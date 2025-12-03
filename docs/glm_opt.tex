@@ -1,0 +1,534 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath,amsfonts,amssymb,fullpage}
+\usepackage{mathtools}
+
+% Shortcuts
+\newcommand{\LL}{\mathcal{L}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\CC}{\mathbb{C}}
+\newcommand{\tp}{^\top}
+\newcommand{\herm}{^\ast}
+\newcommand{\inv}{^{-1}}
+\renewcommand{\Re}{\operatorname{Re}}
+
+\newcommand{\pder}[2]{\frac{\partial #1}{\partial #2}}
+
+% GLM-specific
+\newcommand{\Zv}{\mathbf{Z}}
+\newcommand{\yv}{\mathbf{y}}
+\newcommand{\uv}{\mathbf{u}}
+\newcommand{\lv}{\boldsymbol{\lambda}}
+\newcommand{\mv}{\boldsymbol{\mu}}
+\newcommand{\Av}{\mathcal{A}}
+\newcommand{\Bv}{\mathcal{B}}
+\newcommand{\Uv}{\mathcal{U}}
+\newcommand{\Vv}{\mathcal{V}}
+
+\begin{document}
+\title{Optimality Conditions for General Linear Method Discretized Optimal Control}
+\date{\today}
+\author{Greg von Winckel}
+\maketitle
+
+\section{General Linear Methods}
+
+\subsection{Method Structure}
+
+A General Linear Method (GLM) with $s$ internal stages and $r$ external stages advances the solution as follows. Given incoming external stages $\yv^{[n-1]} = (y_1^{[n-1]}, \ldots, y_r^{[n-1]})\tp$, compute internal stages $\Zv^n = (Z_1^n, \ldots, Z_s^n)\tp$ and outgoing external stages $\yv^{[n]} = (y_1^{[n]}, \ldots, y_r^{[n]})\tp$ via:
+
+\begin{equation}
+\label{eqn:glm_stages}
+Z_i^n = \sum_{j=1}^r u_{ij} y_j^{[n-1]} + h \sum_{j=1}^s a_{ij} f(Z_j^n, \uv_j^n, t_n + c_j h)
+\end{equation}
+\begin{equation}
+\label{eqn:glm_propagate}
+y_i^{[n]} = \sum_{j=1}^r v_{ij} y_j^{[n-1]} + h \sum_{j=1}^s b_{ij} f(Z_j^n, \uv_j^n, t_n + c_j h)
+\end{equation}
+
+The method is characterized by the partitioned tableau:
+\begin{equation}
+\begin{array}{c|c}
+A & U \\
+\hline
+B & V
+\end{array}
+\quad \text{where } A \in \RR^{s\times s}, \; U \in \RR^{s \times r}, \; B \in \RR^{r \times s}, \; V \in \RR^{r \times r}
+\end{equation}
+
+\paragraph{Special cases:}
+\begin{center}
+\begin{tabular}{l|cc|l}
+Method family & $s$ & $r$ & Structure \\
+\hline
+Runge--Kutta & $\geq 1$ & 1 & $U = \mathbf{1}_s$, $V = 1$ \\
+Linear multistep ($k$-step) & 1 & $k$ & $A, B$ are $1 \times k$ and $k \times 1$ \\
+Two-step RK & $\geq 1$ & 2 & Hybrid \\
+Nordsieck & $\geq 1$ & order & External stages are derivatives
+\end{tabular}
+\end{center}
+
+\subsection{Block Notation}
+
+For state dimension $n$, define the stacked vectors:
+\begin{equation}
+\Zv^n = \begin{pmatrix} Z_1^n \\ \vdots \\ Z_s^n \end{pmatrix} \in \RR^{ns}, \qquad
+\yv^{[n]} = \begin{pmatrix} y_1^{[n]} \\ \vdots \\ y_r^{[n]} \end{pmatrix} \in \RR^{nr}
+\end{equation}
+
+and the block Kronecker matrices:
+\begin{equation}
+\Uv = U \otimes I_n \in \RR^{ns \times nr}, \qquad \Vv = V \otimes I_n \in \RR^{nr \times nr}
+\end{equation}
+
+%==============================================================================
+\section{Bilinear System}
+%==============================================================================
+
+Consider the bilinear control system
+\begin{equation}
+\dot{y} = (H + u(t)V)y, \quad y(0) = y_0
+\end{equation}
+where $y \in \CC^n$, $u \in \RR$, and $H, V \in \CC^{n \times n}$.
+
+\subsection{GLM Discretization}
+
+At step $n$, let $\uv^n = (u_1^n, \ldots, u_s^n)$ be the control values at the $s$ internal stages. The GLM equations become:
+
+\begin{equation}
+\label{eqn:bilinear_stage}
+Z_i^n = \sum_{j=1}^r u_{ij} y_j^{[n-1]} + h \sum_{j=1}^s a_{ij} (H + u_j^n V) Z_j^n
+\end{equation}
+\begin{equation}
+\label{eqn:bilinear_prop}
+y_i^{[n]} = \sum_{j=1}^r v_{ij} y_j^{[n-1]} + h \sum_{j=1}^s b_{ij} (H + u_j^n V) Z_j^n
+\end{equation}
+
+\paragraph{Pencil structure.} Define the control-dependent block matrices:
+\begin{equation}
+\Av(\uv^n)_{ij} := \delta_{ij} I - h a_{ij}(H + u_j^n V)
+\end{equation}
+\begin{equation}
+\Bv(\uv^n)_{ij} := h b_{ij}(H + u_j^n V)
+\end{equation}
+
+Note: column $j$ of both $\Av$ and $\Bv$ depends on $u_j^n$ and multiplies $Z_j^n$. This is the pencil structure — each control pairs with its corresponding stage.
+
+In block form:
+\begin{equation}
+\label{eqn:glm_block_stage}
+\boxed{\Av(\uv^n) \Zv^n = \Uv \yv^{[n-1]}}
+\end{equation}
+\begin{equation}
+\label{eqn:glm_block_prop}
+\boxed{\yv^{[n]} = \Vv \yv^{[n-1]} + \Bv(\uv^n) \Zv^n}
+\end{equation}
+
+\subsection{Global Structure}
+
+Stack all unknowns across $N$ time steps:
+\begin{equation}
+\mathbf{Z} = (\Zv^1, \ldots, \Zv^N)\tp \in \CC^{nsN}, \qquad
+\mathbf{Y} = (\yv^{[0]}, \yv^{[1]}, \ldots, \yv^{[N]})\tp \in \CC^{nr(N+1)}
+\end{equation}
+
+The global constraint $\mathcal{E}(\mathbf{Z}, \mathbf{Y}, \mathbf{u}) = 0$ has block structure:
+
+\begin{equation}
+\mathcal{E} = \begin{pmatrix}
+\mathcal{E}^{(Z)}_1 \\
+\mathcal{E}^{(y)}_1 \\
+\vdots \\
+\mathcal{E}^{(Z)}_N \\
+\mathcal{E}^{(y)}_N
+\end{pmatrix}
+= \begin{pmatrix}
+\Av(\uv^1) \Zv^1 - \Uv \yv^{[0]} \\
+\yv^{[1]} - \Vv \yv^{[0]} - \Bv(\uv^1) \Zv^1 \\
+\vdots \\
+\Av(\uv^N) \Zv^N - \Uv \yv^{[N-1]} \\
+\yv^{[N]} - \Vv \yv^{[N-1]} - \Bv(\uv^N) \Zv^N
+\end{pmatrix} = 0
+\end{equation}
+
+The Jacobian with respect to $(\mathbf{Z}, \mathbf{Y})$ is block bidiagonal:
+\begin{equation}
+\mathcal{E}_{(\mathbf{Z},\mathbf{Y})} = 
+\begin{pmatrix}
+\Av_1 & -\Uv & & & & \\
+-\Bv_1 & I & & & & \\
+& & \Av_2 & -\Uv & & \\
+& & -\Bv_2 & I & -\Vv & \\
+& & & & \ddots & \ddots
+\end{pmatrix}
+\end{equation}
+where we abbreviate $\Av_n := \Av(\uv^n)$, etc.
+
+\subsection{Lagrangian and First-Order Conditions}
+
+Introduce Lagrange multipliers $\mv^n \in \CC^{ns}$ for the stage equations and $\lv^n \in \CC^{nr}$ for the propagation equations. The Lagrangian is:
+\begin{equation}
+\LL = J(\mathbf{Y}, \mathbf{u}) + 2\Re\sum_{n=1}^N \left[ (\mv^n)\herm \mathcal{E}^{(Z)}_n + (\lv^n)\herm \mathcal{E}^{(y)}_n \right]
+\end{equation}
+
+\subsubsection{Adjoint Equations}
+
+Taking variations with respect to $Z_k^n$ (for each internal stage $k$ at step $n$):
+\begin{equation}
+\LL_{Z_k^n} = (\mv^n)\herm \Av_{:,k} - (\lv^n)\herm \Bv_{:,k} = 0
+\end{equation}
+where $\Av_{:,k}$ denotes column $k$ of $\Av$. In block form:
+\begin{equation}
+\label{eqn:glm_mu}
+\boxed{\Av(\uv^n)\herm \mv^n = \Bv(\uv^n)\herm \lv^n}
+\end{equation}
+
+Taking variations with respect to $y_k^{[n]}$ (for each external stage $k$ at step $n$):
+\begin{itemize}
+\item From $\mathcal{E}^{(Z)}_{n+1}$: contributes $-\Uv\herm_{:,k} \mv^{n+1}$
+\item From $\mathcal{E}^{(y)}_n$: contributes $\lambda_k^n$
+\item From $\mathcal{E}^{(y)}_{n+1}$: contributes $-\Vv\herm_{:,k} \lv^{n+1}$
+\item From $J$: contributes $\pder{J}{y_k^{[n]}}$
+\end{itemize}
+
+In block form:
+\begin{equation}
+\label{eqn:glm_lambda}
+\boxed{\lv^n = \Uv\herm \mv^{n+1} + \Vv\herm \lv^{n+1} + \pder{J}{\yv^{[n]}}, \quad n = N-1, \ldots, 0}
+\end{equation}
+
+Terminal condition: $\lv^N = \pder{J}{\yv^{[N]}}$
+
+\paragraph{Algorithm.} At each step $n$, going backward:
+\begin{enumerate}
+\item Given $\lv^n$, solve \eqref{eqn:glm_mu} for $\mv^n$ (an $ns \times ns$ system)
+\item Update $\lv^{n-1}$ via \eqref{eqn:glm_lambda}
+\end{enumerate}
+
+\subsubsection{Gradient}
+
+The control $u_k^n$ appears in column $k$ of $\Av(\uv^n)$ and $\Bv(\uv^n)$:
+\begin{equation}
+\pder{\Av_{:,k}}{u_k^n} = -h a_{:,k} \otimes V, \qquad \pder{\Bv_{:,k}}{u_k^n} = h b_{:,k} \otimes V
+\end{equation}
+
+Taking variations:
+\begin{equation}
+\LL_{u_k^n} = \pder{J}{u_k^n} + 2\Re\left[ (\mv^n)\herm \pder{\Av_{:,k}}{u_k^n} Z_k^n - (\lv^n)\herm \pder{\Bv_{:,k}}{u_k^n} Z_k^n \right]
+\end{equation}
+
+Define the weighted adjoint sum:
+\begin{equation}
+\Lambda_k^n := \sum_{i=1}^s a_{ik} \mu_i^n + \sum_{i=1}^r b_{ik} \lambda_i^n
+\end{equation}
+
+Then:
+\begin{equation}
+\boxed{\nabla_{u_k^n} \hat{J} = \pder{J}{u_k^n} - 2h\Re\left[ (\Lambda_k^n)\herm V Z_k^n \right]}
+\end{equation}
+
+This generalizes both the RK formula (where $\Lambda$ involves the single $\lambda$ and the $\mu_i$'s) and the multistep formula (where there are no $\mu$'s but multiple $\lambda$'s from future steps).
+
+%==============================================================================
+\section{Bilinear Second-Order Conditions}
+%==============================================================================
+
+\subsection{State Sensitivity}
+
+Differentiating \eqref{eqn:glm_block_stage}--\eqref{eqn:glm_block_prop}:
+\begin{equation}
+\label{eqn:glm_dZ}
+\boxed{\Av_n \delta\Zv^n = \Uv \delta\yv^{[n-1]} + (\Av'_n \delta\uv^n) \Zv^n}
+\end{equation}
+\begin{equation}
+\label{eqn:glm_dy}
+\boxed{\delta\yv^{[n]} = \Vv \delta\yv^{[n-1]} + \Bv_n \delta\Zv^n + (\Bv'_n \delta\uv^n) \Zv^n}
+\end{equation}
+
+where the control-derivative terms are:
+\begin{equation}
+[(\Av'_n \delta\uv^n) \Zv^n]_i = h \sum_{j=1}^s a_{ij} \delta u_j^n V Z_j^n
+\end{equation}
+\begin{equation}
+[(\Bv'_n \delta\uv^n) \Zv^n]_i = -h \sum_{j=1}^s b_{ij} \delta u_j^n V Z_j^n
+\end{equation}
+
+Initial condition: $\delta\yv^{[0]} = 0$.
+
+\subsection{Adjoint Sensitivity}
+
+Differentiating the adjoint equations \eqref{eqn:glm_mu}--\eqref{eqn:glm_lambda}:
+\begin{equation}
+\label{eqn:glm_dmu}
+\boxed{\Av_n\herm \delta\mv^n = \Bv_n\herm \delta\lv^n + (\Av'_n \delta\uv^n)\herm \mv^n - (\Bv'_n \delta\uv^n)\herm \lv^n}
+\end{equation}
+\begin{equation}
+\label{eqn:glm_dlambda}
+\boxed{\delta\lv^n = \Uv\herm \delta\mv^{n+1} + \Vv\herm \delta\lv^{n+1} + J_{\yv^{[n]}\yv^{[n]}} \delta\yv^{[n]}}
+\end{equation}
+
+Terminal condition: $\delta\lv^N = J_{\yv^{[N]}\yv^{[N]}} \delta\yv^{[N]}$.
+
+The forcing terms in \eqref{eqn:glm_dmu} are:
+\begin{equation}
+[(\Av'_n \delta\uv^n)\herm \mv^n]_k = h \sum_{i=1}^s a_{ik} \delta u_k^n V\herm \mu_i^n = h \delta u_k^n V\herm \sum_{i=1}^s a_{ik} \mu_i^n
+\end{equation}
+\begin{equation}
+[(\Bv'_n \delta\uv^n)\herm \lv^n]_k = -h \sum_{i=1}^r b_{ik} \delta u_k^n V\herm \lambda_i^n = -h \delta u_k^n V\herm \sum_{i=1}^r b_{ik} \lambda_i^n
+\end{equation}
+
+Using the weighted adjoint $\Lambda_k^n$:
+\begin{equation}
+[(\Av'_n \delta\uv^n)\herm \mv^n - (\Bv'_n \delta\uv^n)\herm \lv^n]_k = h \delta u_k^n V\herm \Lambda_k^n
+\end{equation}
+
+\subsection{Hessian-Vector Product}
+
+\begin{equation}
+\boxed{[\nabla^2\hat{J}]\delta\uv = J_{\uv\uv}\delta\uv + \mathcal{H}_{\uv\lv}\delta\lv + \mathcal{H}_{\uv\mv}\delta\mv + \mathcal{H}_{\uv\Zv}\delta\Zv}
+\end{equation}
+
+At stage $k$ of step $n$:
+\begin{align}
+(\mathcal{H}_{\uv\lv}\delta\lv + \mathcal{H}_{\uv\mv}\delta\mv)_k^n &= -2h\Re\left[ (\delta\Lambda_k^n)\herm V Z_k^n \right] \\
+(\mathcal{H}_{\uv\Zv}\delta\Zv)_k^n &= -2h\Re\left[ (\Lambda_k^n)\herm V \delta Z_k^n \right]
+\end{align}
+
+where $\delta\Lambda_k^n = \sum_i a_{ik}\delta\mu_i^n + \sum_i b_{ik}\delta\lambda_i^n$.
+
+%==============================================================================
+\section{Nonlinear System}
+%==============================================================================
+
+Now consider
+\begin{equation}
+\dot{y} = f(y, u, t), \quad y(0) = y_0
+\end{equation}
+with $y \in \RR^n$, $u \in \RR^\nu$.
+
+\subsection{GLM Discretization}
+
+Let $f_k^n := f(Z_k^n, u_k^n, t_n + c_k h)$. The GLM equations are:
+\begin{equation}
+Z_i^n = \sum_{j=1}^r u_{ij} y_j^{[n-1]} + h \sum_{j=1}^s a_{ij} f_j^n
+\end{equation}
+\begin{equation}
+y_i^{[n]} = \sum_{j=1}^r v_{ij} y_j^{[n-1]} + h \sum_{j=1}^s b_{ij} f_j^n
+\end{equation}
+
+Define Jacobians at stage $(n,k)$:
+\begin{equation}
+F_k^n := \pder{f}{y}\bigg|_{Z_k^n, u_k^n}, \qquad G_k^n := \pder{f}{u}\bigg|_{Z_k^n, u_k^n}
+\end{equation}
+
+The linearized stage matrix has blocks:
+\begin{equation}
+\Av(\mathbf{F}^n)_{ij} = \delta_{ij}I - h a_{ij} F_j^n
+\end{equation}
+\begin{equation}
+\Bv(\mathbf{F}^n)_{ij} = h b_{ij} F_j^n
+\end{equation}
+
+Note: column $j$ depends on $F_j^n$ (Jacobian at stage $j$), preserving the pencil structure.
+
+\subsection{First-Order Conditions}
+
+\subsubsection{Adjoint Equations}
+
+The stage adjoint equation (block form):
+\begin{equation}
+\label{eqn:nl_glm_mu}
+\boxed{\Av(\mathbf{F}^n)\tp \mv^n = \Bv(\mathbf{F}^n)\tp \lv^n}
+\end{equation}
+
+Componentwise: 
+\begin{equation}
+\mu_k^n = h\sum_{j=1}^s a_{jk} (F_k^n)\tp \mu_j^n + h\sum_{j=1}^r b_{jk} (F_k^n)\tp \lambda_j^n = h(F_k^n)\tp \Lambda_k^n
+\end{equation}
+where $\Lambda_k^n = \sum_j a_{jk}\mu_j^n + \sum_j b_{jk}\lambda_j^n$ is the weighted adjoint.
+
+The external stage adjoint update:
+\begin{equation}
+\label{eqn:nl_glm_lambda}
+\boxed{\lv^n = \Uv\tp \mv^{n+1} + \Vv\tp \lv^{n+1} + \pder{J}{\yv^{[n]}}}
+\end{equation}
+
+\subsubsection{Gradient}
+
+\begin{equation}
+\boxed{\nabla_{u_k^n}\hat{J} = \pder{J}{u_k^n} - h(G_k^n)\tp \Lambda_k^n}
+\end{equation}
+
+\subsection{Second-Order Conditions}
+
+For second derivatives, define contracted Hessians at $(n,k)$:
+\begin{align}
+F_{yy}^{n,k}[v] &:= \sum_\ell v_\ell \pder{^2 f_\ell}{y\partial y}\bigg|_{n,k} \\
+F_{yu}^{n,k}[v] &:= \sum_\ell v_\ell \pder{^2 f_\ell}{y\partial u}\bigg|_{n,k} \\
+F_{uu}^{n,k}[v] &:= \sum_\ell v_\ell \pder{^2 f_\ell}{u\partial u}\bigg|_{n,k}
+\end{align}
+
+\subsubsection{State Sensitivity}
+
+\begin{equation}
+\boxed{\Av_n \delta\Zv^n = \Uv\delta\yv^{[n-1]} + \Phi^n}
+\end{equation}
+\begin{equation}
+\boxed{\delta\yv^{[n]} = \Vv\delta\yv^{[n-1]} + \Bv_n\delta\Zv^n + \Psi^n}
+\end{equation}
+
+where the forcing terms are:
+\begin{equation}
+\Phi_i^n = h\sum_{j=1}^s a_{ij} G_j^n \delta u_j^n, \qquad
+\Psi_i^n = h\sum_{j=1}^s b_{ij} G_j^n \delta u_j^n
+\end{equation}
+
+\subsubsection{Adjoint Sensitivity}
+
+\begin{equation}
+\boxed{
+\begin{aligned}
+\Av_n\tp \delta\mv^n &= \Bv_n\tp \delta\lv^n + \Gamma^n
+\end{aligned}
+}
+\end{equation}
+\begin{equation}
+\boxed{\delta\lv^n = \Uv\tp\delta\mv^{n+1} + \Vv\tp\delta\lv^{n+1} + J_{\yv\yv}\delta\yv^{[n]}}
+\end{equation}
+
+The forcing $\Gamma^n$ contains second-derivative terms:
+\begin{equation}
+\Gamma_k^n = h\Big[ F_{yy}^{n,k}[\Lambda_k^n] \delta Z_k^n + F_{yu}^{n,k}[\Lambda_k^n] \delta u_k^n \Big]
+\end{equation}
+
+Note: the weighted adjoint $\Lambda_k^n$ multiplies the contracted Hessians, exactly as in the RK and multistep cases.
+
+\subsubsection{Hessian-Vector Product}
+
+\begin{equation}
+\boxed{[\nabla^2\hat{J}]\delta\uv = J_{\uv\uv}\delta\uv + \mathcal{H}_{\uv\Lambda}\delta\Lambda + \mathcal{H}_{\uv Z}\delta\Zv + \mathcal{H}_{\uv\uv}^{\text{constr}}\delta\uv}
+\end{equation}
+
+At stage $(n,k)$:
+\begin{align}
+(\mathcal{H}_{\uv\Lambda}\delta\Lambda)_k^n &= -h(G_k^n)\tp \delta\Lambda_k^n \\
+(\mathcal{H}_{\uv Z}\delta\Zv)_k^n &= -h\, F_{yu}^{n,k}[\Lambda_k^n]\tp \delta Z_k^n \\
+(\mathcal{H}_{\uv\uv}^{\text{constr}}\delta\uv)_k^n &= -h\, F_{uu}^{n,k}[\Lambda_k^n] \delta u_k^n
+\end{align}
+
+where $\delta\Lambda_k^n = \sum_j a_{jk}\delta\mu_j^n + \sum_j b_{jk}\delta\lambda_j^n$.
+
+%==============================================================================
+\section{Reduction to Special Cases}
+%==============================================================================
+
+\subsection{Runge--Kutta ($r = 1$)}
+
+With $r = 1$: $\yv^{[n]} = y_n \in \RR^n$, $\Uv = \mathbf{1}_s \otimes I_n$, $\Vv = I_n$.
+
+The external adjoint update \eqref{eqn:nl_glm_lambda} becomes:
+\begin{equation}
+\lambda_n = \sum_{i=1}^s \mu_i^{n+1} + \lambda_{n+1} + (J_y)_n
+\end{equation}
+which matches the RK adjoint recurrence.
+
+The weighted adjoint simplifies to:
+\begin{equation}
+\Lambda_k^n = \sum_{j=1}^s a_{jk}\mu_j^n + b_k \lambda_n
+\end{equation}
+matching the RK formula from the earlier document.
+
+\subsection{Linear Multistep ($s = 1$)}
+
+With $s = 1$: $\Zv^n = Z^n \in \RR^n$, $\Av = 1 - h\alpha_0 F^n$, etc.
+
+The stage equation becomes trivial or implicit (depending on $\alpha_0$), and the coupling is entirely through the $r$ external stages. The adjoint update \eqref{eqn:nl_glm_lambda} gives the $k$-step backward recurrence.
+
+The weighted adjoint becomes:
+\begin{equation}
+\Lambda^n = a \mu^n + \sum_{j=1}^r b_j \lambda_j^n
+\end{equation}
+which, after eliminating $\mu^n$, reduces to the multistep gradient formula.
+
+%==============================================================================
+\section{Algorithm Summary}
+%==============================================================================
+
+To compute the Hessian-vector product $[\nabla^2\hat{J}(u)]\delta u$:
+
+\begin{enumerate}
+\item \textbf{Forward state solve}: For $n = 1, \ldots, N$:
+\begin{enumerate}
+\item Solve $\Av_n \Zv^n = \Uv\yv^{[n-1]}$ for internal stages
+\item Update $\yv^{[n]} = \Vv\yv^{[n-1]} + \Bv_n\Zv^n$
+\item Store $F_k^n$, $G_k^n$ for all stages
+\end{enumerate}
+
+\item \textbf{Backward adjoint solve}: For $n = N, \ldots, 1$:
+\begin{enumerate}
+\item Solve $\Av_n\tp \mv^n = \Bv_n\tp \lv^n$ for stage adjoints
+\item Update $\lv^{n-1} = \Uv\tp\mv^n + \Vv\tp\lv^n + (J_y)^{n-1}$
+\item Compute $\Lambda_k^n$ for all $k$
+\end{enumerate}
+
+\item \textbf{Forward sensitivity solve}: For $n = 1, \ldots, N$:
+\begin{enumerate}
+\item Solve $\Av_n\delta\Zv^n = \Uv\delta\yv^{[n-1]} + \Phi^n$
+\item Update $\delta\yv^{[n]} = \Vv\delta\yv^{[n-1]} + \Bv_n\delta\Zv^n + \Psi^n$
+\end{enumerate}
+
+\item \textbf{Backward adjoint sensitivity solve}: For $n = N, \ldots, 1$:
+\begin{enumerate}
+\item Solve $\Av_n\tp\delta\mv^n = \Bv_n\tp\delta\lv^n + \Gamma^n$
+\item Update $\delta\lv^{n-1} = \Uv\tp\delta\mv^n + \Vv\tp\delta\lv^n + J_{\yv\yv}\delta\yv^{[n-1]}$
+\item Compute $\delta\Lambda_k^n$
+\end{enumerate}
+
+\item \textbf{Assemble}: Form $[\nabla^2\hat{J}]\delta u$ componentwise.
+\end{enumerate}
+
+\paragraph{Computational costs per step:}
+\begin{itemize}
+\item Forward/backward stage solves: $O((ns)^3)$ or better with structure
+\item External stage updates: $O((nr)^2)$
+\item Jacobian/Hessian evaluations: $s$ per step
+\item Storage: $O(nsN + nrN)$ for states and adjoints
+\end{itemize}
+
+\paragraph{Reusable factorizations:}
+\begin{itemize}
+\item $\Av_n$ and $\Av_n\tp$ share a factorization (transpose)
+\item Forward state and sensitivity use the same $\Av_n$ factorization
+\item Backward adjoint and adjoint sensitivity use the same $\Av_n\tp$ factorization
+\end{itemize}
+
+%==============================================================================
+\section{Extensions}
+%==============================================================================
+
+\subsection{Partitioned Methods (PRK)}
+
+For a partitioned system $(q, p)$ with separate tableaux $(A^q, U^q, B^q, V^q)$ and $(A^p, U^p, B^p, V^p)$:
+
+\begin{itemize}
+\item Internal stages become $(Q_k^n, P_k^n)$ pairs
+\item External stages become $(q_j^{[n]}, p_j^{[n]})$ pairs
+\item The block matrices $\Av$, $\Bv$ become $2 \times 2$ block structured
+\item The pencil structure is preserved within each partition
+\end{itemize}
+
+The adjoint equations inherit the partitioned structure, with separate weighted adjoints $\Lambda_k^{(q)}$ and $\Lambda_k^{(p)}$.
+
+\subsection{Additive/IMEX Methods}
+
+For $\dot{y} = f_E(y,u,t) + f_I(y,u,t)$ with tableaux $(A^E, B^E)$ and $(A^I, B^I)$:
+
+\begin{itemize}
+\item Stage equations: $Z_i^n = (\text{history}) + h\sum_j a_{ij}^E f_E(Z_j) + h\sum_j a_{ij}^I f_I(Z_j)$
+\item The stage matrix becomes $\Av = I - h(A^E \otimes F^E + A^I \otimes F^I)$
+\item Gradient and Hessian terms split into $E$ and $I$ contributions
+\end{itemize}
+
+The structure is unchanged; only the block entries are sums over RHS components.
+
+\end{document}

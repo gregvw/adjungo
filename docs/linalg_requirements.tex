@@ -1,0 +1,521 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath,amsfonts,amssymb,fullpage}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\newcommand{\RR}{\mathbb{R}}
+
+\begin{document}
+\title{Linear Algebra Requirements for GLM Time Stepping}
+\date{\today}
+\author{Greg von Winckel}
+\maketitle
+
+\section{Classification Dimensions}
+
+The computational requirements for a single time step depend on three orthogonal factors:
+
+\begin{enumerate}
+\item \textbf{Stage matrix structure} (from $A$): How are internal stages coupled?
+\item \textbf{Propagation matrix structure} (from $V$): How are external stages coupled?
+\item \textbf{Problem linearity}: Is $f(y,u,t)$ linear, bilinear, or fully nonlinear in $y$?
+\end{enumerate}
+
+\section{Stage Matrix Structure}
+
+The stage equations are:
+\[
+Z_i = \sum_{j=1}^r u_{ij} y_j^{[n-1]} + h\sum_{j=1}^s a_{ij} f(Z_j, u_j, t+c_jh)
+\]
+
+The structure of $A = (a_{ij})$ determines the solve type:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Structure & Definition & Solve type & Cost \\
+\midrule
+\textsc{Explicit} & $A$ strictly lower triangular & Forward substitution & $O(s \cdot n \cdot \text{eval})$ \\
+\textsc{DIRK} & $A$ lower triangular, $a_{ii} \neq 0$ & $s$ sequential $n\times n$ solves & $O(s \cdot n^3)$ \\
+\textsc{SDIRK} & DIRK with $a_{ii} = \gamma$ constant & $s$ solves, 1 factorization & $O(n^3 + s \cdot n^2)$ \\
+\textsc{Implicit} & $A$ dense & Coupled $ns \times ns$ solve & $O((ns)^3)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Detection.} Given tableau $A$:
+\begin{verbatim}
+def classify_stage_structure(A):
+    if is_strictly_lower_triangular(A):
+        return EXPLICIT
+    if is_lower_triangular(A):
+        diag = diagonal(A)
+        if all_equal(diag) and diag[0] != 0:
+            return SDIRK
+        elif all_nonzero(diag):
+            return DIRK
+        else:
+            return EXPLICIT  # zeros on diagonal = explicit stages
+    return IMPLICIT
+\end{verbatim}
+
+\section{Propagation Matrix Structure}
+
+The external stage update is:
+\[
+y_i^{[n]} = \sum_{j=1}^r v_{ij} y_j^{[n-1]} + h\sum_{j=1}^s b_{ij} f(Z_j, u_j, t+c_jh)
+\]
+
+The structure of $V = (v_{ij})$ determines the propagation type:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Structure & Definition & Operation & Cost \\
+\midrule
+\textsc{Identity} & $V = I_r$ & Direct copy + update & $O(r \cdot n)$ \\
+\textsc{Shift} & $V$ is a shift matrix & Cyclic buffer update & $O(r \cdot n)$ \\
+\textsc{Triangular} & $V$ lower triangular & Forward substitution & $O(r^2 \cdot n)$ \\
+\textsc{Dense} & $V$ general & $nr \times nr$ matvec or solve & $O((nr)^2)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Common cases:}
+\begin{itemize}[nosep]
+\item Runge--Kutta: $r=1$, $V = (1)$ — trivial
+\item BDF/Adams: $V$ is a shift matrix (moves history back one slot)
+\item Nordsieck: $V$ encodes Pascal triangle structure
+\end{itemize}
+
+\section{Problem Linearity}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Type & Form of $f$ & Jacobian $F = \partial f/\partial y$ \\
+\midrule
+\textsc{Linear} & $f(y,u,t) = F(t)y + g(u,t)$ & Constant in $y$, independent of $u$ \\
+\textsc{Bilinear} & $f(y,u,t) = (H + uV)y$ & $F = H + uV$, depends on $u$ only \\
+\textsc{Quasilinear} & $f(y,u,t) = F(u,t)y + g(u,t)$ & Depends on $u$, not $y$ \\
+\textsc{Semilinear} & $f(y,u,t) = Fy + g(y,u,t)$ & Constant (stiff part) + nonlinear \\
+\textsc{Nonlinear} & General $f(y,u,t)$ & $F(y,u,t)$ depends on everything \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Combined Requirements}
+
+For implicit stages with a nonlinear $f$, we need Newton iteration. The table below shows what each combination requires:
+
+\begin{center}
+\begin{tabular}{l|ccc}
+\toprule
+& \textsc{Linear/Bilinear} & \textsc{Quasilinear} & \textsc{Nonlinear} \\
+\midrule
+\textsc{Explicit} & Matvec & Matvec & Eval \\
+\textsc{DIRK} & $s$ solves & $s$ solves & $s \times$ Newton($n$) \\
+\textsc{SDIRK} & 1 factor + $s$ solves & $s$ solves$^\dagger$ & $s \times$ Newton($n$)$^\ddagger$ \\
+\textsc{Implicit} & 1 block solve & 1 block solve & Newton($ns$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+$^\dagger$ SDIRK advantage lost if $F$ changes with $u$ between stages.
+
+$^\ddagger$ Can reuse Jacobian factorization across Newton iterations (modified Newton).
+
+\section{Data Structures for Requirements}
+
+\subsection{Tableau Metadata}
+
+\begin{verbatim}
+struct TableauStructure {
+    // Stage structure
+    enum class StageType { Explicit, DIRK, SDIRK, Implicit };
+    StageType stage_type;
+    
+    // For SDIRK: the common diagonal value
+    std::optional<double> sdirk_gamma;
+    
+    // Indices of explicit stages (where a_{ii} = 0)
+    std::vector<int> explicit_stages;
+    
+    // Propagation structure  
+    enum class PropType { Identity, Shift, Triangular, Dense };
+    PropType prop_type;
+    
+    // Dimensions
+    int s;  // internal stages
+    int r;  // external stages
+    
+    // Derived
+    bool is_fully_explicit() const { 
+        return stage_type == StageType::Explicit; 
+    }
+    bool has_reusable_factorization() const {
+        return stage_type == StageType::SDIRK;
+    }
+};
+\end{verbatim}
+
+\subsection{Problem Metadata}
+
+\begin{verbatim}
+struct ProblemStructure {
+    enum class Linearity { Linear, Bilinear, Quasilinear, Semilinear, Nonlinear };
+    Linearity linearity;
+    
+    // For semilinear: split into stiff (linear) and nonstiff parts?
+    bool has_split_rhs;
+    
+    // Jacobian properties
+    bool jacobian_constant;           // F independent of y
+    bool jacobian_control_dependent;  // F depends on u
+    bool jacobian_time_dependent;     // F depends on t
+    
+    // What derivatives are available?
+    bool has_jacobian;        // F = df/dy
+    bool has_control_jacobian; // G = df/du  
+    bool has_hessian_action;   // F_yy[v], F_yu[v], F_uu[v]
+    
+    // Or: use AD for everything?
+    bool use_ad;
+};
+\end{verbatim}
+
+\subsection{Solver Requirements}
+
+\begin{verbatim}
+struct SolverRequirements {
+    // What operations are needed per time step?
+    
+    // Evaluation
+    int f_evals_per_step;         // Number of RHS evaluations
+    int jacobian_evals_per_step;  // Number of Jacobian evaluations
+    
+    // Factorizations
+    int factorizations_per_step;  // LU/Cholesky factorizations
+    int factorization_size;       // n or ns
+    bool can_reuse_factorization; // Same factorization for all stages?
+    
+    // Solves (after factorization)
+    int solves_per_step;
+    int solve_size;               // n or ns
+    
+    // Newton iterations (if applicable)
+    bool needs_newton;
+    int newton_system_size;       // n or ns
+    int max_newton_iters;
+    
+    // Memory
+    int vectors_to_store;         // Working vectors needed
+    int matrices_to_store;        // Jacobians/factorizations to cache
+    
+    // For adjoint/sensitivity (optimization)
+    bool needs_trajectory_storage;  // Store all (Z, y) for backward pass
+    int trajectory_storage_size;    // nsN + nrN
+};
+\end{verbatim}
+
+\section{Dispatch Logic}
+
+\begin{verbatim}
+auto deduce_requirements(TableauStructure tab, ProblemStructure prob) 
+    -> SolverRequirements 
+{
+    SolverRequirements req;
+    
+    // RHS evaluations: always s per step
+    req.f_evals_per_step = tab.s;
+    
+    // Explicit methods: no solves
+    if (tab.is_fully_explicit()) {
+        req.factorizations_per_step = 0;
+        req.solves_per_step = 0;
+        req.needs_newton = false;
+        return req;
+    }
+    
+    // Implicit + nonlinear: need Newton
+    if (prob.linearity == Nonlinear && !tab.is_fully_explicit()) {
+        req.needs_newton = true;
+        req.newton_system_size = (tab.stage_type == Implicit) ? tab.s * n : n;
+        req.max_newton_iters = 10;  // typical default
+        
+        // Jacobian evals: once per Newton iteration (or reuse = modified Newton)
+        req.jacobian_evals_per_step = tab.s;  // at least once per stage
+    }
+    
+    // Linear/bilinear: direct solve, no Newton
+    if (prob.linearity <= Quasilinear) {
+        req.needs_newton = false;
+        
+        switch (tab.stage_type) {
+            case SDIRK:
+                req.factorizations_per_step = prob.jacobian_constant ? 1 : tab.s;
+                req.can_reuse_factorization = prob.jacobian_constant;
+                req.solves_per_step = tab.s;
+                req.factorization_size = n;
+                break;
+            case DIRK:
+                req.factorizations_per_step = tab.s;  // different diagonal each stage
+                req.can_reuse_factorization = false;
+                req.solves_per_step = tab.s;
+                req.factorization_size = n;
+                break;
+            case Implicit:
+                req.factorizations_per_step = 1;
+                req.solves_per_step = 1;
+                req.factorization_size = tab.s * n;
+                break;
+        }
+    }
+    
+    return req;
+}
+\end{verbatim}
+
+\section{Solver Concept Hierarchy}
+
+\begin{verbatim}
+// Base operations every problem must provide
+template<typename P>
+concept Problem = requires(P p, Vector y, Scalar u, Scalar t) {
+    { p.f(y, u, t) } -> VectorLike;
+    { p.dimension() } -> std::convertible_to<int>;
+};
+
+// For implicit methods
+template<typename P>
+concept DifferentiableProblem = Problem<P> && requires(P p, Vector y, ...) {
+    { p.jacobian(y, u, t) } -> MatrixLike;        // F = df/dy
+    { p.apply_jacobian(y, u, t, v) } -> VectorLike;  // F*v (matrix-free)
+};
+
+// For optimization (first-order)
+template<typename P>
+concept OptimizableProblem = DifferentiableProblem<P> && requires(P p, ...) {
+    { p.control_jacobian(y, u, t) } -> MatrixLike;  // G = df/du
+};
+
+// For optimization (second-order)
+template<typename P>
+concept TwiceDifferentiableProblem = OptimizableProblem<P> && requires(P p, ...) {
+    { p.hessian_yy_action(y, u, t, v) } -> MatrixLike;  // F_yy[v]
+    { p.hessian_yu_action(y, u, t, v) } -> MatrixLike;  // F_yu[v]
+    { p.hessian_uu_action(y, u, t, v) } -> MatrixLike;  // F_uu[v]
+};
+
+// Method provides tableau and structure
+template<typename M>
+concept GLMethod = requires(M m) {
+    { m.A() } -> MatrixLike;
+    { m.B() } -> MatrixLike;
+    { m.U() } -> MatrixLike;
+    { m.V() } -> MatrixLike;
+    { m.c() } -> VectorLike;
+    { m.structure() } -> std::same_as<TableauStructure>;
+};
+\end{verbatim}
+
+\section{Example: Solver Selection}
+
+\begin{verbatim}
+template<GLMethod Method, Problem Prob>
+auto make_stepper(Method&& method, Prob&& problem) {
+    auto tab = method.structure();
+    auto prob = deduce_problem_structure(problem);
+    auto req = deduce_requirements(tab, prob);
+    
+    if (tab.is_fully_explicit()) {
+        return ExplicitStepper(method, problem);
+    }
+    
+    if (req.needs_newton) {
+        if (tab.stage_type == TableauStructure::Implicit) {
+            return FullyImplicitNewtonStepper(method, problem);
+        } else {
+            return DIRKNewtonStepper(method, problem);
+        }
+    }
+    
+    // Linear implicit
+    if (tab.stage_type == TableauStructure::SDIRK && req.can_reuse_factorization) {
+        return SDIRKLinearStepper(method, problem);  // factor once
+    }
+    
+    return DIRKLinearStepper(method, problem);  // factor per stage
+}
+\end{verbatim}
+
+\section{IMEX Extension}
+
+For IMEX (additive) methods with $f = f_E + f_I$:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Component & Tableau & Treatment \\
+\midrule
+Explicit ($f_E$) & $A^E$ strictly lower triangular & Evaluation only \\
+Implicit ($f_I$) & $A^I$ with structure above & Solve as classified \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The solve structure is determined by $(A^I, \text{linearity of } f_I)$. The explicit part just adds to the RHS before solving.
+
+Requirements struct gains:
+\begin{verbatim}
+struct IMEXRequirements {
+    SolverRequirements explicit_part;  // Always just evals
+    SolverRequirements implicit_part;  // Solves as needed
+    
+    int total_f_evals() const {
+        return explicit_part.f_evals_per_step + implicit_part.f_evals_per_step;
+    }
+};
+\end{verbatim}
+
+\section{Summary: The Decision Tree}
+
+\begin{verbatim}
+Given: Tableau (A, U, B, V), Problem f(y, u, t)
+
+1. Classify A:
+   - Strictly lower triangular? -> EXPLICIT
+   - Lower triangular, constant nonzero diagonal? -> SDIRK  
+   - Lower triangular, varying diagonal? -> DIRK
+   - Dense? -> IMPLICIT
+
+2. Classify f:
+   - f linear in y? -> LINEAR
+   - f = (H + uV)y? -> BILINEAR
+   - Jacobian independent of y? -> QUASILINEAR
+   - General? -> NONLINEAR
+
+3. Combine:
+   - EXPLICIT + anything: just evaluate f
+   - SDIRK + LINEAR: 1 factorization, s solves
+   - SDIRK + BILINEAR: s factorizations (u changes), s solves
+   - DIRK + LINEAR/BILINEAR: s factorizations, s solves
+   - IMPLICIT + LINEAR/BILINEAR: 1 block factorization, 1 block solve
+   - any implicit + NONLINEAR: Newton iteration
+     - DIRK: s independent Newton solves (size n)
+     - IMPLICIT: 1 coupled Newton solve (size ns)
+
+4. For optimization, additionally need:
+   - G = df/du at each stage
+   - Trajectory storage for backward pass
+   - F_yy, F_yu, F_uu contractions for second-order
+\end{verbatim}
+
+\section{Linear Algebra Primitives Interface}
+
+The solver needs a linear algebra backend that provides these operations. The key insight: different problem structures need different subsets.
+
+\subsection{Primitive Operations}
+
+\begin{verbatim}
+template<typename Scalar, typename Index>
+concept LinearAlgebraBackend = requires {
+    // Vector operations (always needed)
+    Vector axpy(Scalar a, Vector x, Vector y);    // y <- ax + y
+    Scalar dot(Vector x, Vector y);
+    Scalar norm(Vector x);
+    
+    // Matrix-vector (for explicit stages, RHS evaluation)
+    Vector matvec(Matrix A, Vector x);            // y <- Ax
+    Vector matvec_add(Matrix A, Vector x, Vector y); // y <- Ax + y
+    
+    // For implicit stages: factorization + solve
+    Factorization factor(Matrix A);               // LU, Cholesky, etc.
+    Vector solve(Factorization F, Vector b);      // x <- A^{-1}b
+    
+    // For transpose solves (adjoints)
+    Vector solve_transpose(Factorization F, Vector b);  // x <- A^{-T}b
+    
+    // Optional: matrix-free variants
+    Vector apply_operator(Operator A, Vector x);
+    Vector apply_operator_transpose(Operator A, Vector x);
+};
+\end{verbatim}
+
+\subsection{What Each Solver Type Needs}
+
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+Solver & \texttt{matvec} & \texttt{factor} & \texttt{solve} & \texttt{solve\_transpose} & Block \\
+\midrule
+Explicit & \checkmark & & & & \\
+SDIRK (linear) & \checkmark & \checkmark & \checkmark & \checkmark$^*$ & \\
+DIRK (linear) & \checkmark & \checkmark & \checkmark & \checkmark$^*$ & \\
+Implicit (linear) & \checkmark & \checkmark & \checkmark & \checkmark$^*$ & \checkmark \\
+Newton (any) & \checkmark & \checkmark & \checkmark & \checkmark$^*$ & maybe \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+$^*$ Transpose solve needed for adjoint equations (optimization).
+
+\subsection{Matrix-Free Option}
+
+For large-scale problems, forming and factoring the stage matrix $I - h\gamma F$ may be infeasible. The matrix-free alternative:
+
+\begin{verbatim}
+// Instead of:
+Matrix J = problem.jacobian(y, u, t);
+Matrix A = I - h * gamma * J;
+auto LU = factor(A);
+Vector dz = solve(LU, residual);
+
+// Use:
+auto A_op = [&](Vector v) { 
+    return v - h * gamma * problem.apply_jacobian(y, u, t, v);
+};
+Vector dz = krylov_solve(A_op, residual, preconditioner);
+\end{verbatim}
+
+This requires:
+\begin{itemize}[nosep]
+\item \texttt{apply\_jacobian(y, u, t, v)}: Jacobian-vector product $Fv$
+\item \texttt{krylov\_solve}: GMRES, BiCGSTAB, etc.
+\item A preconditioner (often approximate factorization of $I - h\gamma F$)
+\end{itemize}
+
+For the adjoint: \texttt{apply\_jacobian\_transpose(y, u, t, v)} for $F^\top v$.
+
+\subsection{Concept Hierarchy for Backends}
+
+\begin{verbatim}
+// Minimal: explicit methods only
+template<typename B>
+concept BasicLA = requires(B b, Vector x, Vector y, Scalar a) {
+    { b.axpy(a, x, y) } -> VectorLike;
+    { b.matvec(A, x) } -> VectorLike;
+};
+
+// For implicit linear problems
+template<typename B>
+concept DirectSolveLA = BasicLA<B> && requires(B b, Matrix A, Vector x) {
+    { b.factor(A) } -> Factorization;
+    { b.solve(factor, x) } -> VectorLike;
+    { b.solve_transpose(factor, x) } -> VectorLike;
+};
+
+// For large-scale / matrix-free
+template<typename B>
+concept IterativeSolveLA = BasicLA<B> && requires(B b, Operator A, Vector x) {
+    { b.apply_operator(A, x) } -> VectorLike;
+    { b.krylov_solve(A, x, tol) } -> VectorLike;
+};
+
+// Full-featured
+template<typename B>
+concept FullLA = DirectSolveLA<B> && IterativeSolveLA<B>;
+\end{verbatim}
+
+\end{document}

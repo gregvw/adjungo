@@ -1,0 +1,467 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath,amsfonts,amssymb,fullpage}
+\usepackage{mathtools}
+
+% Shortcuts
+\newcommand{\LL}{\mathcal{L}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\CC}{\mathbb{C}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\tp}{^\top}
+\newcommand{\herm}{^\ast}
+\newcommand{\inv}{^{-1}}
+\renewcommand{\Re}{\operatorname{Re}}
+
+\newcommand{\pder}[2]{\frac{\partial #1}{\partial #2}}
+
+\begin{document}
+\title{Optimality Conditions for Multistep Discretized Optimal Control}
+\date{\today}
+\author{Greg von Winckel}
+\maketitle
+
+\section{Bilinear System with Multistep Discretization}
+
+\subsection{Problem Setup}
+
+Consider the bilinear control system
+\begin{equation}
+\label{eqn:bilinear}
+M \dot{y} = Hy + u(t) V y, \quad y(0) = y_0
+\end{equation}
+where $y:[0,T]\to\CC^n$, $u:[0,T]\to\RR$, and $M,H,V \in \CC^{n\times n}$ with $M$ invertible. We seek to minimize
+\begin{equation}
+J(y,u) = 1 - y_N\herm P y_N + \frac{1}{2} u\tp K u
+\end{equation}
+where $P$ is Hermitian positive semidefinite and $K$ is real symmetric positive definite.
+
+\subsection{Linear Multistep Discretization}
+
+Partition $[0,T]$ into $N$ steps of size $h$, with $t_n = nh$. A $k$-step linear multistep method has the form
+\begin{equation}
+\label{eqn:lmm}
+\sum_{j=0}^{k-1} \alpha_j y_{n-j} = h \sum_{j=0}^{k-1} \beta_j \dot{y}_{n-j}
+\end{equation}
+where we normalize $\alpha_0 = 1$. For our bilinear system, $M\dot{y}_m = (H + u_m V)y_m$, so the discrete equations become
+\begin{equation}
+\label{eqn:lmm_bilinear}
+\sum_{j=0}^{k-1} \alpha_j M y_{n-j} = h \sum_{j=0}^{k-1} \beta_j (H + u_{n-j} V) y_{n-j}
+\end{equation}
+
+\paragraph{Pencil structure.} Note carefully: the RHS term at lag $j$ pairs $(H + u_{n-j}V)$ with $y_{n-j}$. Each state value is multiplied by the operator evaluated at the \emph{same} time. This gives a matrix pencil structure:
+\begin{equation}
+\sum_{j=0}^{k-1} C_j(u_{n-j})\, y_{n-j} = 0
+\end{equation}
+where
+\begin{equation}
+C_j(u) := \alpha_j M - h\beta_j(H + uV)
+\end{equation}
+
+Rearranging to isolate $y_n$:
+\begin{equation}
+\label{eqn:step_update}
+\underbrace{C_0(u_n)}_{=:A_n} y_n = 
+-\sum_{j=1}^{k-1} \underbrace{C_j(u_{n-j})}_{=:B_{n,j}} y_{n-j}
+\end{equation}
+Explicitly: $A_n = M - h\beta_0(H + u_n V)$ and $B_{n,j} = \alpha_j M - h\beta_j(H + u_{n-j}V)$.
+
+\paragraph{Example methods:}
+\begin{center}
+\begin{tabular}{l|cc|cc}
+Method & $\alpha_0, \alpha_1$ & $\alpha_2, \ldots$ & $\beta_0, \beta_1$ & $\beta_2,\ldots$ \\
+\hline
+Backward Euler (BDF1) & $1, -1$ & — & $1, 0$ & — \\
+Trapezoidal & $1, -1$ & — & $\frac{1}{2}, \frac{1}{2}$ & — \\
+BDF2 & $1, -\frac{4}{3}, \frac{1}{3}$ & — & $\frac{2}{3}, 0, 0$ & — \\
+Adams-Moulton 2 & $1, -1$ & — & $\frac{1}{2}, \frac{1}{2}$ & — \\
+Adams-Bashforth 2 & $1, -1$ & — & $0, \frac{3}{2}, -\frac{1}{2}$ & — \\
+\end{tabular}
+\end{center}
+
+\subsection{Global Banded Structure}
+
+Stack all unknowns into a global state vector $\mathbf{y} = (y_0, y_1, \ldots, y_N)\tp \in \CC^{n(N+1)}$. The constraints \eqref{eqn:step_update} for $n = k-1, \ldots, N$ can be written as
+\begin{equation}
+\label{eqn:global_constraint}
+\mathcal{E}(\mathbf{y}, u) = \mathbf{0}
+\end{equation}
+where $\mathcal{E}: \CC^{n(N+1)} \times \RR^{N+1} \to \CC^{n(N-k+2)}$.
+
+For the bilinear system, the Jacobian $\mathcal{E}_{\mathbf{y}}$ is a \emph{banded matrix} with bandwidth $k$:
+\begin{equation}
+\mathcal{E}_{\mathbf{y}} = 
+\begin{pmatrix}
+\ddots & & & & \\
+B_{k-1,k-1} & \cdots & B_{k-1,1} & A_{k-1} & & \\
+& B_{k,k-1} & \cdots & B_{k,1} & A_k & \\
+& & \ddots & & \ddots & \ddots \\
+& & & B_{N,k-1} & \cdots & B_{N,1} & A_N
+\end{pmatrix}
+\end{equation}
+This is block lower triangular with $k$ block diagonals. Each block is $n \times n$.
+
+For a 2-step method ($k=2$), the structure is block bidiagonal:
+\begin{equation}
+\mathcal{E}_{\mathbf{y}} = 
+\begin{pmatrix}
+B_{1,1} & A_1 & & & \\
+& B_{2,1} & A_2 & & \\
+& & B_{3,1} & A_3 & \\
+& & & \ddots & \ddots \\
+& & & & B_{N,1} & A_N
+\end{pmatrix}
+\end{equation}
+
+\subsection{Lagrangian and First-Order Conditions}
+
+Introduce Lagrange multipliers $\boldsymbol{\lambda} = (\lambda_{k-1}, \ldots, \lambda_N)\tp \in \CC^{n(N-k+2)}$ for the constraints. The Lagrangian is
+\begin{equation}
+\LL(\mathbf{y}, u, \boldsymbol{\lambda}) = J(\mathbf{y}, u) + 2\Re\left[ \boldsymbol{\lambda}\herm \mathcal{E}(\mathbf{y}, u) \right]
+\end{equation}
+
+The factor of 2 and the real part handle the complex-valued case correctly via Wirtinger calculus.
+
+\subsubsection{Adjoint Equation}
+
+Setting $\LL_{\mathbf{y}} = 0$ gives
+\begin{equation}
+\mathcal{E}_{\mathbf{y}}\herm \boldsymbol{\lambda} = -\frac{1}{2}\nabla_{\mathbf{y}} J
+\end{equation}
+
+Since $\mathcal{E}_{\mathbf{y}}$ is block lower triangular, its Hermitian transpose $\mathcal{E}_{\mathbf{y}}\herm$ is block \emph{upper} triangular with the same bandwidth $k$. The adjoint system is:
+\begin{equation}
+\label{eqn:adjoint_banded}
+\begin{pmatrix}
+A_{k-1}\herm & B_{k,1}\herm & B_{k+1,2}\herm & \cdots \\
+& A_k\herm & B_{k+1,1}\herm & B_{k+2,2}\herm & \cdots \\
+& & A_{k+1}\herm & B_{k+2,1}\herm & \cdots \\
+& & & \ddots & \ddots
+\end{pmatrix}
+\begin{pmatrix}
+\lambda_{k-1} \\ \lambda_k \\ \lambda_{k+1} \\ \vdots \\ \lambda_N
+\end{pmatrix}
+=
+\begin{pmatrix}
+0 \\ 0 \\ \vdots \\ 0 \\ Py_N
+\end{pmatrix}
+\end{equation}
+
+This is solved \emph{backward} in time. Explicitly, for $n = N, N-1, \ldots, k-1$:
+\begin{equation}
+\boxed{
+A_n\herm \lambda_n = -\sum_{j=1}^{\min(k-1, N-n)} B_{n+j,j}\herm \lambda_{n+j} + \delta_{n,N} P y_N
+}
+\end{equation}
+
+The key observation: $\lambda_n$ depends on $\lambda_{n+1}, \ldots, \lambda_{n+k-1}$ — exactly the reverse of how $y_n$ depends on $y_{n-1}, \ldots, y_{n-k+1}$.
+
+\subsubsection{Gradient}
+
+Setting $\LL_u = 0$ gives the optimality condition. The gradient of the reduced objective $\hat{J}(u) = J(\mathbf{y}(u), u)$ is
+\begin{equation}
+\nabla_{u_m} \hat{J} = (Ku)_m + 2\Re\left[ \sum_n \lambda_n\herm \pder{\mathcal{E}_n}{u_m} \right]
+\end{equation}
+
+The control $u_m$ appears in $C_j(u_m)$ wherever the constraint uses $y_m$. By the pencil structure \eqref{eqn:step_update}, $u_m$ multiplies $y_m$ in:
+\begin{itemize}
+\item Constraint at step $n = m$: via $C_0(u_m)$
+\item Constraint at step $n = m+1$: via $C_1(u_m)$ (acting on $y_{(m+1)-1} = y_m$)
+\item $\vdots$
+\item Constraint at step $n = m+k-1$: via $C_{k-1}(u_m)$ (acting on $y_{(m+k-1)-(k-1)} = y_m$)
+\end{itemize}
+
+Since $\partial C_j/\partial u = -h\beta_j V$, we have
+\begin{equation}
+\pder{\mathcal{E}_n}{u_m} = -h\beta_{n-m} V y_m \quad \text{for } n = m, m+1, \ldots, m+k-1
+\end{equation}
+
+Summing:
+\begin{equation}
+\boxed{
+\nabla_{u_m} \hat{J} = (Ku)_m - 2h\Re\left[ \sum_{j=0}^{\min(k-1,N-m)} \beta_j \lambda_{m+j}\herm V y_m \right]
+}
+\end{equation}
+
+The structure is: $u_m$ always pairs with $y_m$, but the contribution to the gradient sums over adjoints at steps $m, m+1, \ldots, m+k-1$.
+
+%==============================================================================
+\section{Second-Order Conditions: Bilinear Case}
+%==============================================================================
+
+\subsection{Structure of the Reduced Hessian}
+
+The reduced Hessian acts on a control perturbation $\delta u$ as
+\begin{equation}
+[\nabla^2 \hat{J}(u)]\delta u = K\delta u + 2\Re\left[ \mathcal{E}_u\herm \delta\boldsymbol{\lambda} + (\text{second-order terms in } \mathcal{E}) \right]
+\end{equation}
+
+For the bilinear system, $\mathcal{E}$ is affine in $u$ (since the $u$-dependence is $u_n V y_n$, linear in $u$). However, $\mathcal{E}$ is \emph{not} affine in $y$ when viewed jointly — but we're looking at the reduced problem where $y = y(u)$.
+
+The full computation requires:
+\begin{enumerate}
+\item State sensitivity: how $\delta y$ depends on $\delta u$
+\item Adjoint sensitivity: how $\delta\lambda$ depends on $\delta u$ and $\delta y$
+\item Assembly of the Hessian-vector product
+\end{enumerate}
+
+\subsection{State Sensitivity}
+
+Differentiating the constraint $\mathcal{E}(\mathbf{y}(u), u) = 0$ with respect to $u$:
+\begin{equation}
+\mathcal{E}_{\mathbf{y}} \delta\mathbf{y} + \mathcal{E}_u \delta u = 0
+\end{equation}
+
+This is a banded linear system for $\delta\mathbf{y}$:
+\begin{equation}
+\label{eqn:state_sensitivity}
+\mathcal{E}_{\mathbf{y}} \delta\mathbf{y} = -\mathcal{E}_u \delta u
+\end{equation}
+
+Explicitly, at step $n$:
+\begin{equation}
+\boxed{
+A_n \delta y_n = -\sum_{j=1}^{k-1} B_{n,j} \delta y_{n-j} + h\beta_0 V y_n \delta u_n + h\sum_{j=1}^{k-1} \beta_j V y_{n-j} \delta u_{n-j}
+}
+\end{equation}
+with $\delta y_0 = \cdots = \delta y_{k-2} = 0$ (initial conditions are fixed).
+
+The forcing on the right comes from the $u$-dependence in $A_n$ and $B_{n,j}$.
+
+\subsection{Adjoint Sensitivity}
+
+Differentiating the adjoint equation $\mathcal{E}_{\mathbf{y}}\herm \boldsymbol{\lambda} = -\frac{1}{2}\nabla_{\mathbf{y}} J$:
+\begin{equation}
+\mathcal{E}_{\mathbf{y}}\herm \delta\boldsymbol{\lambda} = -(\delta \mathcal{E}_{\mathbf{y}})\herm \boldsymbol{\lambda} - \frac{1}{2} J_{\mathbf{yy}} \delta\mathbf{y}
+\end{equation}
+
+The term $(\delta \mathcal{E}_{\mathbf{y}})\herm \boldsymbol{\lambda}$ arises because $\mathcal{E}_{\mathbf{y}}$ depends on $u$ (through the $u_n V$ terms in $A_n$ and $B_{n,j}$).
+
+Explicitly:
+\begin{equation}
+\delta A_n = -h\beta_0 \delta u_n V, \qquad \delta B_{n,j} = -h\beta_j \delta u_{n-j} V
+\end{equation}
+
+At step $n$, the adjoint sensitivity equation is:
+\begin{equation}
+\boxed{
+\begin{aligned}
+A_n\herm \delta\lambda_n &= -\sum_{j=1}^{\min(k-1,N-n)} B_{n+j,j}\herm \delta\lambda_{n+j} \\
+&\quad + h\beta_0 V\herm \lambda_n \delta u_n + h\sum_{j=1}^{\min(k-1,N-n)} \beta_j V\herm \lambda_{n+j} \delta u_n \\
+&\quad + \delta_{n,N} P \delta y_N
+\end{aligned}
+}
+\end{equation}
+
+This is solved backward, just like the original adjoint.
+
+\subsection{Hessian-Vector Product}
+
+Assembling everything:
+\begin{equation}
+\boxed{
+[\nabla^2\hat{J}(u)]\delta u = K\delta u + 2\Re\left[ \mathcal{L}_{u\lambda}\delta\boldsymbol{\lambda} + \mathcal{L}_{uy}\delta\mathbf{y} \right]
+}
+\end{equation}
+
+The components at index $n$:
+\begin{equation}
+\begin{aligned}
+(\mathcal{L}_{u\lambda}\delta\boldsymbol{\lambda})_n &= -h\beta_0 (\delta\lambda_n)\herm V y_n - h\sum_{j=1}^{\min(k-1,N-n)} \beta_j (\delta\lambda_{n+j})\herm V y_n \\[6pt]
+(\mathcal{L}_{uy}\delta\mathbf{y})_n &= -h\beta_0 \lambda_n\herm V \delta y_n - h\sum_{j=1}^{\min(k-1,N-n)} \beta_j \lambda_{n+j}\herm V \delta y_n
+\end{aligned}
+\end{equation}
+
+Note the symmetry: both terms have the same structure $\lambda\herm V \delta y$, but one has $\delta$ on $\lambda$ and one on $y$.
+
+%==============================================================================
+\section{Nonlinear System with Multistep Discretization}
+%==============================================================================
+
+Now consider the general nonlinear system
+\begin{equation}
+\dot{y} = f(y, u, t), \quad y(0) = y_0
+\end{equation}
+with $y:[0,T]\to\RR^n$, $u:[0,T]\to\RR^\nu$.
+
+\subsection{Discretization}
+
+The $k$-step method becomes:
+\begin{equation}
+\sum_{j=0}^{k-1} \alpha_j y_{n-j} = h\sum_{j=0}^{k-1} \beta_j f(y_{n-j}, u_{n-j}, t_{n-j})
+\end{equation}
+
+Define $f_n := f(y_n, u_n, t_n)$ and rearrange:
+\begin{equation}
+\label{eqn:nonlinear_step}
+y_n - h\beta_0 f_n = -\sum_{j=1}^{k-1} \alpha_j y_{n-j} + h\sum_{j=1}^{k-1} \beta_j f_{n-j}
+\end{equation}
+
+\subsection{Notation}
+
+Let $F_n := \partial f/\partial y |_{n}$ and $G_n := \partial f/\partial u|_n$ be the Jacobians at step $n$.
+
+For second derivatives contracted with a vector $v \in \RR^n$:
+\begin{align}
+F_{yy}^n[v] &:= \sum_\ell v_\ell \pder{^2 f_\ell}{y\partial y}\bigg|_n \in \RR^{n\times n} \\
+F_{yu}^n[v] &:= \sum_\ell v_\ell \pder{^2 f_\ell}{y\partial u}\bigg|_n \in \RR^{n\times \nu} \\
+F_{uu}^n[v] &:= \sum_\ell v_\ell \pder{^2 f_\ell}{u\partial u}\bigg|_n \in \RR^{\nu\times \nu}
+\end{align}
+
+\subsection{Global Constraint and Jacobian}
+
+The constraint $\mathcal{E}(\mathbf{y}, u) = 0$ has Jacobian with banded structure:
+\begin{equation}
+(\mathcal{E}_{\mathbf{y}})_{n,m} = 
+\begin{cases}
+I - h\beta_0 F_n & m = n \\
+-\alpha_j I + h\beta_j F_{n-j} & m = n-j, \; j = 1,\ldots,k-1 \\
+0 & \text{otherwise}
+\end{cases}
+\end{equation}
+
+This is block lower triangular with bandwidth $k$, exactly as in the bilinear case. The key difference: the blocks now depend on the solution through $F_n = F(y_n, u_n, t_n)$.
+
+\subsection{First-Order Conditions}
+
+\subsubsection{Adjoint Equation}
+
+The state $y_m$ appears in constraints at steps $m, m+1, \ldots, m+k-1$ (via the history terms). In each, the coefficient involves $F_m = \partial f/\partial y|_{y_m, u_m, t_m}$. Setting $\partial\LL/\partial y_m = 0$:
+
+\begin{equation}
+\sum_{j=0}^{\min(k-1, N-m)} (\alpha_j I - h\beta_j F_m\tp)\lambda_{m+j} = -\nabla_{y_m}J
+\end{equation}
+
+Rearranging to solve for $\lambda_m$ (using $\alpha_0 = 1$):
+\begin{equation}
+\boxed{
+(I - h\beta_0 F_m\tp) \lambda_m = -\sum_{j=1}^{\min(k-1,N-m)} (\alpha_j I - h\beta_j F_m\tp) \lambda_{m+j} + \delta_{m,N}\nabla_{y_N}J
+}
+\end{equation}
+
+Solved backward from $m = N$ to $m = k-1$.
+
+\paragraph{Key structural point:} All $F$ terms are evaluated at $m$ (not $m+j$). This follows from the pencil structure: $y_m$ pairs with $f_m$ which depends on $(y_m, u_m)$.
+
+\subsubsection{Gradient}
+
+By the same pencil logic as the bilinear case: $u_m$ affects $f_m = f(y_m, u_m, t_m)$, which appears in constraints at steps $m, m+1, \ldots, m+k-1$ with coefficients $\beta_0, \beta_1, \ldots, \beta_{k-1}$.
+
+\begin{equation}
+\boxed{
+\nabla_{u_m}\hat{J} = \pder{J}{u_m} - h\sum_{j=0}^{\min(k-1,N-m)} \beta_j G_m\tp \lambda_{m+j}
+}
+\end{equation}
+
+Note: $G_m = \partial f/\partial u|_{y_m, u_m, t_m}$ is evaluated at time $m$, but it multiplies adjoints from steps $m$ through $m+k-1$.
+
+\subsection{Second-Order Conditions}
+
+\subsubsection{State Sensitivity}
+
+Differentiating the constraint at step $n$:
+\begin{equation}
+\boxed{
+\begin{aligned}
+(I - h\beta_0 F_n)\delta y_n &= -\sum_{j=1}^{k-1}(\alpha_j I - h\beta_j F_{n-j})\delta y_{n-j} \\
+&\quad + h\sum_{j=0}^{k-1} \beta_j G_{n-j} \delta u_{n-j}
+\end{aligned}
+}
+\end{equation}
+
+Solved forward with $\delta y_0 = \cdots = \delta y_{k-2} = 0$.
+
+Note: each $F_{n-j}$, $G_{n-j}$ is evaluated at $(y_{n-j}, u_{n-j}, t_{n-j})$ — the Jacobians at different lags are at different points.
+
+\subsubsection{Adjoint Sensitivity}
+
+Differentiating the adjoint equation at step $m$. Since all $F_m$ terms are evaluated at $(y_m, u_m)$, we have $\delta F_m = F_{yy}^m[\cdot]\delta y_m + F_{yu}^m[\cdot]\delta u_m$. The adjoint sensitivity picks up second-derivative terms:
+
+\begin{equation}
+\boxed{
+\begin{aligned}
+(I - h\beta_0 F_m\tp)\delta\lambda_m &= -\sum_{j=1}^{\min(k-1,N-m)} (\alpha_j I - h\beta_j F_m\tp)\delta\lambda_{m+j} \\
+&\quad + h\sum_{j=0}^{\min(k-1,N-m)} \beta_j \Big[ F_{yy}^m[\lambda_{m+j}]\, \delta y_m + F_{yu}^m[\lambda_{m+j}]\, \delta u_m \Big] \\
+&\quad + \delta_{m,N} J_{y_N y_N} \delta y_N
+\end{aligned}
+}
+\end{equation}
+
+Solved backward.
+
+\paragraph{Key simplification:} All second-derivative terms $F_{yy}^m$, $F_{yu}^m$ are evaluated at step $m$, contracted with different adjoint vectors $\lambda_{m+j}$. This is cleaner than the RK case where stage coupling creates more complex index patterns.
+
+\subsubsection{Hessian-Vector Product}
+
+Assembling everything:
+\begin{equation}
+\boxed{
+[\nabla^2\hat{J}(u)]\delta u = J_{uu}\delta u + \mathcal{H}_{u\lambda}\delta\boldsymbol{\lambda} + \mathcal{H}_{uy}\delta\mathbf{y} + \mathcal{H}_{uu}^{\text{constr}}\delta u
+}
+\end{equation}
+
+At index $m$, define $\Lambda_m := \sum_{j=0}^{\min(k-1,N-m)} \beta_j \lambda_{m+j}$ as the weighted sum of adjoints. Then:
+\begin{align}
+(\mathcal{H}_{u\lambda}\delta\boldsymbol{\lambda})_m &= -h G_m\tp \sum_{j=0}^{\min(k-1,N-m)} \beta_j \delta\lambda_{m+j} \\[6pt]
+(\mathcal{H}_{uy}\delta\mathbf{y})_m &= -h \, F_{yu}^m[\Lambda_m]\tp \delta y_m \\[6pt]
+(\mathcal{H}_{uu}^{\text{constr}}\delta u)_m &= -h \, F_{uu}^m[\Lambda_m] \,\delta u_m
+\end{align}
+
+Note the simplification: all Hessian contractions are with $\Lambda_m$, evaluated at step $m$.
+
+%==============================================================================
+\section{Algorithm Summary}
+%==============================================================================
+
+To compute the Hessian-vector product $[\nabla^2\hat{J}(u)]\delta u$ for the nonlinear multistep case:
+
+\begin{enumerate}
+\item \textbf{Forward solve}: Compute $y_n$ for $n = k-1, \ldots, N$ via \eqref{eqn:nonlinear_step}. Store $F_n$, $G_n$.
+
+\item \textbf{Backward adjoint solve}: Compute $\lambda_n$ for $n = N, \ldots, k-1$.
+
+\item \textbf{Forward sensitivity solve}: Given $\delta u$, compute $\delta y_n$ for $n = k-1, \ldots, N$.
+
+\item \textbf{Backward adjoint sensitivity solve}: Compute $\delta\lambda_n$ for $n = N, \ldots, k-1$. This requires $F_{yy}^n$, $F_{yu}^n$ contracted with adjoint vectors.
+
+\item \textbf{Assemble}: Form $[\nabla^2\hat{J}]\delta u$ componentwise.
+\end{enumerate}
+
+\paragraph{Computational notes:}
+\begin{itemize}
+\item All four systems (forward state, backward adjoint, forward sensitivity, backward adjoint sensitivity) have the same banded structure with bandwidth $k$.
+\item The forward systems use $\mathcal{E}_{\mathbf{y}}$ (block lower triangular); the backward systems use $\mathcal{E}_{\mathbf{y}}\tp$ (block upper triangular).
+\item For $k$-step methods, each solve at step $n$ requires data from $k-1$ previous (forward) or future (backward) steps.
+\item The implicit systems at each step are $n \times n$ (no internal stages, unlike RK).
+\end{itemize}
+
+%==============================================================================
+\section{Verification: Reduction to Backward Euler}
+%==============================================================================
+
+Backward Euler is the 1-step method with $\alpha_0 = 1$, $\alpha_1 = -1$, $\beta_0 = 1$, $\beta_1 = 0$. The constraint is:
+\begin{equation}
+y_n - y_{n-1} - hf_n = 0
+\end{equation}
+
+\paragraph{Adjoint:} With $k=1$, there are no future coupling terms:
+\begin{equation}
+(I - hF_n\tp)\lambda_n = \lambda_{n+1} + \delta_{n,N}\nabla_{y_N}J
+\end{equation}
+This matches the standard backward Euler adjoint.
+
+\paragraph{Gradient:}
+\begin{equation}
+\nabla_{u_n}\hat{J} = \pder{J}{u_n} - hG_n\tp\lambda_n
+\end{equation}
+Matches the one-step formula.
+
+\paragraph{Sensitivity:}
+\begin{equation}
+(I - hF_n)\delta y_n = \delta y_{n-1} + hG_n\delta u_n
+\end{equation}
+The standard tangent linear model.
+
+This confirms the multistep formulas reduce correctly to the single-step case.
+
+\end{document}

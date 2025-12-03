@@ -1,0 +1,6 @@
+*.swp
+*.swo
+
+docs/*.aux
+docs/*.log
+docs/*.pdf

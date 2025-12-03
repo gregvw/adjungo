@@ -1,0 +1,337 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath,amsfonts,amssymb,fullpage}
+\usepackage{mathtools}
+
+% Shortcuts
+\newcommand{\LL}{\mathcal{L}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\tp}{^\top}
+\newcommand{\inv}{^{-1}}
+
+% Partial derivative shortcuts
+\newcommand{\pder}[2]{\frac{\partial #1}{\partial #2}}
+
+\begin{document}
+\title{Second-Order Optimality Conditions for Runge--Kutta Discretized Nonlinear Optimal Control}
+\date{\today}
+\author{Greg von Winckel}
+\maketitle
+
+\section{Problem Formulation}
+
+Consider the optimal control problem
+\begin{equation}
+\min_{y,u} J(y,u)
+\end{equation}
+subject to the nonlinear dynamical constraint
+\begin{equation}
+\label{eqn:dynamics}
+\dot{y} = f(y,u,t), \quad y(0) = y_0
+\end{equation}
+where $y:[0,T]\to\RR^n$ is the state, $u:[0,T]\to\RR^\nu$ is the control, and $f:\RR^n\times\RR^\nu\times\RR\to\RR^n$ is sufficiently smooth.
+
+\subsection{Runge--Kutta Discretization}
+
+The time interval $[0,T]$ is partitioned into $N$ uniform steps of size $h$, with $t_k = kh$. We discretize \eqref{eqn:dynamics} using a $d$-stage Runge--Kutta method specified by the Butcher tableau $(A,b,c)$ where $A\in\RR^{d\times d}$, $b\in\RR^d$, and $c\in\RR^d$.
+
+Introducing stage variables $z_k^i \approx y(t_{k-1}+c_i h)$ for $i=1,\ldots,d$ and $k=1,\ldots,N$, the discrete equations are
+\begin{equation}
+\label{eqn:rk_state}
+\boxed{
+\begin{aligned}
+z_k^i &= y_{k-1} + h \sum_{j=1}^d a_{ij} f_k^j \\[4pt]
+y_k &= y_{k-1} + h \sum_{j=1}^d b_j f_k^j
+\end{aligned}
+}
+\end{equation}
+where $f_k^j := f(z_k^j, u_k^j, t_{k-1}+c_j h)$ and $u_k^j := u(t_{k-1}+c_j h)$.
+
+\subsection{Notation for Derivatives}
+
+We adopt the following conventions. All Jacobians are evaluated at $(z_k^j, u_k^j, t_{k-1}+c_j h)$ unless otherwise noted.
+
+\paragraph{First derivatives of $f$:}
+\begin{align}
+F_k^j &:= \pder{f}{z}\bigg|_{k,j} \in \RR^{n\times n} &
+G_k^j &:= \pder{f}{u}\bigg|_{k,j} \in \RR^{n\times \nu}
+\end{align}
+
+\paragraph{Second derivatives of $f$:} For vectors $v\in\RR^n$ and $w\in\RR^\nu$, we define the contracted Hessians
+\begin{align}
+F_{zz}^{k,j}[v] &:= \sum_{\ell=1}^n v_\ell \, \pder{^2 f_\ell}{z\,\partial z}\bigg|_{k,j} \in \RR^{n\times n} \\[4pt]
+F_{zu}^{k,j}[v] &:= \sum_{\ell=1}^n v_\ell \, \pder{^2 f_\ell}{z\,\partial u}\bigg|_{k,j} \in \RR^{n\times \nu} \\[4pt]
+F_{uu}^{k,j}[v] &:= \sum_{\ell=1}^n v_\ell \, \pder{^2 f_\ell}{u\,\partial u}\bigg|_{k,j} \in \RR^{\nu\times \nu}
+\end{align}
+These represent the action of the Hessian tensor contracted with the vector $v$.
+
+\paragraph{Objective function:} We assume $J$ depends on terminal and running costs. Let $J_y$, $J_u$ denote gradients and $J_{yy}$, $J_{yu}$, $J_{uu}$ denote Hessian blocks, evaluated at appropriate indices.
+
+%==============================================================================
+\section{First-Order Optimality Conditions}
+%==============================================================================
+
+\subsection{Lagrangian}
+
+Introducing Lagrange multipliers $\lambda_k\in\RR^n$ for the state update and $\mu_k^i\in\RR^n$ for the stage equations, the Lagrangian is
+\begin{equation}
+\begin{aligned}
+\LL &= J(y,u) \\
+&\quad + \sum_{k=1}^N \lambda_k\tp \left( y_k - y_{k-1} - h\sum_{j=1}^d b_j f_k^j \right) \\
+&\quad + \sum_{k=1}^N \sum_{i=1}^d (\mu_k^i)\tp \left( z_k^i - y_{k-1} - h\sum_{j=1}^d a_{ij} f_k^j \right)
+\end{aligned}
+\end{equation}
+
+\subsection{Adjoint Equations}
+
+Taking variations with respect to $y_k$ and $z_k^i$ and setting them to zero yields the adjoint system, which propagates \emph{backward} in time.
+
+\paragraph{Terminal condition:}
+\begin{equation}
+\lambda_N = \pder{J}{y_N}
+\end{equation}
+
+\paragraph{State adjoint update:} For $k = N-1, \ldots, 1$:
+\begin{equation}
+\label{eqn:lambda_update}
+\boxed{
+\lambda_k = \lambda_{k+1} + \sum_{i=1}^d \mu_{k+1}^i + \pder{J}{y_k}
+}
+\end{equation}
+
+\paragraph{Stage adjoint:} For each $k$ and $i=1,\ldots,d$:
+\begin{equation}
+\label{eqn:mu_solve}
+\boxed{
+\mu_k^i = h\sum_{j=1}^d a_{ji} (F_k^j)\tp \mu_k^j + h b_i (F_k^i)\tp \lambda_k
+}
+\end{equation}
+For implicit methods, this is a coupled linear system in $\mu_k^1,\ldots,\mu_k^d$. Define the $nd\times nd$ matrix
+\begin{equation}
+\mathcal{M}_k := I_{nd} - h \begin{pmatrix}
+a_{11}(F_k^1)\tp & a_{21}(F_k^2)\tp & \cdots & a_{d1}(F_k^d)\tp \\
+a_{12}(F_k^1)\tp & a_{22}(F_k^2)\tp & \cdots & a_{d2}(F_k^d)\tp \\
+\vdots & \vdots & \ddots & \vdots \\
+a_{1d}(F_k^1)\tp & a_{2d}(F_k^2)\tp & \cdots & a_{dd}(F_k^d)\tp
+\end{pmatrix}
+\end{equation}
+and the forcing vector
+\begin{equation}
+\beta_k := h \begin{pmatrix} b_1 (F_k^1)\tp \lambda_k \\ b_2 (F_k^2)\tp \lambda_k \\ \vdots \\ b_d (F_k^d)\tp \lambda_k \end{pmatrix}
+\end{equation}
+Then \eqref{eqn:mu_solve} is equivalent to
+\begin{equation}
+\mathcal{M}_k \begin{pmatrix} \mu_k^1 \\ \vdots \\ \mu_k^d \end{pmatrix} = \beta_k
+\end{equation}
+
+\subsection{Gradient}
+
+The gradient of the reduced objective $\hat{J}(u) := J(y(u),u)$ with respect to the control at stage $(k,i)$ is
+\begin{equation}
+\label{eqn:gradient}
+\boxed{
+\nabla_{u_k^i} \hat{J} = \pder{J}{u_k^i} - h b_i (G_k^i)\tp \lambda_k - h\sum_{j=1}^d a_{ji} (G_k^j)\tp \mu_k^j
+}
+\end{equation}
+
+%==============================================================================
+\section{Second-Order Optimality Conditions}
+%==============================================================================
+
+To derive the reduced Hessian, we compute the differential change in all variables induced by a perturbation $\delta u$, then assemble the Hessian-vector product.
+
+\subsection{State Sensitivity Equations}
+
+Differentiating \eqref{eqn:rk_state} with respect to $u$ in direction $\delta u$:
+
+\begin{equation}
+\label{eqn:state_sensitivity}
+\boxed{
+\begin{aligned}
+\delta z_k^i &= \delta y_{k-1} + h\sum_{j=1}^d a_{ij} \left( F_k^j \,\delta z_k^j + G_k^j\, \delta u_k^j \right) \\[4pt]
+\delta y_k &= \delta y_{k-1} + h\sum_{j=1}^d b_j \left( F_k^j\, \delta z_k^j + G_k^j\, \delta u_k^j \right)
+\end{aligned}
+}
+\end{equation}
+with initial condition $\delta y_0 = 0$.
+
+In block form, define the $nd\times nd$ stage matrix (note: this is the transpose structure of $\mathcal{M}_k$)
+\begin{equation}
+\mathcal{A}_k := I_{nd} - h \begin{pmatrix}
+a_{11} F_k^1 & a_{12} F_k^2 & \cdots & a_{1d} F_k^d \\
+a_{21} F_k^1 & a_{22} F_k^2 & \cdots & a_{2d} F_k^d \\
+\vdots & \vdots & \ddots & \vdots \\
+a_{d1} F_k^1 & a_{d2} F_k^2 & \cdots & a_{dd} F_k^d
+\end{pmatrix}
+\end{equation}
+and forcing vectors
+\begin{equation}
+\phi_k := h \begin{pmatrix} \sum_j a_{1j} G_k^j \,\delta u_k^j \\ \vdots \\ \sum_j a_{dj} G_k^j\, \delta u_k^j \end{pmatrix}, \qquad
+\psi_k := h \sum_{j=1}^d b_j G_k^j \,\delta u_k^j
+\end{equation}
+Then the stage sensitivity solves
+\begin{equation}
+\mathcal{A}_k \begin{pmatrix} \delta z_k^1 \\ \vdots \\ \delta z_k^d \end{pmatrix} = \mathbf{1}_d \otimes \delta y_{k-1} + \phi_k
+\end{equation}
+followed by
+\begin{equation}
+\delta y_k = \delta y_{k-1} + h\sum_{j=1}^d b_j F_k^j \,\delta z_k^j + \psi_k
+\end{equation}
+
+\subsection{Adjoint Sensitivity Equations}
+
+Differentiating the adjoint equations \eqref{eqn:lambda_update}--\eqref{eqn:mu_solve} yields the adjoint sensitivity system, which also propagates backward.
+
+\paragraph{Terminal condition:}
+\begin{equation}
+\delta\lambda_N = J_{y_N y_N}\, \delta y_N + J_{y_N u}\, \delta u
+\end{equation}
+where $J_{y_N u}\,\delta u$ collects any cross terms if the objective couples $y_N$ and $u$.
+
+\paragraph{State adjoint sensitivity:} For $k = N-1,\ldots,1$:
+\begin{equation}
+\label{eqn:delta_lambda}
+\boxed{
+\delta\lambda_k = \delta\lambda_{k+1} + \sum_{i=1}^d \delta\mu_{k+1}^i + J_{y_k y_k}\, \delta y_k
+}
+\end{equation}
+
+\paragraph{Stage adjoint sensitivity:} This is where nonlinearity introduces second-derivative terms. For each $k$ and $i$:
+\begin{equation}
+\label{eqn:delta_mu}
+\boxed{
+\begin{aligned}
+\delta\mu_k^i &= h\sum_{j=1}^d a_{ji} \Big[ (F_k^j)\tp \delta\mu_k^j + F_{zz}^{k,j}[\mu_k^j]\, \delta z_k^j + F_{zu}^{k,j}[\mu_k^j]\, \delta u_k^j \Big] \\[4pt]
+&\quad + h b_i \Big[ (F_k^i)\tp \delta\lambda_k + F_{zz}^{k,i}[\lambda_k]\, \delta z_k^i + F_{zu}^{k,i}[\lambda_k]\, \delta u_k^i \Big]
+\end{aligned}
+}
+\end{equation}
+
+The terms $F_{zz}^{k,j}[\mu_k^j]$ and $F_{zz}^{k,i}[\lambda_k]$ arise from differentiating $(F_k^j)\tp \mu_k^j$ with respect to $z_k^j$, and similarly for the $F_{zu}$ terms.
+
+In block form, define the forcing
+\begin{equation}
+\begin{aligned}
+\gamma_k^i &:= h\sum_{j=1}^d a_{ji} \Big[ F_{zz}^{k,j}[\mu_k^j]\, \delta z_k^j + F_{zu}^{k,j}[\mu_k^j]\, \delta u_k^j \Big] \\
+&\quad + h b_i \Big[ (F_k^i)\tp \delta\lambda_k + F_{zz}^{k,i}[\lambda_k]\, \delta z_k^i + F_{zu}^{k,i}[\lambda_k]\, \delta u_k^i \Big]
+\end{aligned}
+\end{equation}
+Then \eqref{eqn:delta_mu} becomes
+\begin{equation}
+\mathcal{M}_k \begin{pmatrix} \delta\mu_k^1 \\ \vdots \\ \delta\mu_k^d \end{pmatrix} = \begin{pmatrix} \gamma_k^1 \\ \vdots \\ \gamma_k^d \end{pmatrix}
+\end{equation}
+using the same matrix $\mathcal{M}_k$ from the first-order adjoint solve.
+
+\subsection{Reduced Hessian Action}
+
+The action of the reduced Hessian on $\delta u$ is
+\begin{equation}
+\label{eqn:hessian_action}
+\boxed{
+[\nabla^2\hat{J}(u)]\,\delta u = \mathcal{H}_{uu}\,\delta u + \mathcal{H}_{uy}\,\delta y + \mathcal{H}_{uz}\,\delta z + \mathcal{H}_{u\lambda}\,\delta\lambda + \mathcal{H}_{u\mu}\,\delta\mu
+}
+\end{equation}
+
+The individual components at control index $(k,i)$ are:
+
+\paragraph{Direct control Hessian:}
+\begin{equation}
+(\mathcal{H}_{uu}\,\delta u)_k^i = \pder{^2 J}{(u_k^i)^2}\,\delta u_k^i - h b_i\, F_{uu}^{k,i}[\lambda_k]\,\delta u_k^i - h\sum_{j=1}^d a_{ji}\, F_{uu}^{k,j}[\mu_k^j]\,\delta u_k^j
+\end{equation}
+
+\paragraph{Control-state cross term:}
+\begin{equation}
+(\mathcal{H}_{uy}\,\delta y)_k^i = J_{u_k^i y}\,\delta y
+\end{equation}
+where this collects any objective cross-derivatives between $u_k^i$ and state variables.
+
+\paragraph{Control-stage cross term:}
+\begin{equation}
+(\mathcal{H}_{uz}\,\delta z)_k^i = -h b_i\, F_{zu}^{k,i}[\lambda_k]\tp \delta z_k^i - h\sum_{j=1}^d a_{ji}\, F_{zu}^{k,j}[\mu_k^j]\tp \delta z_k^j
+\end{equation}
+Note the transpose on $F_{zu}$: the operator $F_{zu}^{k,j}[v]$ maps $\RR^\nu\to\RR^n$, so its transpose maps $\RR^n\to\RR^\nu$.
+
+\paragraph{Adjoint coupling terms:}
+\begin{align}
+(\mathcal{H}_{u\lambda}\,\delta\lambda)_k^i &= -h b_i\, (G_k^i)\tp \delta\lambda_k \\[4pt]
+(\mathcal{H}_{u\mu}\,\delta\mu)_k^i &= -h\sum_{j=1}^d a_{ji}\, (G_k^j)\tp \delta\mu_k^j
+\end{align}
+
+%==============================================================================
+\section{Algorithm Summary}
+%==============================================================================
+
+To compute the Hessian-vector product $[\nabla^2\hat{J}(u)]\,\delta u$:
+
+\begin{enumerate}
+\item \textbf{Forward state solve:} Compute $y_k$, $z_k^i$ from \eqref{eqn:rk_state} and store all Jacobians $F_k^j$, $G_k^j$.
+
+\item \textbf{Backward adjoint solve:} Compute $\lambda_k$, $\mu_k^i$ from \eqref{eqn:lambda_update}--\eqref{eqn:mu_solve}.
+
+\item \textbf{Forward sensitivity solve:} Given $\delta u$, compute $\delta y_k$, $\delta z_k^i$ from \eqref{eqn:state_sensitivity}. This requires the stored Jacobians but also the second derivatives $F_{zz}$, $F_{zu}$, $F_{uu}$ contracted with adjoint variables.
+
+\item \textbf{Backward adjoint sensitivity solve:} Compute $\delta\lambda_k$, $\delta\mu_k^i$ from \eqref{eqn:delta_lambda}--\eqref{eqn:delta_mu}.
+
+\item \textbf{Assemble:} Form the Hessian-vector product via \eqref{eqn:hessian_action}.
+\end{enumerate}
+
+\paragraph{Computational notes:}
+\begin{itemize}
+\item The matrices $\mathcal{A}_k$ and $\mathcal{M}_k = \mathcal{A}_k\tp$ share a factorization (up to transposition), reducing work.
+\item For explicit methods ($A$ strictly lower triangular), the stage systems decouple and can be solved by forward/backward substitution.
+\item The second-derivative tensors $F_{zz}$, $F_{zu}$, $F_{uu}$ need not be formed explicitly; only their contractions with known vectors are required.
+\end{itemize}
+
+%==============================================================================
+\section{Comparison with the Bilinear Case}
+%==============================================================================
+
+For the bilinear system $M\dot{y} = Hy + u(t)Vy$, we have
+\begin{equation}
+f(y,u,t) = M\inv(H + uV)y
+\end{equation}
+and thus
+\begin{align}
+F &= M\inv(H+uV) & G &= M\inv V y \\[4pt]
+F_{zz} &= 0 & F_{zu} &= M\inv V \\[4pt]
+F_{uu} &= 0
+\end{align}
+
+Substituting into the general formulas:
+\begin{itemize}
+\item The state sensitivity \eqref{eqn:state_sensitivity} reduces to a linear system with forcing $G_k^j\,\delta u_k^j = M\inv V z_k^j\,\delta u_k^j$, matching the $(B_k'\delta u_k)z_k$ and $(A_k'\delta u_k)z_k$ terms in your bilinear derivation.
+
+\item The adjoint sensitivity \eqref{eqn:delta_mu} loses the $F_{zz}$ terms (they vanish) and the $F_{zu}[\mu]\,\delta u$ terms become $M\inv V\,\delta u$, which after transposition gives the $(A_k'{}^\ast \delta u_k)p_k$ terms.
+
+\item The Hessian cross terms $\mathcal{H}_{uz}$ reduce to $-h b_i (M\inv V)\tp \lambda_k$ contracted appropriately, recovering your $\LL_{uz}\delta z$ expressions.
+\end{itemize}
+
+%==============================================================================
+\section{Special Case: Tracking Objective}
+%==============================================================================
+
+A common objective is the tracking functional with terminal cost and regularization:
+\begin{equation}
+J(y,u) = \frac{1}{2}(y_N - y_d)\tp Q_N (y_N-y_d) + \frac{h}{2}\sum_{k=1}^N \sum_{i=1}^d b_i \left[ (y_k-y_d)\tp Q\,(y_k-y_d) + (u_k^i)\tp R\, u_k^i \right]
+\end{equation}
+where $Q_N, Q \succeq 0$ and $R \succ 0$.
+
+For this objective:
+\begin{align}
+\pder{J}{y_N} &= Q_N(y_N-y_d) + hb_{\cdot} Q(y_N-y_d) \\
+\pder{J}{y_k} &= h b_{\cdot} Q(y_k-y_d), \quad k < N \\
+\pder{J}{u_k^i} &= h b_i R\, u_k^i
+\end{align}
+and the Hessians are
+\begin{equation}
+J_{y_N y_N} = Q_N + hb_\cdot Q, \qquad J_{y_k y_k} = hb_\cdot Q, \qquad J_{u_k^i u_k^i} = h b_i R
+\end{equation}
+with all cross terms $J_{yu} = 0$.
+
+The reduced Hessian action simplifies to
+\begin{equation}
+[\nabla^2\hat{J}(u)]\,\delta u = hb_i R\,\delta u + \text{(adjoint coupling and second-derivative terms)}
+\end{equation}
+
+\end{document}
