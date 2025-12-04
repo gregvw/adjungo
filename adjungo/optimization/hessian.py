@@ -25,6 +25,7 @@ def assemble_hessian_vector_product(
     method: GLMethod,
     problem: Problem,
     h: float,
+    t0: float = 0.0,
 ) -> NDArray:
     """
     From glm_opt.tex:
@@ -56,18 +57,31 @@ def assemble_hessian_vector_product(
 
     for step in range(N):
         cache = trajectory.caches[step]
+        Lambda_k = adjoint.WeightedAdj[step]  # Weighted adjoints
 
         for k in range(s):
             # J_{uu} δu (from objective)
             hvp[step, k] = objective.d2J_du2(u[step, k], step, k) @ delta_u[step, k]
 
-            # -h G_k^T δΛ_k
+            # -h G_k^T δΛ_k (adjoint sensitivity contribution)
             delta_Lambda_k = adj_sensitivity.delta_WeightedAdj[step, k]
             hvp[step, k] -= h * cache.G[k].T @ delta_Lambda_k
 
-            # Second-order terms (if available)
-            # -h F_{yu}[Λ_k]^T δZ_k
-            # -h F_{uu}[Λ_k] δu_k
-            # (Placeholder - requires second derivatives)
+            # Second-order terms from constraint Hessian
+            if hasattr(problem, 'F_yu_action') and hasattr(problem, 'F_uu_action'):
+                y_k = trajectory.Z[step, k]
+                u_k = u[step, k]
+                t_n = t0 + step * h
+                t_k = t_n + method.c[k] * h
+
+                # -h F_{yu}[Λ_k]^T δZ_k
+                # This is the transpose of F_{yu}[Λ_k], so we compute it as:
+                # (δZ_k)^T F_{yu}[Λ_k]
+                F_yu_Lambda = problem.F_yu_action(y_k, u_k, t_k, Lambda_k[k])
+                hvp[step, k] -= h * sensitivity.delta_Z[step, k].T @ F_yu_Lambda
+
+                # -h F_{uu}[Λ_k] δu_k
+                F_uu_du = problem.F_uu_action(y_k, u_k, t_k, delta_u[step, k])
+                hvp[step, k] -= h * Lambda_k[k].T @ F_uu_du
 
     return hvp

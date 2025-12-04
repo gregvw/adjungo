@@ -144,6 +144,7 @@ class GLMOptimizer:
             self._trajectory,
             self._adjoint,
             sensitivity,
+            u,
             v,
             self.method,
             self.stage_solver,
@@ -162,6 +163,7 @@ class GLMOptimizer:
             self.method,
             self.problem,
             self.h,
+            self.t_span[0],
         )
 
     def scipy_interface(self) -> Tuple[Callable, Callable]:
