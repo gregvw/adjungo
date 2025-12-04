@@ -63,7 +63,7 @@ def test_optimizer_caches_forward_and_adjoint(monkeypatch):
         Z = np.zeros((N, 1, 1))
         return Trajectory(Y=Y, Z=Z, caches=[None] * N)
 
-    def fake_adjoint(trajectory, objective, method, stage_solver):
+    def fake_adjoint(trajectory, objective, method, stage_solver, h):
         adjoint_calls.append(True)
         Lambda = np.zeros_like(trajectory.Y)
         Mu = np.zeros_like(trajectory.Z)
