@@ -2,6 +2,12 @@
 
 General Linear Method optimization library for optimal control problems.
 
+## Why "adjungo"?
+
+The name comes from the Latin verb adjungō: "I join to" (from ad- "to, toward" + jungō "I join, yoke"). This is the direct ancestor of the English word "adjoint"—the French adjoindre descends from the Latin infinitive adjungere.
+The etymology captures the mathematical relationship precisely. In the adjoint method, we don't merely combine equations symmetrically; we attach the adjoint system to the primal problem, exploiting its structure to compute gradients efficiently. The directional sense of ad- reflects this dependency.
+The first-person singular form follows Latin verbs that survive in English as active declarations: audio ("I hear"), video ("I see"), adjungo ("I join to"). The library announces what it does.
+
 ## Overview
 
 Adjungo provides a framework for solving optimal control problems using General Linear Methods (GLMs) with support for:
