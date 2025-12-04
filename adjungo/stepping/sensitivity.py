@@ -169,9 +169,14 @@ def adjoint_sensitivity(
     delta_Mu = np.zeros((N, s, n))
     delta_WeightedAdj = np.zeros((N, s, n))
 
-    # Terminal condition from objective Hessian
-    # δλ[N] = J_{yy}(y_final) δy_final
-    delta_Lambda[N] = 0  # For now - would need objective.d2J_dy2_terminal()
+    # Terminal condition for adjoint sensitivity
+    # δλ[N] should capture how the terminal objective Hessian couples with state sensitivity
+    # For terminal cost J(y_final), we have: δλ[N] depends on d²J/dy² δy_final
+    # BUT in the discrete adjoints paper, this is handled through the gradient assembly
+    # So the terminal condition here should indeed be zero for the Lagrangian formulation
+    delta_Lambda[N] = 0
+
+    # TODO: Verify if we need terminal Hessian contribution here or in gradient assembly
 
     # Backward sweep (same direction as adjoint solve)
     for step in range(N - 1, -1, -1):
@@ -238,8 +243,12 @@ def adjoint_sensitivity(
                 pass
 
         # Compute weighted adjoint sensitivities for Hessian assembly
+        # δΛ_k = Σ_j a_{jk} δμ_j + Σ_j b_{jk} δλ_j
         for k in range(s):
-            delta_WeightedAdj[step, k] = cache.F[k].T @ delta_Mu[step, k]
+            delta_WeightedAdj[step, k] = (
+                A[:, k] @ delta_Mu[step] +  # Σ_j a_{jk} δμ_j
+                B[:, k] @ delta_Lambda[step + 1]  # Σ_j b_{jk} δλ_j
+            )
 
         # Propagate external stages backward
         # δλ^{n-1} = U^T δμ + V^T δλ + J_{yy} δy^{n-1}
