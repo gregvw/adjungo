@@ -94,3 +94,31 @@ def sdirk3() -> GLMethod:
     V = np.array([[1.0]])
     c = np.array([gamma, (1.0 + gamma)/2.0, 1.0])
     return GLMethod(A=A, U=U, B=B, V=V, c=c)
+
+
+def implicit_trapezoid() -> GLMethod:
+    """
+    Implicit trapezoidal rule / Crank-Nicolson method (2nd order, A-stable).
+
+    This is the DIRK(2,2) method:
+        y_{n+1} = y_n + h/2 * [f(y_n, u_n, t_n) + f(y_{n+1}, u_{n+1}, t_{n+1})]
+
+    The method has two stages:
+        - Stage 1: Explicit evaluation at y_n (c_1 = 0)
+        - Stage 2: Implicit evaluation at y_{n+1} (c_2 = 1)
+
+    Properties:
+        - A-stable (unconditionally stable)
+        - 2nd order accurate
+        - Symplectic for Hamiltonian systems
+        - Excellent for stiff problems and long-time integration
+    """
+    A = np.array([
+        [0.0, 0.0],      # Stage 1: explicit (Z_1 = y_n)
+        [0.5, 0.5],      # Stage 2: implicit (Z_2 involves f(Z_2))
+    ])
+    U = np.array([[1.0], [1.0]])
+    B = np.array([[0.5, 0.5]])  # Equal weights (trapezoidal)
+    V = np.array([[1.0]])
+    c = np.array([0.0, 1.0])    # Evaluate at t_n and t_{n+1}
+    return GLMethod(A=A, U=U, B=B, V=V, c=c)

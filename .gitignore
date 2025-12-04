@@ -1,6 +1,14 @@
 *.swp
 *.swo
 
+*.egg-info
+*.pyc
+
+
+.venv
+
+__pycache__
+
 docs/*.aux
 docs/*.log
 docs/*.pdf

@@ -83,8 +83,9 @@ def _classify_stage_structure(A: NDArray) -> StageType:
         if len(nonzero_diag) == 0:
             return StageType.EXPLICIT
 
-        # All nonzero diagonal entries equal?
-        if np.allclose(nonzero_diag, nonzero_diag[0]):
+        # SDIRK: ALL diagonal entries must be equal and nonzero
+        # (not just the nonzero ones being equal!)
+        if len(nonzero_diag) == s and np.allclose(diag, diag[0]):
             return StageType.SDIRK
         return StageType.DIRK
 

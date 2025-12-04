@@ -43,9 +43,21 @@ class DIRKStageSolver(StageSolver):
                 # Explicit stage
                 Z[i] = rhs
             else:
-                # Implicit stage - simplified linear solve
-                # For nonlinear problems, should use Newton iteration
-                Z[i] = rhs  # Placeholder
+                # Implicit stage: Z_i = rhs + h * a_ii * f(Z_i, u_i)
+                # For linear problems: Z_i = rhs + h * a_ii * (F * Z_i + G * u_i)
+                # Rearranging: (I - h * a_ii * F) * Z_i = rhs + h * a_ii * G * u_i
+
+                # Get Jacobians (for LTI, these are constant)
+                F_matrix = problem.F(rhs, u_stages[i], t_stage)
+                G_matrix = problem.G(rhs, u_stages[i], t_stage)
+
+                # Build implicit system
+                gamma = method.A[i, i]
+                I_minus_gamma_hF = np.eye(n) - h * gamma * F_matrix
+                rhs_implicit = rhs + h * gamma * (G_matrix @ u_stages[i])
+
+                # Solve linear system
+                Z[i] = np.linalg.solve(I_minus_gamma_hF, rhs_implicit)
 
             self._f_cached[i] = problem.f(Z[i], u_stages[i], t_stage)
             F_list.append(problem.F(Z[i], u_stages[i], t_stage))
