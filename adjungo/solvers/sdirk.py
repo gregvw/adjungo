@@ -82,6 +82,7 @@ class SDIRKStageSolver(StageSolver):
         lambda_ext: NDArray,
         cache: StepCache,
         method: GLMethod,
+        h: float,
     ) -> NDArray:
         """
         Solve adjoint stages using cached factorization.
@@ -93,11 +94,11 @@ class SDIRKStageSolver(StageSolver):
 
         mu = np.zeros((s, n))
 
-        # Solve (I - hγF)^T μ = B^T λ + coupling terms
+        # Solve (I - hγF)^T μ = h * (F_i^T B λ + coupling terms)
         for i in range(s - 1, -1, -1):
-            rhs = B[:, i].T @ lambda_ext
+            rhs = h * cache.F[i].T @ (B[:, i] @ lambda_ext)
             for j in range(i + 1, s):
-                rhs += A[j, i] * cache.F[i].T @ mu[j]
+                rhs += h * A[j, i] * cache.F[j].T @ mu[j]
 
             if cache.factorization is not None and not np.isclose(
                 method.A[i, i], 0

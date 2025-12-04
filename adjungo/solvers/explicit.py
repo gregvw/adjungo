@@ -51,6 +51,7 @@ class ExplicitStageSolver(StageSolver):
         lambda_ext: NDArray,
         cache: StepCache,
         method: GLMethod,
+        h: float,
     ) -> NDArray:
         """Backward substitution for A^T (upper triangular)."""
         s = method.s
@@ -59,10 +60,10 @@ class ExplicitStageSolver(StageSolver):
 
         mu = np.zeros((s, n))
 
-        # Backward substitution: μ_i = h Σ_{j>i} a_{ji} F_i^T μ_j + b_i F_i^T λ
+        # Backward substitution: μ_i = h Σ_{j>i} a_{ji} F_j^T μ_j + h b_i F_i^T λ
         for i in range(s - 1, -1, -1):
-            mu[i] = B[:, i].T @ lambda_ext
+            mu[i] = h * cache.F[i].T @ (B[:, i] @ lambda_ext)
             for j in range(i + 1, s):
-                mu[i] += A[j, i] * cache.F[i].T @ mu[j]
+                mu[i] += h * A[j, i] * cache.F[j].T @ mu[j]
 
         return mu

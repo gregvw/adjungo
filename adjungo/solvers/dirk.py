@@ -58,6 +58,7 @@ class DIRKStageSolver(StageSolver):
         lambda_ext: NDArray,
         cache: StepCache,
         method: GLMethod,
+        h: float,
     ) -> NDArray:
         """Solve adjoint stages for DIRK."""
         s = method.s
@@ -67,8 +68,8 @@ class DIRKStageSolver(StageSolver):
         mu = np.zeros((s, n))
 
         for i in range(s - 1, -1, -1):
-            mu[i] = B[:, i].T @ lambda_ext
+            mu[i] = h * cache.F[i].T @ (B[:, i] @ lambda_ext)
             for j in range(i + 1, s):
-                mu[i] += A[j, i] * cache.F[i].T @ mu[j]
+                mu[i] += h * A[j, i] * cache.F[j].T @ mu[j]
 
         return mu

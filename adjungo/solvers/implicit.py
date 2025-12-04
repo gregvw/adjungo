@@ -41,6 +41,7 @@ class ImplicitStageSolver(StageSolver):
         lambda_ext: NDArray,
         cache: StepCache,
         method: GLMethod,
+        h: float,
     ) -> NDArray:
         """Solve fully coupled adjoint system."""
         s = method.s

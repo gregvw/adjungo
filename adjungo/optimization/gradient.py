@@ -48,10 +48,10 @@ def assemble_gradient(
             # ∂J/∂u contribution (if objective depends on u directly)
             grad[step, k] = objective.dJ_du(u[step, k], step, k)
 
-            # Constraint contribution: -h G_k^T Λ_k
+            # Constraint contribution: +h G_k^T Λ_k
             G_k = cache.G[k]  # (n, ν)
             Lambda_k = adjoint.WeightedAdj[step, k]  # (n,)
 
-            grad[step, k] -= h * G_k.T @ Lambda_k
+            grad[step, k] += h * G_k.T @ Lambda_k
 
     return grad

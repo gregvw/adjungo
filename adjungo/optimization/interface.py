@@ -204,5 +204,5 @@ class GLMOptimizer:
         if self._adjoint is None:
             assert self._trajectory is not None
             self._adjoint = adjoint_solve(
-                self._trajectory, self.objective, self.method, self.stage_solver
+                self._trajectory, self.objective, self.method, self.stage_solver, self.h
             )

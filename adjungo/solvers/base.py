@@ -53,6 +53,7 @@ class StageSolver(ABC):
         lambda_ext: NDArray,  # (r, n) external adjoints
         cache: StepCache,
         method: "GLMethod",
+        h: float,
     ) -> NDArray:
         """
         Solve adjoint stage equations: A^T μ = B^T λ.
@@ -61,6 +62,7 @@ class StageSolver(ABC):
             lambda_ext: External stage adjoints (r, n)
             cache: Cached data from forward solve
             method: GLM tableau
+            h: Step size
 
         Returns:
             μ: Stage adjoints (s, n)

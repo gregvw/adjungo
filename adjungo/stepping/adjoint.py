@@ -24,6 +24,7 @@ def adjoint_solve(
     objective: Objective,
     method: GLMethod,
     stage_solver: StageSolver,
+    h: float,
 ) -> AdjointTrajectory:
     """
     Algorithm 2: Backward adjoint solve from glm_opt.tex Section 7.
@@ -38,6 +39,7 @@ def adjoint_solve(
         objective: Objective function
         method: GLM tableau
         stage_solver: Stage equation solver
+        h: Step size
 
     Returns:
         Adjoint trajectory with Lambda, Mu, and weighted adjoints
@@ -57,7 +59,7 @@ def adjoint_solve(
 
         # Solve A^T μ = B^T λ (reuses factorization from forward!)
         Mu[step] = stage_solver.solve_adjoint_stages(
-            Lambda[step + 1], cache, method
+            Lambda[step + 1], cache, method, h
         )
 
         # Compute weighted adjoint: Λ_k = Σ_j a_{jk} μ_j + Σ_j b_{jk} λ_j
