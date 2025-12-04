@@ -100,8 +100,12 @@ def _classify_prop_structure(V: NDArray) -> PropType:
         return PropType.IDENTITY
 
     # Check shift matrix
-    if r > 1 and np.allclose(V, np.eye(r, k=1)):
-        return PropType.SHIFT
+    if r > 1:
+        forward_shift = np.eye(r, k=1)
+        cyclic_shift = np.roll(np.eye(r), -1, axis=1)
+
+        if np.allclose(V, forward_shift) or np.allclose(V, cyclic_shift):
+            return PropType.SHIFT
 
     # Check lower triangular
     if np.allclose(V, np.tril(V)):
