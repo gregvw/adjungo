@@ -1,7 +1,8 @@
 """Problem specification protocols."""
 
-from typing import Protocol, Optional
 from enum import Enum, auto
+from typing import Protocol
+
 from numpy.typing import NDArray
 
 

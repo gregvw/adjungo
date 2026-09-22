@@ -3,15 +3,14 @@
 import numpy as np
 import pytest
 
-from adjungo.core.requirements import deduce_requirements, SolverRequirements
-from adjungo.core.problem import ProblemStructure, Linearity
 from adjungo.core.method import GLMethod, StageType
-from adjungo.methods.runge_kutta import explicit_euler, rk4, sdirk2, implicit_midpoint
-from adjungo.solvers.factory import create_stage_solver
-from adjungo.solvers.explicit import ExplicitStageSolver
-from adjungo.solvers.sdirk import SDIRKStageSolver
+from adjungo.core.problem import Linearity, ProblemStructure
+from adjungo.core.requirements import deduce_requirements
+from adjungo.methods.runge_kutta import explicit_euler, implicit_midpoint, rk4, sdirk2
 from adjungo.solvers.dirk import DIRKStageSolver
-from adjungo.solvers.implicit import ImplicitStageSolver
+from adjungo.solvers.explicit import ExplicitStageSolver
+from adjungo.solvers.factory import create_stage_solver
+from adjungo.solvers.sdirk import SDIRKStageSolver
 
 
 def test_requirements_explicit_method():
@@ -189,7 +188,12 @@ def test_factory_dirk_method():
 
 
 def test_factory_implicit_method():
-    """Test factory creates implicit solver for fully implicit methods."""
+    """Factory dispatches fully implicit tableaux to the refusing solver.
+
+    Dispatch itself is still exercised: the NotImplementedError can only come
+    from ImplicitStageSolver, so reaching it proves the decision tree routed
+    correctly. The solver is uncertified until M3 (NUMERICS.md C-6.1).
+    """
     # Create a fully implicit method
     A = np.array([[0.25, 0.25 - np.sqrt(3)/6], [0.25 + np.sqrt(3)/6, 0.25]])
     U = np.array([[1.0], [1.0]])
@@ -208,8 +212,8 @@ def test_factory_implicit_method():
     )
     req = deduce_requirements(method, problem, state_dim=5)
 
-    solver = create_stage_solver(method, req, problem)
-    assert isinstance(solver, ImplicitStageSolver)
+    with pytest.raises(NotImplementedError, match=r"not implemented"):
+        create_stage_solver(method, req, problem)
 
 
 def test_problem_structure_linearity_classification():

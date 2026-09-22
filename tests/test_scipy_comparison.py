@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 from scipy.integrate import solve_ivp
 
-from adjungo.stepping.forward import forward_solve
+from adjungo.methods.runge_kutta import explicit_euler, heun, rk4
 from adjungo.solvers.explicit import ExplicitStageSolver
-from adjungo.methods.runge_kutta import explicit_euler, rk4, heun
+from adjungo.stepping.forward import forward_solve
 
 
 class LinearODE:
@@ -122,7 +122,7 @@ def test_rk4_vs_scipy_harmonic_oscillator():
     print(f"Initial: [{y0[0]:.6f}, {y0[1]:.6f}]")
     print(f"Ours (RK4): [{y_final_ours[0]:.6f}, {y_final_ours[1]:.6f}]")
     print(f"Scipy (RK45): [{y_final_scipy[0]:.6f}, {y_final_scipy[1]:.6f}]")
-    print(f"Analytical: [1.0, 0.0]")
+    print("Analytical: [1.0, 0.0]")
 
     # Both should be close to [1, 0]
     assert np.allclose(y_final_ours, y0, atol=0.01)

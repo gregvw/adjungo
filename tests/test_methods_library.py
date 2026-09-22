@@ -1,21 +1,28 @@
 """Tests for standard method tableaux library."""
 
+import dataclasses
+
 import numpy as np
 import pytest
 
+from adjungo.core.method import PropType, StageType
+from adjungo.methods.experimental.imex import imex_ark2, imex_ark3
+from adjungo.methods.experimental.multistep import (
+    adams_bashforth2,
+    adams_moulton2,
+    bdf2,
+    bdf3,
+)
+from adjungo.methods.glm import create_custom_glm, validate_glm
 from adjungo.methods.runge_kutta import (
     explicit_euler,
-    rk4,
+    gauss2,
     heun,
     implicit_midpoint,
-    gauss2,
+    rk4,
     sdirk2,
     sdirk3,
 )
-from adjungo.methods.multistep import bdf2, bdf3, adams_bashforth2, adams_moulton2
-from adjungo.methods.glm import create_custom_glm, validate_glm
-from adjungo.methods.imex import imex_ark2, imex_ark3
-from adjungo.core.method import StageType, PropType
 
 
 def test_explicit_euler_structure():
@@ -128,46 +135,33 @@ def test_sdirk3_structure():
         assert np.isclose(method.A[i, i], gamma)
 
 
-def test_bdf2_structure():
-    """Test BDF2 multistep method."""
-    method = bdf2()
+@pytest.mark.parametrize(
+    ("factory", "expected_r"), [(bdf2, 2), (bdf3, 3)]
+)
+def test_bdf_tableaux_are_shape_valid_but_uncertified(factory, expected_r):
+    """BDF tableaux construct, but carry no accuracy claim (C-6.3).
 
-    assert method.s == 1  # Single stage
-    assert method.r == 2  # Two-step method
-
-    # Check shift matrix
-    assert method.prop_type == PropType.SHIFT
-
-
-def test_bdf3_structure():
-    """Test BDF3 multistep method."""
-    method = bdf3()
+    They satisfy the C-8.2 shape invariants, so unlike the Adams tableaux they
+    are constructible. They are refused by the optimizer solely because r > 1.
+    This test deliberately asserts nothing about their accuracy.
+    """
+    method = factory()
 
     assert method.s == 1
-    assert method.r == 3  # Three-step method
-
-    # Check that it's implicit
-    assert not np.isclose(method.A[0, 0], 0.0)
+    assert method.r == expected_r
+    assert not np.isclose(method.A[0, 0], 0.0), "BDF stages are implicit"
 
 
-def test_adams_bashforth2_structure():
-    """Test Adams-Bashforth 2-step method."""
-    method = adams_bashforth2()
+@pytest.mark.parametrize("factory", [adams_bashforth2, adams_moulton2])
+def test_adams_tableaux_are_malformed_and_refused(factory):
+    """Adams tableaux store history coefficients in the rows of A.
 
-    assert method.s == 2  # Two stages for history evaluation
-    assert method.r == 2  # Two-step method
-    assert method.stage_type == StageType.EXPLICIT
-
-
-def test_adams_moulton2_structure():
-    """Test Adams-Moulton 2-step method."""
-    method = adams_moulton2()
-
-    assert method.s == 2
-    assert method.r == 2
-
-    # Adams-Moulton is implicit
-    assert not np.isclose(method.A[0, 0], 0.0)
+    That gives A shape (1, 2). Since s is read from A.shape[0], these reported
+    s == 1 while supplying two abscissae, so every shape-derived quantity was
+    silently wrong. C-8.2 validation turns this into a construction error.
+    """
+    with pytest.raises(ValueError, match=r"A must be square"):
+        factory()
 
 
 def test_create_custom_glm():
@@ -262,12 +256,16 @@ def test_method_immutability():
     """Test that methods are immutable (frozen dataclass)."""
     method = rk4()
 
-    with pytest.raises(Exception):  # FrozenInstanceError or similar
+    with pytest.raises(dataclasses.FrozenInstanceError):
         method.s = 10
 
 
 def test_all_methods_have_correct_shapes():
-    """Test that all methods have consistent array shapes."""
+    """Every constructible tableau satisfies the C-8.2 shape invariants.
+
+    adams_bashforth2 and adams_moulton2 are absent because they cannot be
+    constructed at all; see test_adams_tableaux_are_malformed_and_refused.
+    """
     methods = [
         explicit_euler(),
         rk4(),
@@ -278,8 +276,6 @@ def test_all_methods_have_correct_shapes():
         sdirk3(),
         bdf2(),
         bdf3(),
-        adams_bashforth2(),
-        adams_moulton2(),
     ]
 
     for method in methods:

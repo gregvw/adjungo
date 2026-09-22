@@ -1,9 +1,9 @@
 """General Linear Method specification."""
 
 from dataclasses import dataclass
-from functools import cached_property
 from enum import Enum, auto
-from typing import Optional
+from functools import cached_property
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -34,15 +34,56 @@ class GLMethod:
     V: NDArray  # (r, r) - history → output
     c: NDArray  # (s,)   - abscissae
 
+    def __post_init__(self) -> None:
+        """Enforce the NUMERICS.md C-8.2 shape invariants.
+
+        A tableau that stores per-history coefficients in the rows of ``A`` is
+        malformed, not merely unconventional: ``s`` is read from ``A.shape[0]``,
+        so such a tableau silently reports the wrong stage count instead of
+        failing. Validating here makes that a construction-time error.
+        """
+        for name in ("A", "U", "B", "V", "c"):
+            value = getattr(self, name)
+            if not isinstance(value, np.ndarray):
+                raise TypeError(
+                    f"GLMethod.{name} must be a numpy array, got "
+                    f"{type(value).__name__}."
+                )
+
+        if self.A.ndim != 2 or self.A.shape[0] != self.A.shape[1]:
+            raise ValueError(
+                f"GLMethod.A must be square (s, s); got shape {self.A.shape}. "
+                f"A tableau needing per-history coefficients is not "
+                f"representable this way under C-8."
+            )
+
+        s = self.A.shape[0]
+
+        if self.V.ndim != 2 or self.V.shape[0] != self.V.shape[1]:
+            raise ValueError(
+                f"GLMethod.V must be square (r, r); got shape {self.V.shape}."
+            )
+
+        r = self.V.shape[0]
+
+        expected = {"U": (s, r), "B": (r, s), "c": (s,)}
+        for name, shape in expected.items():
+            actual = getattr(self, name).shape
+            if actual != shape:
+                raise ValueError(
+                    f"GLMethod.{name} must have shape {shape} for s={s}, r={r}; "
+                    f"got {actual}. See NUMERICS.md C-8.2."
+                )
+
     @cached_property
     def s(self) -> int:
         """Number of internal stages."""
-        return self.A.shape[0]
+        return int(self.A.shape[0])
 
     @cached_property
     def r(self) -> int:
         """Number of external stages."""
-        return self.V.shape[0]
+        return int(self.V.shape[0])
 
     @cached_property
     def stage_type(self) -> StageType:
@@ -55,7 +96,7 @@ class GLMethod:
         return _classify_prop_structure(self.V)
 
     @cached_property
-    def sdirk_gamma(self) -> Optional[float]:
+    def sdirk_gamma(self) -> float | None:
         """Return γ if SDIRK, otherwise None."""
         if self.stage_type == StageType.SDIRK:
             return float(self.A[0, 0])

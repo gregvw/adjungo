@@ -1,6 +1,7 @@
 """Dense linear algebra backend using NumPy/SciPy."""
 
-from typing import Any, Tuple
+from typing import cast
+
 import numpy as np
 import scipy.linalg
 from numpy.typing import NDArray
@@ -13,18 +14,18 @@ class DenseBackend:
         """Solve linear system Ax = b using direct solve."""
         return np.linalg.solve(A, b)
 
-    def lu_factor(self, A: NDArray) -> Tuple[NDArray, NDArray]:
+    def lu_factor(self, A: NDArray) -> tuple[NDArray, NDArray]:
         """
         Compute LU factorization using scipy.
 
         Returns:
             (lu, piv) tuple from scipy.linalg.lu_factor
         """
-        return scipy.linalg.lu_factor(A)
+        return cast("tuple[NDArray, NDArray]", scipy.linalg.lu_factor(A))
 
     def lu_solve(
         self,
-        factorization: Tuple[NDArray, NDArray],
+        factorization: tuple[NDArray, NDArray],
         b: NDArray,
         trans: int = 0,
     ) -> NDArray:
@@ -39,7 +40,7 @@ class DenseBackend:
         Returns:
             Solution x
         """
-        return scipy.linalg.lu_solve(factorization, b, trans=trans)
+        return cast("NDArray", scipy.linalg.lu_solve(factorization, b, trans=trans))
 
     def norm(self, x: NDArray) -> float:
         """Compute L2 norm."""

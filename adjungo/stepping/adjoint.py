@@ -1,13 +1,14 @@
 """Backward adjoint propagation."""
 
 from dataclasses import dataclass
+
 import numpy as np
 from numpy.typing import NDArray
 
-from adjungo.stepping.trajectory import Trajectory
-from adjungo.solvers.base import StageSolver
-from adjungo.core.objective import Objective
 from adjungo.core.method import GLMethod
+from adjungo.core.objective import Objective
+from adjungo.solvers.base import StageSolver
+from adjungo.stepping.trajectory import Trajectory
 
 
 @dataclass

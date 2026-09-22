@@ -1,12 +1,10 @@
 """Tests for stage solvers."""
 
 import numpy as np
-import pytest
 
+from adjungo.methods.runge_kutta import explicit_euler, rk4, sdirk2
 from adjungo.solvers.explicit import ExplicitStageSolver
 from adjungo.solvers.sdirk import SDIRKStageSolver
-from adjungo.core.method import GLMethod
-from adjungo.methods.runge_kutta import explicit_euler, rk4, sdirk2
 
 
 class SimpleProblem:
@@ -76,7 +74,7 @@ def test_explicit_solver_adjoint():
     t_n = 0.0
     h = 0.1
 
-    Z, cache = solver.solve_stages(y_history, u_stages, t_n, h, problem, method)
+    _Z, cache = solver.solve_stages(y_history, u_stages, t_n, h, problem, method)
 
     # Adjoint with zero terminal condition
     lambda_ext = np.zeros((1, 2))
@@ -115,7 +113,7 @@ def test_sdirk_solver_adjoint():
     t_n = 0.0
     h = 0.1
 
-    Z, cache = solver.solve_stages(y_history, u_stages, t_n, h, problem, method)
+    _Z, cache = solver.solve_stages(y_history, u_stages, t_n, h, problem, method)
 
     # Adjoint should reuse factorization
     lambda_ext = np.ones((1, 2))
@@ -135,7 +133,7 @@ def test_solver_cache_structure():
     t_n = 0.0
     h = 0.1
 
-    Z, cache = solver.solve_stages(y_history, u_stages, t_n, h, problem, method)
+    _Z, cache = solver.solve_stages(y_history, u_stages, t_n, h, problem, method)
 
     # Verify cache structure
     assert hasattr(cache, "Z")

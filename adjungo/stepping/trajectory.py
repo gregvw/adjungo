@@ -1,7 +1,9 @@
 """Trajectory storage for optimization."""
 
 from dataclasses import dataclass
+
 from numpy.typing import NDArray
+
 from adjungo.solvers.base import StepCache
 
 
@@ -21,14 +23,14 @@ class Trajectory:
     @property
     def n(self) -> int:
         """State dimension."""
-        return self.Y.shape[2]
+        return int(self.Y.shape[2])
 
     @property
     def r(self) -> int:
         """Number of external stages."""
-        return self.Y.shape[1]
+        return int(self.Y.shape[1])
 
     @property
     def s(self) -> int:
         """Number of internal stages."""
-        return self.Z.shape[1]
+        return int(self.Z.shape[1])

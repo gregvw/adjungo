@@ -1,13 +1,12 @@
 """Tests for utility functions."""
 
 import numpy as np
-import pytest
 
 from adjungo.utils.kronecker import (
-    kronecker_eye,
-    eye_kronecker,
     block_matvec,
     block_solve,
+    eye_kronecker,
+    kronecker_eye,
 )
 
 

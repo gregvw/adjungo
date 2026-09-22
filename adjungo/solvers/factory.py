@@ -1,13 +1,13 @@
 """Solver factory and dispatch logic."""
 
-from adjungo.solvers.base import StageSolver
-from adjungo.solvers.explicit import ExplicitStageSolver
-from adjungo.solvers.sdirk import SDIRKStageSolver
-from adjungo.solvers.dirk import DIRKStageSolver
-from adjungo.solvers.implicit import ImplicitStageSolver
 from adjungo.core.method import GLMethod, StageType
-from adjungo.core.requirements import SolverRequirements
 from adjungo.core.problem import ProblemStructure
+from adjungo.core.requirements import SolverRequirements
+from adjungo.solvers.base import StageSolver
+from adjungo.solvers.dirk import DIRKStageSolver
+from adjungo.solvers.explicit import ExplicitStageSolver
+from adjungo.solvers.implicit import ImplicitStageSolver
+from adjungo.solvers.sdirk import SDIRKStageSolver
 
 
 def create_stage_solver(
@@ -38,5 +38,7 @@ def create_stage_solver(
     if method.stage_type == StageType.DIRK:
         return DIRKStageSolver()
 
-    # Fully implicit
+    # Fully implicit. ImplicitStageSolver.__init__ raises (NUMERICS.md C-6.2);
+    # constructing it here rather than returning a placeholder keeps the refusal
+    # on the direct-construction path too, not only via GLMOptimizer.
     return ImplicitStageSolver()

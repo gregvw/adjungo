@@ -1,6 +1,7 @@
 """General Linear Method utilities and custom tableaux."""
 
 import numpy as np
+
 from adjungo.core.method import GLMethod
 
 

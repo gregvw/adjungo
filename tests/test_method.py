@@ -1,6 +1,6 @@
 import numpy as np
 
-from adjungo.core.method import GLMethod, StageType, PropType
+from adjungo.core.method import GLMethod, PropType, StageType
 
 
 def test_stage_and_prop_classification():

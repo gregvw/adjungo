@@ -3,15 +3,15 @@
 import numpy as np
 from numpy.typing import NDArray
 
-from adjungo.stepping.trajectory import Trajectory
+from adjungo.core.method import GLMethod
+from adjungo.core.objective import Objective
+from adjungo.core.problem import Problem
 from adjungo.stepping.adjoint import AdjointTrajectory
 from adjungo.stepping.sensitivity import (
-    SensitivityTrajectory,
     AdjointSensitivityTrajectory,
+    SensitivityTrajectory,
 )
-from adjungo.core.objective import Objective
-from adjungo.core.method import GLMethod
-from adjungo.core.problem import Problem
+from adjungo.stepping.trajectory import Trajectory
 
 
 def assemble_hessian_vector_product(
@@ -52,7 +52,7 @@ def assemble_hessian_vector_product(
     Returns:
         Hessian-vector product (N, s, ν)
     """
-    N, s, nu = u.shape
+    N, s, _nu = u.shape
     hvp = np.zeros_like(u)
 
     for step in range(N):

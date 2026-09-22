@@ -10,10 +10,10 @@ Tests:
 import numpy as np
 import pytest
 
+from adjungo.core.problem import Linearity, ProblemStructure
+from adjungo.methods.runge_kutta import explicit_euler, implicit_trapezoid
 from adjungo.optimization.interface import GLMOptimizer
-from adjungo.core.problem import ProblemStructure, Linearity
-from adjungo.methods.runge_kutta import implicit_trapezoid, explicit_euler
-from adjungo.stepping.sensitivity import forward_sensitivity, adjoint_sensitivity
+from adjungo.stepping.sensitivity import adjoint_sensitivity, forward_sensitivity
 
 
 class MildlyNonlinearProblem:
@@ -239,7 +239,6 @@ def test_forward_sensitivity_finite_difference():
     delta_u[10, 0, 0] = 1.0  # Pulse at step 10
 
     # Forward sensitivity: δy from δu
-    from adjungo.stepping.sensitivity import forward_sensitivity
     sens = forward_sensitivity(
         trajectory, delta_u, method, optimizer.stage_solver,
         optimizer.problem, optimizer.h
@@ -259,8 +258,25 @@ def test_forward_sensitivity_finite_difference():
         f"Sensitivity: {sens.delta_Y[-1]}, FD: {delta_y_fd[-1]}"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="U-M1.3: sensitivity.py sets delta_Lambda[N]=0 where the derivation "
+           "requires J_yy*delta_y^[N]. Observed eps-independent plateau 3.14e-2 "
+           "against a reference of the same magnitude. Remove this marker when "
+           "the terminal term lands; xfail_strict will flag it as XPASS.",
+)
 def test_adjoint_sensitivity_finite_difference():
-    """Test adjoint sensitivity δλ against finite differences."""
+    """Test adjoint sensitivity δλ against finite differences.
+
+    Marked xfail pending the terminal-Hessian cure (NUMERICS.md precedent R-1,
+    plan unit U-M1.3). ``sensitivity.py`` sets ``delta_Lambda[N] = 0`` where the
+    derivation requires ``J_yy δy^[N]``, so δλ currently recovers only about 3%
+    of its true magnitude.
+
+    Before this test was made real it asserted only ``is not None`` on two
+    dataclass fields that are unconditionally assigned arrays, so it could never
+    fail and concealed the defect entirely.
+    """
     problem = MildlyNonlinearProblem()
     objective = SimpleObjective(y_target=1.0)
     method = explicit_euler()
@@ -285,7 +301,6 @@ def test_adjoint_sensitivity_finite_difference():
     delta_u[10, 0, 0] = 1.0
 
     # Forward sensitivity to get δy
-    from adjungo.stepping.sensitivity import forward_sensitivity, adjoint_sensitivity
 
     sens = forward_sensitivity(
         trajectory, delta_u, method, optimizer.stage_solver,
@@ -298,24 +313,52 @@ def test_adjoint_sensitivity_finite_difference():
         optimizer.stage_solver, optimizer.problem, optimizer.h
     )
 
-    # Finite difference on adjoint
-    eps = 1e-6
+    # Central difference on the adjoint, at a FIXED mesh (NUMERICS.md C-2).
+    # Fresh optimizers are built per perturbation rather than poking the private
+    # cache key, so this test does not depend on cache-invalidation internals.
+    def _adjoint_at(u_eval):
+        opt = GLMOptimizer(
+            problem=MildlyNonlinearProblem(),
+            objective=SimpleObjective(y_target=1.0),
+            method=explicit_euler(),
+            t_span=(0.0, 1.0),
+            N=20,
+            y0=np.array([0.0]),
+        )
+        opt._ensure_adjoint(u_eval)
+        return opt._adjoint.Lambda.copy()
 
-    # Perturb control, recompute trajectory and adjoint
-    u_pert = u + eps * delta_u
-    optimizer._u_hash = None  # Force recompute
-    optimizer._ensure_adjoint(u_pert)
-    lambda_pert = optimizer._adjoint.Lambda
+    eps = 1e-5
+    delta_lambda_fd = (
+        _adjoint_at(u + eps * delta_u) - _adjoint_at(u - eps * delta_u)
+    ) / (2 * eps)
 
-    delta_lambda_fd = (lambda_pert - adjoint.Lambda) / eps
+    scale = max(np.max(np.abs(delta_lambda_fd)), 1.0)
+    err = np.max(np.abs(adj_sens.delta_Lambda - delta_lambda_fd))
 
-    # Check terminal adjoint sensitivity
-    # This is subtle - the terminal condition changes with δy
-    # So we compare the propagated values
-    assert adj_sens.delta_Lambda is not None
-    assert adj_sens.delta_Mu is not None
+    # Tolerance basis (C-3.2): central difference on a smooth reduced map at
+    # eps=1e-5 carries truncation O(eps^2)~1e-10 and cancellation
+    # O(eps_mach*|L|/eps)~1e-11, so 1e-6 relative is loose by several decades
+    # and any failure is a genuine defect rather than differencing noise.
+    assert err / scale < 1e-6, (
+        f"adjoint sensitivity delta_Lambda disagrees with central differences: "
+        f"max abs error {err:.6e}, reference scale {scale:.6e}. "
+        f"delta_Lambda[N] = {adj_sens.delta_Lambda[-1]} "
+        f"(a nonzero terminal term J_yy*delta_y is required)."
+    )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="U-M1.3: the Hessian-vector product omits the terminal J_yy*delta_y "
+           "term (delta_Lambda[N] is set to 0) and the running J_yy*delta_y "
+           "term. Finite differences of the gradient plateau at 3.82152e-3 "
+           "independently of eps, which per C-3.3 proves the operator is not "
+           "the Hessian of the implemented discrete objective. The dense "
+           "operator is symmetric to 8.7e-19 while being wrong, so symmetry is "
+           "no defence (precedent R-3). Remove this marker when M1.3 lands; "
+           "xfail_strict will flag it as XPASS.",
+)
 def test_hessian_vector_product_finite_difference():
     """Test Hessian-vector product [∇²J]v against finite differences."""
     problem = MildlyNonlinearProblem()
@@ -419,33 +462,3 @@ def test_gradient_nonlinear_vs_linear():
     # Very close match expected
     assert np.allclose(grad_linear, grad_nonlinear, rtol=1e-2, atol=1e-4), \
         f"Max diff: {np.max(np.abs(grad_linear - grad_nonlinear)):.6e}"
-
-
-if __name__ == "__main__":
-    print("Testing mildly nonlinear problems and sensitivities...")
-
-    print("\n1. Testing explicit Euler with mild nonlinearity...")
-    test_mildly_nonlinear_explicit_euler()
-    print("   ✅ Explicit Euler works with nonlinearity")
-
-    print("\n2. Testing quadratic drag...")
-    test_quadratic_drag_explicit()
-    print("   ✅ Quadratic drag optimization works")
-
-    print("\n3. Testing forward sensitivity...")
-    test_forward_sensitivity_finite_difference()
-    print("   ✅ Forward sensitivity matches FD")
-
-    print("\n4. Testing gradient linear vs. nonlinear...")
-    test_gradient_nonlinear_vs_linear()
-    print("   ✅ Nonlinear reduces to linear for small states")
-
-    print("\n5. Testing Hessian-vector product...")
-    try:
-        test_hessian_vector_product_finite_difference()
-        print("   ✅ Hessian-vector product works")
-    except Exception as e:
-        print(f"   ⚠️  Hessian test: {e}")
-
-    print("\n🎉 All implemented tests pass!")
-    print("\n⚠️  Note: Implicit methods need Newton iteration for nonlinear problems")

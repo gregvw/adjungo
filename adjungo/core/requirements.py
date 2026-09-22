@@ -1,8 +1,9 @@
 """Solver requirements deduction."""
 
 from dataclasses import dataclass
+
 from adjungo.core.method import GLMethod, StageType
-from adjungo.core.problem import ProblemStructure, Linearity
+from adjungo.core.problem import Linearity, ProblemStructure
 
 
 @dataclass

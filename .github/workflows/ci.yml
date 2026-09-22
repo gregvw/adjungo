@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # NUMERICS.md C-11.1: the linked backend is part of the certification
+      # record. Development machines here link Apple Accelerate while CI links
+      # OpenBLAS, so this log is how a tolerance failure is attributed.
+      - name: Record BLAS/LAPACK backend (C-11.1)
+        run: |
+          python - <<'PY'
+          import numpy, scipy, sys
+          print("python :", sys.version)
+          print("numpy  :", numpy.__version__)
+          print("scipy  :", scipy.__version__)
+          print("-" * 60)
+          numpy.show_config()
+          print("-" * 60)
+          try:
+              import scipy.linalg.blas as B
+              print("scipy BLAS dgemm from:", B.get_blas_funcs("gemm", dtype="d").module_name)
+          except Exception as exc:
+              print("scipy BLAS probe unavailable:", exc)
+          PY
+
+      - name: Lint
+        run: python -m ruff check adjungo tests
+
+      # C-11.2 keeps certified routes on LU only. An SVD-based route would need
+      # that clause amended, so flag any appearance in the library.
+      - name: Guard certified linear-algebra routes (C-11.2)
+        run: |
+          if grep -rnE '\b(svd|svdvals|pinv|lstsq|eigh?|schur|qz)\s*\(' adjungo/; then
+            echo "::error::Non-LU linear-algebra route found. NUMERICS.md C-11.2 restricts"
+            echo "::error::certified routes to LU. Amend the clause before merging."
+            exit 1
+          fi
+          echo "No non-LU routes found."
+
+      - name: Type check
+        run: python -m mypy adjungo
+
+      - name: Test
+        run: python -m pytest
+
+  collection:
+    name: pytest collection is clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+
+      # AGENTS.md forbids root-level test_*.py. They are not tests, and one of
+      # them previously raised at import and broke bare `pytest` collection.
+      - name: No test_*.py at the repository root
+        run: |
+          if ls test_*.py >/dev/null 2>&1; then
+            echo "::error::Root-level test_*.py found. Put exploratory scripts in"
+            echo "::error::scripts/diagnostics/ (see AGENTS.md)."
+            exit 1
+          fi
+          echo "Repository root is clean."
+
+      # testpaths must make bare `pytest` and `pytest tests/` agree.
+      - name: Bare pytest collects exactly tests/
+        run: |
+          bare=$(python -m pytest --collect-only -q 2>&1 | tail -1)
+          scoped=$(python -m pytest tests/ --collect-only -q 2>&1 | tail -1)
+          echo "bare  : $bare"
+          echo "scoped: $scoped"
+          test "$bare" = "$scoped"

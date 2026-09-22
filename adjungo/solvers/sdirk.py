@@ -1,13 +1,14 @@
 """SDIRK stage solver with factorization reuse."""
 
+from typing import Any
+
 import numpy as np
 import scipy.linalg
-from typing import Optional, Any
 from numpy.typing import NDArray
 
-from adjungo.solvers.base import StageSolver, StepCache
-from adjungo.core.problem import Problem
 from adjungo.core.method import GLMethod
+from adjungo.core.problem import Problem
+from adjungo.solvers.base import StageSolver, StepCache
 
 
 class SDIRKStageSolver(StageSolver):
@@ -17,7 +18,7 @@ class SDIRKStageSolver(StageSolver):
     """
 
     def __init__(self, reuse_across_steps: bool = False) -> None:
-        self._global_factorization: Optional[Any] = None
+        self._global_factorization: Any | None = None
         self._reuse_across_steps = reuse_across_steps
         self._f_cached: list[NDArray] = []
 
@@ -42,7 +43,7 @@ class SDIRKStageSolver(StageSolver):
         G_list: list[NDArray] = []
         self._f_cached = [np.zeros(n) for _ in range(s)]
 
-        factorization: Optional[Any] = None
+        factorization: Any | None = None
 
         for i in range(s):
             t_stage = t_n + method.c[i] * h
@@ -86,7 +87,17 @@ class SDIRKStageSolver(StageSolver):
     ) -> NDArray:
         """
         Solve adjoint stages using cached factorization.
-        Key: scipy.linalg.lu_solve with trans=1 solves A^T x = b.
+
+        Differentiating the stage equations gives
+
+            (I - h γ F_i^T) μ_i = h F_i^T ( Σ_{j>i} A[j,i] μ_j
+                                            + Σ_l B[l,i] λ_l )
+
+        ``F_i`` (not ``F_j``) multiplies the entire weighted sum, because
+        ``Z_i`` enters every stage equation only through ``f(Z_i, ...)``.
+
+        Key: ``scipy.linalg.lu_solve`` with ``trans=1`` solves ``A^T x = b``,
+        so the forward factorization of ``I - h γ F`` is reused directly.
         """
         s = method.s
         n = cache.Z.shape[1]
@@ -94,11 +105,11 @@ class SDIRKStageSolver(StageSolver):
 
         mu = np.zeros((s, n))
 
-        # Solve (I - hγF)^T μ = h * (F_i^T B λ + coupling terms)
         for i in range(s - 1, -1, -1):
-            rhs = h * cache.F[i].T @ (B[:, i] @ lambda_ext)
+            weighted = B[:, i] @ lambda_ext
             for j in range(i + 1, s):
-                rhs += h * A[j, i] * cache.F[j].T @ mu[j]
+                weighted = weighted + A[j, i] * mu[j]
+            rhs = h * cache.F[i].T @ weighted
 
             if cache.factorization is not None and not np.isclose(
                 method.A[i, i], 0

@@ -1,7 +1,11 @@
 """Objective function protocols."""
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from adjungo.stepping.trajectory import Trajectory
 
 
 class Objective(Protocol):

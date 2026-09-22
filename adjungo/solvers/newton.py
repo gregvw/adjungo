@@ -1,6 +1,8 @@
 """Newton solver mixin for nonlinear stage equations."""
 
-from typing import Callable, Any
+from collections.abc import Callable
+from typing import Any
+
 import numpy as np
 import scipy.linalg
 from numpy.typing import NDArray

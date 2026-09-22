@@ -1,6 +1,7 @@
 """Standard Runge-Kutta method tableaux."""
 
 import numpy as np
+
 from adjungo.core.method import GLMethod
 
 

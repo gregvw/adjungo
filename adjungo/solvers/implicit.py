@@ -1,15 +1,35 @@
-"""Fully implicit stage solver."""
+"""Fully implicit stage solver.
 
-import numpy as np
+NOT YET IMPLEMENTED. This class exists as an explicit refusal (NUMERICS.md
+C-6.2) and is certified in milestone M3.
+
+History, recorded as NUMERICS.md precedent R-4: both methods previously returned
+zero arrays as placeholders. A Gauss-2 forward solve therefore returned the
+initial condition unchanged, with no exception and no warning, and the caller
+had no way to distinguish that from a correct result. Under C-7 a silent
+sentinel is a contract violation rather than an incomplete feature, so the
+bodies were deleted rather than left reachable.
+"""
+
 from numpy.typing import NDArray
 
-from adjungo.solvers.base import StageSolver, StepCache
-from adjungo.core.problem import Problem
 from adjungo.core.method import GLMethod
+from adjungo.core.problem import Problem
+from adjungo.solvers.base import StageSolver, StepCache
+
+_MESSAGE = (
+    "Fully implicit stage solves are not implemented (NUMERICS.md C-6.1; "
+    "scheduled for milestone M3). A tableau with a dense stage matrix A "
+    "requires a coupled (s*n) x (s*n) Newton solve. Use an explicit, DIRK, or "
+    "SDIRK method instead."
+)
 
 
 class ImplicitStageSolver(StageSolver):
-    """Fully implicit stage solver for general A matrices."""
+    """Refuses fully implicit tableaux until milestone M3 certifies them."""
+
+    def __init__(self) -> None:
+        raise NotImplementedError(_MESSAGE)
 
     def solve_stages(
         self,
@@ -20,21 +40,8 @@ class ImplicitStageSolver(StageSolver):
         problem: Problem,
         method: GLMethod,
     ) -> tuple[NDArray, StepCache]:
-        """Solve fully coupled implicit stages."""
-        s, n = method.s, problem.state_dim
-
-        # Placeholder: would solve full (s*n) x (s*n) system
-        Z = np.zeros((s, n))
-        F_list: list[NDArray] = []
-        G_list: list[NDArray] = []
-
-        # Simplified version - actual implementation would solve coupled system
-        for i in range(s):
-            t_stage = t_n + method.c[i] * h
-            F_list.append(problem.F(Z[i], u_stages[i], t_stage))
-            G_list.append(problem.G(Z[i], u_stages[i], t_stage))
-
-        return Z, StepCache(Z=Z, F=F_list, G=G_list)
+        """Unreachable: construction raises."""
+        raise NotImplementedError(_MESSAGE)
 
     def solve_adjoint_stages(
         self,
@@ -43,11 +50,5 @@ class ImplicitStageSolver(StageSolver):
         method: GLMethod,
         h: float,
     ) -> NDArray:
-        """Solve fully coupled adjoint system."""
-        s = method.s
-        n = cache.Z.shape[1]
-
-        # Placeholder
-        mu = np.zeros((s, n))
-
-        return mu
+        """Unreachable: construction raises."""
+        raise NotImplementedError(_MESSAGE)

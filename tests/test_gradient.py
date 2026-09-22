@@ -1,11 +1,10 @@
 """Tests for gradient computation via finite differences."""
 
 import numpy as np
-import pytest
 
-from adjungo.optimization.interface import GLMOptimizer
-from adjungo.core.problem import ProblemStructure, Linearity
+from adjungo.core.problem import Linearity, ProblemStructure
 from adjungo.methods.runge_kutta import explicit_euler, rk4
+from adjungo.optimization.interface import GLMOptimizer
 
 
 class SimpleProblem:

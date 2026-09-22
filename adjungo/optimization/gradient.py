@@ -3,11 +3,11 @@
 import numpy as np
 from numpy.typing import NDArray
 
-from adjungo.stepping.trajectory import Trajectory
-from adjungo.stepping.adjoint import AdjointTrajectory
-from adjungo.core.objective import Objective
 from adjungo.core.method import GLMethod
+from adjungo.core.objective import Objective
 from adjungo.core.problem import Problem
+from adjungo.stepping.adjoint import AdjointTrajectory
+from adjungo.stepping.trajectory import Trajectory
 
 
 def assemble_gradient(
@@ -38,7 +38,7 @@ def assemble_gradient(
     Returns:
         Gradient array (N, s, ν)
     """
-    N, s, nu = u.shape
+    N, s, _nu = u.shape
     grad = np.zeros_like(u)
 
     for step in range(N):

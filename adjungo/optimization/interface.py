@@ -1,23 +1,65 @@
 """Optimization interface for external optimizers."""
 
-from typing import Optional, Callable, Tuple
+from collections.abc import Callable
+
 import numpy as np
 from numpy.typing import NDArray
 
-from adjungo.core.problem import Problem, ProblemStructure, Linearity
+from adjungo.core.method import GLMethod, StageType
 from adjungo.core.objective import Objective
-from adjungo.core.method import GLMethod
+from adjungo.core.problem import Linearity, Problem, ProblemStructure
 from adjungo.core.requirements import deduce_requirements
-from adjungo.solvers.factory import create_stage_solver
-from adjungo.stepping.trajectory import Trajectory
-from adjungo.stepping.forward import forward_solve
-from adjungo.stepping.adjoint import AdjointTrajectory, adjoint_solve
-from adjungo.stepping.sensitivity import (
-    forward_sensitivity,
-    adjoint_sensitivity,
-)
 from adjungo.optimization.gradient import assemble_gradient
 from adjungo.optimization.hessian import assemble_hessian_vector_product
+from adjungo.solvers.factory import create_stage_solver
+from adjungo.stepping.adjoint import AdjointTrajectory, adjoint_solve
+from adjungo.stepping.forward import forward_solve
+from adjungo.stepping.sensitivity import (
+    adjoint_sensitivity,
+    forward_sensitivity,
+)
+from adjungo.stepping.trajectory import Trajectory
+
+#: Method families certified by a completed milestone (NUMERICS.md C-6.1).
+#: Adding an entry here is a certification claim and requires the milestone's
+#: acceptance evidence.
+CERTIFIED_STAGE_TYPES = frozenset(
+    {StageType.EXPLICIT, StageType.DIRK, StageType.SDIRK}
+)
+
+
+def _enforce_envelope(
+    method: GLMethod, t_span: tuple[float, float], N: int
+) -> None:
+    """Refuse unsupported configurations at construction (C-6.2, C-12).
+
+    These are hard guards with no override. Proceeding into an uncertified path
+    and reporting a plausible-looking number is the failure mode this contract
+    exists to prevent.
+    """
+    if N < 1:
+        raise ValueError(f"N must be at least 1, got {N} (NUMERICS.md C-12).")
+
+    if t_span[1] == t_span[0]:
+        raise ValueError(
+            f"t_span must have nonzero extent, got {t_span} (NUMERICS.md C-12)."
+        )
+
+    if method.r > 1:
+        raise NotImplementedError(
+            f"Methods with r > 1 external stages are not supported (got "
+            f"r={method.r}). Adjungo has no starting procedure for multistep "
+            f"methods; see NUMERICS.md C-6.2 and open question C-Q4."
+        )
+
+    if method.stage_type not in CERTIFIED_STAGE_TYPES:
+        raise NotImplementedError(
+            f"Method family {method.stage_type.name} is not certified "
+            f"(NUMERICS.md C-6.1). A dense stage matrix A requires a coupled "
+            f"Newton solve, scheduled for milestone M3. Certified families: "
+            f"{', '.join(sorted(t.name for t in CERTIFIED_STAGE_TYPES))}."
+        )
+
 
 
 class GLMOptimizer:
@@ -33,7 +75,7 @@ class GLMOptimizer:
         t_span: tuple[float, float],
         N: int,
         y0: NDArray,
-        problem_structure: Optional[ProblemStructure] = None,
+        problem_structure: ProblemStructure | None = None,
     ):
         """
         Initialize GLM optimizer.
@@ -53,6 +95,9 @@ class GLMOptimizer:
         self.t_span = t_span
         self.N = N
         self.y0 = y0
+
+        _enforce_envelope(method, t_span, N)
+
         self.h = (t_span[1] - t_span[0]) / N
 
         # Deduce problem structure if not provided
@@ -68,18 +113,53 @@ class GLMOptimizer:
         )
 
         # Cached trajectory (invalidated when u changes)
-        self._trajectory: Optional[Trajectory] = None
-        self._adjoint: Optional[AdjointTrajectory] = None
-        self._u_hash: Optional[int] = None
+        self._trajectory: Trajectory | None = None
+        self._adjoint: AdjointTrajectory | None = None
+        self._u_cached: NDArray | None = None
 
     def _deduce_problem_structure(self) -> ProblemStructure:
-        """Deduce problem structure from problem specification."""
-        # Simplified deduction - user should provide for better performance
+        """Deduce problem structure from the problem specification.
+
+        This previously returned a hard-coded ``NONLINEAR`` /
+        ``has_second_derivatives=False`` regardless of the problem, so the flag
+        described nothing and a problem supplying second derivatives was
+        reported as not supplying them.
+
+        What can honestly be deduced:
+
+        - ``has_second_derivatives`` is detected by the presence of all three
+          contracted-Hessian callbacks. Partial support is treated as absent,
+          because the second-order path needs all three.
+        - ``linearity`` cannot be deduced from an opaque callback protocol
+          without evaluating it, so an undeclared problem is assumed
+          ``NONLINEAR``. That is the conservative choice: it forces Jacobian
+          re-evaluation and disables reuse. A problem that knows it is linear
+          declares so via ``problem.linearity`` or by passing an explicit
+          ``problem_structure``.
+        """
+        declared = getattr(self.problem, "linearity", None)
+        linearity = declared if isinstance(declared, Linearity) else (
+            Linearity.NONLINEAR
+        )
+
+        second_derivative_hooks = ("F_yy_action", "F_yu_action", "F_uu_action")
+        has_second_derivatives = all(
+            callable(getattr(self.problem, name, None))
+            for name in second_derivative_hooks
+        )
+
+        # Only a problem that declares linearity may claim a constant Jacobian.
+        jacobian_constant = linearity is Linearity.LINEAR
+        jacobian_control_dependent = linearity not in (
+            Linearity.LINEAR,
+            Linearity.SEMILINEAR,
+        )
+
         return ProblemStructure(
-            linearity=Linearity.NONLINEAR,
-            jacobian_constant=False,
-            jacobian_control_dependent=True,
-            has_second_derivatives=False,
+            linearity=linearity,
+            jacobian_constant=jacobian_constant,
+            jacobian_control_dependent=jacobian_control_dependent,
+            has_second_derivatives=has_second_derivatives,
         )
 
     def objective_value(self, u: NDArray) -> float:
@@ -166,7 +246,7 @@ class GLMOptimizer:
             self.t_span[0],
         )
 
-    def scipy_interface(self) -> Tuple[Callable, Callable]:
+    def scipy_interface(self) -> tuple[Callable, Callable]:
         """
         Returns (fun, jac) for scipy.optimize.minimize.
 
@@ -185,9 +265,17 @@ class GLMOptimizer:
         return fun, jac
 
     def _ensure_forward(self, u: NDArray) -> None:
-        """Run forward solve if not cached or u changed."""
-        u_hash = hash(u.tobytes())
-        if self._trajectory is None or self._u_hash != u_hash:
+        """Run forward solve if not cached or u changed.
+
+        The cache key is a defensive copy of ``u`` compared with
+        ``np.array_equal``, not a hash. A hash collision would silently return
+        another point's trajectory, and every derivative check downstream would
+        then be comparing quantities evaluated at different controls. Copying
+        also means a caller mutating ``u`` in place afterwards cannot corrupt
+        the key. The arrays are (N, s, nu) and small, so this is cheap; per C-1
+        correctness outranks micro-optimization in a reference implementation.
+        """
+        if self._trajectory is None or not self._cache_matches(u):
             self._trajectory = forward_solve(
                 self.y0,
                 u,
@@ -197,8 +285,17 @@ class GLMOptimizer:
                 self.method,
                 self.stage_solver,
             )
-            self._u_hash = u_hash
+            self._u_cached = u.copy()
             self._adjoint = None  # Invalidate adjoint
+
+    def _cache_matches(self, u: NDArray) -> bool:
+        """True when ``u`` is exactly the control the cache was built from."""
+        cached = self._u_cached
+        return (
+            cached is not None
+            and cached.shape == u.shape
+            and bool(np.array_equal(cached, u))
+        )
 
     def _ensure_adjoint(self, u: NDArray) -> None:
         """Run forward and adjoint solve if not cached or u changed."""

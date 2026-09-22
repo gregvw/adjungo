@@ -1,7 +1,7 @@
 """Matrix-free operator wrappers."""
 
-from typing import Callable
-import numpy as np
+from collections.abc import Callable
+
 from numpy.typing import NDArray
 
 

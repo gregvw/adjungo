@@ -1,6 +1,7 @@
 """Linear algebra backend protocol."""
 
-from typing import Protocol, Any, Tuple
+from typing import Any, Protocol
+
 from numpy.typing import NDArray
 
 

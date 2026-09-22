@@ -1,9 +1,18 @@
-"""IMEX (Implicit-Explicit) method pairs."""
+"""IMEX (Implicit-Explicit) method pairs.
+
+UNCERTIFIED AND UNREACHABLE. Retained under NUMERICS.md C-6.3 for future work.
+``GLMOptimizer`` refuses additive/IMEX methods at construction under C-6.2.
+
+``IMEXMethod`` is not a ``GLMethod`` and carries no adjoint implementation: the
+adjoint of an additive splitting must contract each tableau against its own
+right-hand side, and Adjungo's stepping code assumes a single ``f``.
+"""
+
+from dataclasses import dataclass
 
 import numpy as np
-from dataclasses import dataclass
+
 from adjungo.core.method import GLMethod
-from adjungo.methods.runge_kutta import rk4, sdirk2
 
 
 @dataclass

@@ -1,13 +1,12 @@
 """Tests for forward and adjoint stepping algorithms."""
 
 import numpy as np
-import pytest
 
-from adjungo.stepping.forward import forward_solve
-from adjungo.stepping.adjoint import adjoint_solve
-from adjungo.stepping.trajectory import Trajectory
-from adjungo.solvers.explicit import ExplicitStageSolver
 from adjungo.methods.runge_kutta import explicit_euler, rk4
+from adjungo.solvers.explicit import ExplicitStageSolver
+from adjungo.stepping.adjoint import adjoint_solve
+from adjungo.stepping.forward import forward_solve
+from adjungo.stepping.trajectory import Trajectory
 
 
 class LinearProblem:

@@ -2,8 +2,13 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
+
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from adjungo.core.method import GLMethod
+    from adjungo.core.problem import Problem
 
 
 @dataclass
@@ -13,8 +18,8 @@ class StepCache:
     Z: NDArray                          # (s, n) stage values
     F: list[NDArray]                    # s Jacobians, each (n, n)
     G: list[NDArray]                    # s control Jacobians, each (n, ν)
-    factorization: Optional[Any] = None # LU of stage matrix (reusable)
-    stage_matrix: Optional[NDArray] = None
+    factorization: Any | None = None # LU of stage matrix (reusable)
+    stage_matrix: NDArray | None = None
 
 
 class StageSolver(ABC):

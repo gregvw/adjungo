@@ -1,18 +1,19 @@
 """Forward state propagation."""
 
-from typing import Callable, Union
+from collections.abc import Callable
+
 import numpy as np
 from numpy.typing import NDArray
 
-from adjungo.stepping.trajectory import Trajectory
-from adjungo.solvers.base import StageSolver
-from adjungo.core.problem import Problem
 from adjungo.core.method import GLMethod
+from adjungo.core.problem import Problem
+from adjungo.solvers.base import StageSolver
+from adjungo.stepping.trajectory import Trajectory
 
 
 def forward_solve(
     y0: NDArray,
-    u: Union[NDArray, Callable],  # (N, s, ν) or callable
+    u: NDArray | Callable,  # (N, s, ν) or callable
     t_span: tuple[float, float],
     N: int,
     problem: Problem,
@@ -82,7 +83,7 @@ def _initialize_external_stages(
 
 
 def _get_stage_controls(
-    u: Union[NDArray, Callable],
+    u: NDArray | Callable,
     step: int,
     method: GLMethod,
     h: float,

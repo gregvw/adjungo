@@ -1,14 +1,16 @@
 """State and adjoint sensitivity equations."""
 
 from dataclasses import dataclass
+
 import numpy as np
 from numpy.typing import NDArray
 
-from adjungo.stepping.trajectory import Trajectory
-from adjungo.stepping.adjoint import AdjointTrajectory
-from adjungo.solvers.base import StageSolver
-from adjungo.core.problem import Problem
 from adjungo.core.method import GLMethod
+from adjungo.core.objective import Objective
+from adjungo.core.problem import Problem
+from adjungo.solvers.base import StageSolver
+from adjungo.stepping.adjoint import AdjointTrajectory
+from adjungo.stepping.trajectory import Trajectory
 
 
 @dataclass
@@ -127,7 +129,7 @@ def adjoint_sensitivity(
     problem: Problem,
     h: float,
     t0: float = 0.0,
-    objective=None,
+    objective: Objective | None = None,
 ) -> AdjointSensitivityTrajectory:
     """
     Algorithm 4: Backward adjoint sensitivity from glm_opt.tex Section 7.
@@ -223,16 +225,20 @@ def adjoint_sensitivity(
 
         # Backward substitution for explicit methods
         # For implicit methods, would reuse transposed factorization
+        #
+        # Differentiating μ_i = h F_i^T Λ_i gives
+        #   δμ_i = h F_i^T ( Σ_{j>i} A[j,i] δμ_j + Σ_l B[l,i] δλ_l ) + Γ_i
+        # where Γ_i collects the terms from differentiating F_i itself.
+        # F_i (not F_j) multiplies the entire weighted sum; see
+        # ExplicitStageSolver.solve_adjoint_stages for the derivation.
         for i in range(s - 1, -1, -1):
-            # Terminal contribution: h B[i]^T F[i]^T δλ
-            delta_Mu[step, i] = h * cache.F[i].T @ (B[:, i] @ delta_lambda_ext)
+            weighted = B[:, i] @ delta_lambda_ext
+            for j in range(i + 1, s):
+                weighted = weighted + A[j, i] * delta_Mu[step, j]
+            delta_Mu[step, i] = h * cache.F[i].T @ weighted
 
             # Add second-derivative forcing
             delta_Mu[step, i] += Gamma[i]
-
-            # Coupling from later stages: h Σ_{j>i} a_{ji} F_j^T δμ_j
-            for j in range(i + 1, s):
-                delta_Mu[step, i] += h * A[j, i] * cache.F[j].T @ delta_Mu[step, j]
 
             # For implicit stages (a_{ii} ≠ 0), would solve:
             # (I - h a_{ii} F_i^T) δμ_i = rhs

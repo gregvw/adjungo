@@ -2,8 +2,8 @@ import numpy as np
 
 from adjungo.core.method import GLMethod
 from adjungo.optimization.interface import GLMOptimizer
-from adjungo.stepping.trajectory import Trajectory
 from adjungo.stepping.adjoint import AdjointTrajectory
+from adjungo.stepping.trajectory import Trajectory
 
 
 class DummyProblem:

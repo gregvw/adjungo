@@ -1,11 +1,10 @@
 """Integration tests for end-to-end optimization."""
 
 import numpy as np
-import pytest
 
-from adjungo.optimization.interface import GLMOptimizer
-from adjungo.core.problem import ProblemStructure, Linearity
+from adjungo.core.problem import Linearity, ProblemStructure
 from adjungo.methods.runge_kutta import explicit_euler, rk4
+from adjungo.optimization.interface import GLMOptimizer
 
 
 class HarmonicOscillator:
@@ -315,6 +314,10 @@ def test_nonlinear_problem_integration():
     u = np.ones((N, 1, 1)) * 0.5
     J = optimizer.objective_value(u)
     grad = optimizer.gradient(u)
+
+    # C-7: no silent sentinels. A finite objective is the minimum evidence that
+    # the forward solve produced a result rather than a placeholder.
+    assert np.isfinite(J)
 
     # Gradient should have correct shape
     assert grad.shape == (N, 1, 1)
