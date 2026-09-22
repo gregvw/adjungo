@@ -36,7 +36,7 @@ Hessian-vector product against an independently assembled reference.
 | Explicit Runge–Kutta (`explicit_euler`, `heun`, `rk4`) | **certified** |
 | DIRK (`implicit_trapezoid` / Crank–Nicolson) | **certified** |
 | SDIRK (`implicit_midpoint`, `sdirk2`, `sdirk3`) | **certified** |
-| Fully implicit, dense `A` (`gauss2`) | **refused** — needs a coupled Newton solve |
+| Fully implicit, dense `A` (`gauss2`) | **certified** — one coupled `(s·n)` Newton solve per step |
 | BDF (`bdf2`, `bdf3`) | **refused** — `r > 1` has no starting procedure |
 | Adams (`adams_bashforth2`, `adams_moulton2`) | **refused** — tableau not representable |
 | IMEX / additive splitting | **refused** |

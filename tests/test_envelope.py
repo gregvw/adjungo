@@ -9,7 +9,7 @@ and nothing distinguished that from a correct answer.
 import numpy as np
 import pytest
 
-from adjungo.core.method import GLMethod
+from adjungo.core.method import GLMethod, StageType
 from adjungo.core.problem import Linearity, ProblemStructure
 from adjungo.methods.experimental.multistep import bdf2, bdf3
 from adjungo.methods.runge_kutta import explicit_euler, gauss2, rk4
@@ -66,21 +66,53 @@ def test_multistep_is_refused(factory):
         _build(factory())
 
 
-def test_fully_implicit_is_refused():
-    """C-6.1: the fully implicit family is not certified until M3."""
-    with pytest.raises(NotImplementedError, match=r"not certified"):
-        _build(gauss2())
+def test_fully_implicit_is_admitted():
+    """C-6.1: the fully implicit family is certified as of M3.
+
+    This test was previously ``test_fully_implicit_is_refused``. It is kept as
+    an envelope test, with its sense inverted, so that the transition from
+    refused to certified is visible in the history of one test rather than
+    appearing as an unexplained deletion.
+    """
+    optimizer = _build(gauss2())
+    assert optimizer.method.stage_type is StageType.IMPLICIT
 
 
-def test_fully_implicit_solver_cannot_be_constructed_directly():
-    """The refusal must not be bypassable by building the solver directly.
+def test_fully_implicit_solver_can_be_constructed_directly():
+    """Direct construction must produce a working solver, not a silent stub.
 
-    Precedent R-4: this class previously returned Z = 0 silently.
+    Precedent R-4: this class once returned Z = 0 silently, then was made to
+    raise. It must now solve. The assertion below is the R-4 guard in its
+    current form: a stub that returned zeros would leave the residual at its
+    initial value instead of driving it to the C-3.4 tolerance.
     """
     from adjungo.solvers.implicit import ImplicitStageSolver
 
-    with pytest.raises(NotImplementedError, match=r"not implemented"):
-        ImplicitStageSolver()
+    solver = ImplicitStageSolver(y_scale=1.0)
+    method = gauss2()
+
+    n, h = 1, 0.1
+    problem = _Decay()
+    y_ext = np.array([[2.0]])
+    Z, cache = solver.solve_stages(
+        y_ext, np.zeros((method.s, 1)), 0.0, h, problem, method
+    )
+
+    assert Z.shape == (method.s, n)
+    assert not np.allclose(Z, 0.0), "R-4: the solver must not return zeros"
+    residual = np.array(
+        [
+            Z[i]
+            - y_ext[0]
+            - h * sum(
+                method.A[i, j] * problem.f(Z[j], np.zeros(1), 0.0)
+                for j in range(method.s)
+            )
+            for i in range(method.s)
+        ]
+    )
+    assert np.max(np.abs(residual)) < 1e-12
+    assert cache.coupled_factorization is not None
 
 
 @pytest.mark.parametrize("bad_N", [0, -1])
@@ -129,12 +161,17 @@ def test_mismatched_tableau_blocks_are_refused():
 
 
 def test_problem_structure_override_does_not_bypass_the_guard():
-    """An explicit structure argument must not reopen a refused family."""
+    """An explicit structure argument must not reopen a refused family.
+
+    This previously used ``gauss2``, which M3 certified. It now uses ``bdf2``,
+    which remains refused under C-6.2 because r > 1 has no starting procedure.
+    Reusing a now-certified method here would have made the test vacuous.
+    """
     structure = ProblemStructure(
         linearity=Linearity.LINEAR,
         jacobian_constant=True,
         jacobian_control_dependent=False,
         has_second_derivatives=False,
     )
-    with pytest.raises(NotImplementedError):
-        _build(gauss2(), problem_structure=structure)
+    with pytest.raises(NotImplementedError, match=r"r > 1"):
+        _build(bdf2(), problem_structure=structure)

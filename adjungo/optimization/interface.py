@@ -27,7 +27,12 @@ from adjungo.stepping.trajectory import Trajectory
 #: Adding an entry here is a certification claim and requires the milestone's
 #: acceptance evidence.
 CERTIFIED_STAGE_TYPES = frozenset(
-    {StageType.EXPLICIT, StageType.DIRK, StageType.SDIRK}
+    {
+        StageType.EXPLICIT,
+        StageType.DIRK,
+        StageType.SDIRK,
+        StageType.IMPLICIT,
+    }
 )
 
 

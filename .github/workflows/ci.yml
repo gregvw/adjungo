@@ -54,7 +54,7 @@ jobs:
           PY
 
       - name: Lint
-        run: python -m ruff check adjungo tests
+        run: python -m ruff check adjungo tests examples
 
       # C-11.2 keeps certified routes on LU only. An SVD-based route would need
       # that clause amended, so flag any appearance in the library.

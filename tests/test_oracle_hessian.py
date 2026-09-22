@@ -19,6 +19,7 @@ import pytest
 
 from adjungo.methods.runge_kutta import (
     explicit_euler,
+    gauss2,
     heun,
     implicit_midpoint,
     implicit_trapezoid,
@@ -47,6 +48,7 @@ METHODS = [
     pytest.param(implicit_trapezoid, id="crank_nicolson_dirk_s2"),
     pytest.param(sdirk2, id="sdirk2_s2"),
     pytest.param(sdirk3, id="sdirk3_s3"),
+    pytest.param(gauss2, id="gauss2_fully_implicit_s2"),
 ]
 
 

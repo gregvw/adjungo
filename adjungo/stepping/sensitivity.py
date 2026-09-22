@@ -10,6 +10,10 @@ from adjungo.core.method import GLMethod
 from adjungo.core.objective import Objective
 from adjungo.core.problem import Problem
 from adjungo.solvers.base import StageSolver
+from adjungo.solvers.implicit import (
+    solve_coupled,
+    solve_coupled_transposed,
+)
 from adjungo.stepping.adjoint import AdjointTrajectory
 from adjungo.stepping.trajectory import Trajectory
 
@@ -82,45 +86,66 @@ def forward_sensitivity(
     for step in range(N):
         cache = trajectory.caches[step]
 
-        # Solve sensitivity system stage-by-stage
-        # For explicit: forward substitution
-        # For implicit: would reuse factorization
+        # The tangent system is the forward stage system linearised:
+        #   δZ_i = U[i] δy + h Σ_j A[i,j] ( F_j δZ_j + G_j δu_j )
+        # Its operator has blocks δ_ij I - h A[i,j] F_j, which is exactly the
+        # forward Newton Jacobian, so the converged factorization is reused
+        # rather than rebuilt. Rebuilding would be a second opportunity to
+        # evaluate F at the wrong point (C-5.4).
+        if cache.coupled_factorization is not None:
+            # Dense A: the sum over j runs over every stage, so there is no
+            # order in which the stages become available one at a time.
+            rhs_coupled = np.empty((s, n))
+            for i in range(s):
+                acc = np.asarray(method.U[i] @ delta_Y[step], dtype=float)
+                for j in range(s):
+                    if A[i, j] != 0.0:
+                        acc = acc + h * A[i, j] * (
+                            cache.G[j] @ delta_u[step, j]
+                        )
+                rhs_coupled[i] = acc
+            delta_Z[step] = solve_coupled(
+                cache.coupled_factorization, rhs_coupled
+            )
+        else:
+            for i in range(s):
+                # RHS: U δy^{n-1} + h Σ_{j<i} a_{ij} [F_j δZ_j + G_j δu_j]
+                rhs = method.U[i] @ delta_Y[step]
 
-        for i in range(s):
-            # Build RHS: U δy^{n-1} + h Σ_{j<i} a_{ij} [F_j δZ_j + G_j δu_j]
-            rhs = method.U[i] @ delta_Y[step]
+                # Add coupling from previous stages
+                for j in range(i):
+                    rhs += h * A[i, j] * (cache.F[j] @ delta_Z[step, j] +
+                                          cache.G[j] @ delta_u[step, j])
 
-            # Add coupling from previous stages
-            for j in range(i):
-                # a_{ij} * [F_j^T δZ_j + G_j δu_j]
-                rhs += h * A[i, j] * (cache.F[j] @ delta_Z[step, j] +
-                                       cache.G[j] @ delta_u[step, j])
-
-            # For explicit stages (a_{ii} = 0): δZ_i = rhs
-            if np.isclose(A[i, i], 0):
-                delta_Z[step, i] = rhs
-            else:
-                # Implicit stage. Differentiating
-                #   Z_i - h a_ii f(Z_i, u_i, t_i) = U[i] y + h Σ_{j<i} A[i,j] f_j
-                # gives
-                #   (I - h a_ii F_i) δZ_i = rhs + h a_ii G_i δu_i
-                # The operator is exactly the forward stage matrix, so the
-                # factorization taken at the converged stage value is reused
-                # rather than rebuilt. Rebuilding it here would be a second
-                # opportunity to evaluate F at the wrong point.
-                gamma = A[i, i]
-                rhs_implicit = rhs + h * gamma * (cache.G[i] @ delta_u[step, i])
-                lu = (
-                    cache.stage_factorizations[i]
-                    if cache.stage_factorizations is not None
-                    else None
-                )
-                if lu is None:
-                    delta_Z[step, i] = np.linalg.solve(
-                        np.eye(n) - h * gamma * cache.F[i], rhs_implicit
-                    )
+                # For explicit stages (a_{ii} = 0): δZ_i = rhs
+                if np.isclose(A[i, i], 0):
+                    delta_Z[step, i] = rhs
                 else:
-                    delta_Z[step, i] = scipy.linalg.lu_solve(lu, rhs_implicit)
+                    # Implicit stage. Differentiating
+                    #   Z_i - h a_ii f(Z_i, u_i, t_i)
+                    #       = U[i] y + h Σ_{j<i} A[i,j] f_j
+                    # gives
+                    #   (I - h a_ii F_i) δZ_i = rhs + h a_ii G_i δu_i
+                    # The operator is exactly the forward stage matrix, so
+                    # the factorization taken at the converged stage value is
+                    # reused rather than rebuilt.
+                    gamma = A[i, i]
+                    rhs_implicit = rhs + h * gamma * (
+                        cache.G[i] @ delta_u[step, i]
+                    )
+                    lu = (
+                        cache.stage_factorizations[i]
+                        if cache.stage_factorizations is not None
+                        else None
+                    )
+                    if lu is None:
+                        delta_Z[step, i] = np.linalg.solve(
+                            np.eye(n) - h * gamma * cache.F[i], rhs_implicit
+                        )
+                    else:
+                        delta_Z[step, i] = scipy.linalg.lu_solve(
+                            lu, rhs_implicit
+                        )
 
         # Propagate sensitivity: δy^n = V δy^{n-1} + h B Σ_i [F_i δZ_i + G_i δu_i]
         delta_Y[step + 1] = method.V @ delta_Y[step]
@@ -270,31 +295,54 @@ def adjoint_sensitivity(
 
         delta_lambda_ext = delta_Lambda[step + 1]
 
-        # Backward substitution for explicit methods
-        # For implicit methods, would reuse transposed factorization
-        #
         # Differentiating μ_i = h F_i^T Λ_i gives
-        #   δμ_i = h F_i^T ( Σ_{j>i} A[j,i] δμ_j + Σ_l B[l,i] δλ_l ) + Γ_i
+        #   δμ_i = h F_i^T ( Σ_j A[j,i] δμ_j + Σ_l B[l,i] δλ_l ) + Γ_i
         # where Γ_i collects the terms from differentiating F_i itself.
         # F_i (not F_j) multiplies the entire weighted sum; see
         # ExplicitStageSolver.solve_adjoint_stages for the derivation.
-        for i in range(s - 1, -1, -1):
-            weighted = B[:, i] @ delta_lambda_ext
-            for j in range(i + 1, s):
-                weighted = weighted + A[j, i] * delta_Mu[step, j]
-            rhs = h * cache.F[i].T @ weighted + Gamma[i]
-
-            # Implicit stages carry the same transposed stage solve as the
-            # first-order adjoint: (I - h a_ii F_i^T) δμ_i = rhs.
-            lu = (
-                cache.stage_factorizations[i]
-                if cache.stage_factorizations is not None
-                else None
+        #
+        # This is the same linear system the *first-order* adjoint solves,
+        # with a different right-hand side, so it is solved the same way.
+        if cache.coupled_factorization is not None:
+            # Dense A: the sum over j runs over every stage, so no ordering
+            # makes the stages available one at a time. The operator is the
+            # transpose of the forward coupled Jacobian. Every A-weighted
+            # coupling lives in that operator, so the right-hand side carries
+            # only the external-adjoint term and Γ; adding an A term here as
+            # well -- the natural slip when adapting the triangular branch
+            # below -- would count the coupling twice.
+            rhs_coupled = np.empty((s, cache.Z.shape[1]))
+            for i in range(s):
+                rhs_coupled[i] = (
+                    h * cache.F[i].T @ (B[:, i] @ delta_lambda_ext)
+                    + Gamma[i]
+                )
+            delta_Mu[step] = solve_coupled_transposed(
+                cache.coupled_factorization, rhs_coupled
             )
-            if lu is None:
-                delta_Mu[step, i] = rhs
-            else:
-                delta_Mu[step, i] = scipy.linalg.lu_solve(lu, rhs, trans=1)
+        else:
+            # A is (strictly) lower triangular, so the same system is block
+            # triangular and backward substitution solves it in s small
+            # blocks instead of one (s*n) solve.
+            for i in range(s - 1, -1, -1):
+                weighted = B[:, i] @ delta_lambda_ext
+                for j in range(i + 1, s):
+                    weighted = weighted + A[j, i] * delta_Mu[step, j]
+                rhs = h * cache.F[i].T @ weighted + Gamma[i]
+
+                # Implicit stages carry the same transposed stage solve as
+                # the first-order adjoint: (I - h a_ii F_i^T) δμ_i = rhs.
+                lu = (
+                    cache.stage_factorizations[i]
+                    if cache.stage_factorizations is not None
+                    else None
+                )
+                if lu is None:
+                    delta_Mu[step, i] = rhs
+                else:
+                    delta_Mu[step, i] = scipy.linalg.lu_solve(
+                        lu, rhs, trans=1
+                    )
 
         # Compute weighted adjoint sensitivities for Hessian assembly
         # δΛ_k = Σ_j a_{jk} δμ_j + Σ_j b_{jk} δλ_j

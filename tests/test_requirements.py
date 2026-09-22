@@ -1,7 +1,6 @@
 """Tests for solver requirements deduction."""
 
 import numpy as np
-import pytest
 
 from adjungo.core.method import GLMethod, StageType
 from adjungo.core.problem import Linearity, ProblemStructure
@@ -10,6 +9,7 @@ from adjungo.methods.runge_kutta import explicit_euler, implicit_midpoint, rk4, 
 from adjungo.solvers.dirk import DIRKStageSolver
 from adjungo.solvers.explicit import ExplicitStageSolver
 from adjungo.solvers.factory import create_stage_solver
+from adjungo.solvers.implicit import ImplicitStageSolver
 from adjungo.solvers.sdirk import SDIRKStageSolver
 
 
@@ -188,11 +188,14 @@ def test_factory_dirk_method():
 
 
 def test_factory_implicit_method():
-    """Factory dispatches fully implicit tableaux to the refusing solver.
+    """Factory dispatches fully implicit tableaux to ImplicitStageSolver.
 
-    Dispatch itself is still exercised: the NotImplementedError can only come
-    from ImplicitStageSolver, so reaching it proves the decision tree routed
-    correctly. The solver is uncertified until M3 (NUMERICS.md C-6.1).
+    Before M3 this asserted that a NotImplementedError escaped. The solver is
+    now certified (NUMERICS.md C-6.1), so dispatch is checked by the returned
+    type instead. The ``y_scale`` assertion is not incidental: the coupled
+    Newton stopping test is scaled by it (C-3.4), and passing the default 1.0
+    for a problem whose states are O(1e3) would silently over-solve or, worse,
+    under-solve.
     """
     # Create a fully implicit method
     A = np.array([[0.25, 0.25 - np.sqrt(3)/6], [0.25 + np.sqrt(3)/6, 0.25]])
@@ -212,8 +215,10 @@ def test_factory_implicit_method():
     )
     req = deduce_requirements(method, problem, state_dim=5)
 
-    with pytest.raises(NotImplementedError, match=r"not implemented"):
-        create_stage_solver(method, req, problem)
+    solver = create_stage_solver(method, req, problem, y_scale=7.5)
+
+    assert isinstance(solver, ImplicitStageSolver)
+    assert solver.y_scale == 7.5
 
 
 def test_problem_structure_linearity_classification():

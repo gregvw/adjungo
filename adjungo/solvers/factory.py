@@ -42,7 +42,5 @@ def create_stage_solver(
     if method.stage_type == StageType.DIRK:
         return DIRKStageSolver(y_scale=y_scale)
 
-    # Fully implicit. ImplicitStageSolver.__init__ raises (NUMERICS.md C-6.2);
-    # constructing it here rather than returning a placeholder keeps the refusal
-    # on the direct-construction path too, not only via GLMOptimizer.
-    return ImplicitStageSolver()
+    # Fully implicit (dense A): one coupled (s*n) Newton solve per step.
+    return ImplicitStageSolver(y_scale=y_scale)

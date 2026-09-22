@@ -224,6 +224,29 @@ All four required locators are asserted individually by
 `tests/test_implicit_solvers.py::test_newton_reports_the_stage_context_on_failure`,
 so a refactor that drops one fails rather than merely degrading a message.
 
+**Amendment (M3), `APPROVED`.** A fully implicit tableau solves all `s` stages
+in one coupled `(s·n)` system, so there is no single failing stage to name: the
+iteration either converges for every stage or for none. For that route the stage
+locator is satisfied by naming the **block carrying the largest residual
+component**, which is the stage a reader should examine first.
+
+The amendment narrows rather than relaxes the clause. The step index, the time
+interval, the final residual norm, and the iteration count are still required
+verbatim, and the reported block index must be the argmax of the per-block
+residual, not an arbitrary valid index. Example:
+
+```
+fully implicit step 4, coupled stage system, t=[0.7, 1.7], worst block stage 1
+(||r_1||_inf = 2.874923e+01): Newton failed to converge in 50 iterations; final
+||r||_inf = 2.874923e+01, tolerance 1.188503e-13
+```
+
+`OBSERVED` — `tests/test_fully_implicit.py::test_failed_coupled_solve_names_a_stage_block`
+asserts each locator, and `::test_worst_block_is_the_block_with_the_largest_residual`
+recomputes the argmax from the residual vector the exception carries. The latter
+first asserts that the two blocks differ by more than 50%, so a solver that
+always reported stage 0 could not pass by coincidence.
+
 ### C-5.4 Converged-iterate derivatives — `APPROVED`
 
 The Jacobian stored for adjoint and sensitivity use **must be evaluated at the
@@ -250,7 +273,7 @@ forward solve, gradient, **and** Hessian-vector product for it, against the
 | Explicit Runge–Kutta | **certified** — M1 (`explicit_euler`, `heun`, `rk4`) |
 | DIRK | **certified** — M2 (`implicit_trapezoid` / Crank–Nicolson) |
 | SDIRK | **certified** — M2 (`implicit_midpoint`, `sdirk2`, `sdirk3`) |
-| Fully implicit (dense `A`) | pending milestone M3 |
+| Fully implicit (dense `A`) | **certified** — M3 (`gauss2`) |
 | Linear multistep, `r > 1` | **not supported** |
 | IMEX / additive splitting | **not supported** |
 
@@ -268,6 +291,57 @@ forward solve, gradient, **and** Hessian-vector product for it, against the
 The certified list and `adjungo/optimization/interface.py::CERTIFIED_STAGE_TYPES`
 must agree; adding an entry to either without the evidence above is a false
 certification.
+
+#### Additional evidence for the fully implicit family
+
+A dense `A` is solved by one coupled Newton system per step rather than by
+substitution, so three properties that are structural for the triangular routes
+have to be established rather than assumed. They are carried by
+`tests/test_fully_implicit.py`:
+
+| Claim | Test |
+|---|---|
+| The stored factorization is of the analytic Jacobian **at the converged iterate** (C-5.4), checked against a Jacobian built by differencing the residual | `::test_cached_factorization_matches_a_differenced_jacobian` |
+| The adjoint operator is the transpose of the forward Jacobian, so the forward factorization may be reused with `trans=1` | `::test_transposed_solve_is_the_adjoint_of_the_untransposed_one` |
+| The stage adjoints satisfy `μ_p = h F_pᵀ (Σ_i A[i,p] μ_i + Σ_l B[l,p] λ_l)`, with the `A` coupling in the operator and **not** also in the right-hand side | `::test_adjoint_stage_solve_reuses_the_forward_factorization` |
+| Routes do not cross: a coupled cache never carries per-stage factorizations, and a triangular cache never carries a coupled one | `::test_coupled_cache_carries_a_factorization_not_per_stage_ones`, `::test_triangular_methods_do_not_set_the_coupled_factorization` |
+
+`OBSERVED` — sensitivity of that evidence, measured under the
+[R-11](#r-11) procedure at a
+286-test baseline with 0 failures:
+
+| Injected defect | Failing tests |
+|---|---|
+| Coupled Jacobian block `(i,j)` uses `F_i` where the derivation gives `F_j` (defect B0 transposed; see [R-5](#r-5)) | 8 |
+| Adjoint stage solve drops the transpose (`trans=1` → `trans=0`) | 10 |
+| Adjoint right-hand side also carries the `A` coupling, double-counting it | 8 |
+| Coupled Jacobian keeps only its diagonal blocks | 8 |
+| Factorization taken at the Newton starting point rather than the converged iterate (C-5.4) | 8 |
+| Coupled **tangent** solve drops the `h Σ_j A[i,j] G_j δu_j` forcing | 4 |
+| Coupled **tangent** solve uses the transposed operator | 4 |
+| Coupled **tangent** solve uses `A[j,i]` where the derivation gives `A[i,j]` | 4 |
+
+The last three rows matter because `forward_sensitivity` has its own coupled
+branch, reached only by the Hessian path. They confirm it is executed rather
+than merely present: a branch that no test enters would show 0 failures for all
+three.
+
+The fourth row is worth reading carefully. Dropping the off-diagonal Jacobian
+blocks turns Newton into a quasi-Newton iteration, which still converges to the
+**same** stage values: the forward solve, and therefore the order study below,
+remain correct. Only the derivatives are wrong, because the adjoint reuses that
+factorization. A certification resting on forward accuracy alone would have
+missed it entirely.
+
+`OBSERVED` — continuous accuracy (C-4): `gauss2` attains observed order 4.0
+(rates 3.989, 3.997, 3.999, 4.000 over N = 10…160) against `expm(A T) y0` for a
+linear damped oscillator, in
+`tests/test_fully_implicit.py::test_gauss2_observed_order_is_four`. Per
+[C-2](#c-2-primary-accuracy-claim) this is a refined-mesh claim about the
+continuous problem and may never be cited to excuse a fixed-mesh derivative
+discrepancy. It is recorded because order 4 from two stages is the property
+that distinguishes a correct Gauss solve from one that has degenerated to the
+implicit midpoint rule.
 
 ### C-6.2 Hard refusals
 
@@ -557,6 +631,29 @@ Recorded under C-1. A port that changes any of these produces different numbers:
    performance-oriented port.
 7. **The independent reference of C-14.1**, which should be ported alongside the
    solver rather than reinvented.
+8. **The coupled-system identity for a dense `A` (M3).** The forward stage
+   Jacobian has blocks
+
+   ```
+   ∂R_i/∂Z_j = δ_ij I − h A[i,j] F_j
+   ```
+
+   and the operator acting on the stage adjoints has blocks
+   `δ_pi I − h A[i,p] F_pᵀ`, which is exactly the transpose of the above. A port
+   must therefore reuse the **forward** factorisation with a transposed solve
+   (LAPACK `trans='T'`), not assemble a second matrix. Two consequences are easy
+   to get wrong and are invisible to a forward-accuracy test:
+
+   - block `(i, j)` carries `F_j`, the Jacobian of the stage being differentiated
+     *with respect to*, not `F_i`;
+   - all of the `A` coupling lives in the operator. Adding an `A` term to the
+     adjoint right-hand side as well — the natural slip when adapting triangular
+     backward substitution — double-counts it.
+
+   A quasi-Newton port that drops the off-diagonal blocks to save work will still
+   converge to the correct stage values and still show order 4, while returning a
+   wrong gradient. If the port does this deliberately it must factor the true
+   Jacobian once at the converged iterate for the adjoint's use.
 
 ---
 
@@ -859,6 +956,19 @@ object saved no work and only risked the adjoint operator.
 4. The C-14 population is extended with a state-only-Jacobian problem
    (`tests/test_implicit_solvers.py::StateOnlyJacobian`). A population in which
    every Jacobian depends on `u` cannot certify a control-independent path.
+
+**Not in scope of this precedent (M3).** `StepCache.coupled_factorization`, added
+for the fully implicit route, is *not* a shared per-stage factorisation and does
+not require a structure declaration. A dense `A` produces **one** `(s·n)` linear
+system for the whole step, whose blocks already carry the distinct per-stage
+`F_j`. Nothing is substituted for anything: there is no second matrix that the
+adjoint could have used instead. The property R-9 protects — that the matrix a
+stage is solved with is the matrix taken at that stage's own converged iterate —
+holds here by construction, and is checked directly by
+`tests/test_fully_implicit.py::test_cached_factorization_matches_a_differenced_jacobian`.
+The two routes are kept from crossing by
+`::test_coupled_cache_carries_a_factorization_not_per_stage_ones` and
+`::test_triangular_methods_do_not_set_the_coupled_factorization`.
 
 ### R-10 An iteration count is not a correctness discriminator — `APPROVED`
 

@@ -29,6 +29,7 @@ import pytest
 from adjungo.core.method import StageType
 from adjungo.methods.runge_kutta import (
     explicit_euler,
+    gauss2,
     heun,
     implicit_midpoint,
     implicit_trapezoid,
@@ -101,13 +102,15 @@ EXPLICIT_METHODS = [
     pytest.param(rk4, id="rk4_s4"),
 ]
 
-#: Certified implicit families (C-6.1). ``gauss2`` is deliberately absent: it
-#: has a dense stage matrix and is refused at construction pending M3.
+#: Certified implicit families (C-6.1). ``gauss2`` has a dense stage matrix
+#: and is solved by one coupled (s*n) Newton iteration per step (M3); it is
+#: held to exactly the same oracle tolerance as the triangular families.
 IMPLICIT_METHODS = [
     pytest.param(implicit_midpoint, id="implicit_midpoint_sdirk_s1"),
     pytest.param(implicit_trapezoid, id="crank_nicolson_dirk_s2"),
     pytest.param(sdirk2, id="sdirk2_s2"),
     pytest.param(sdirk3, id="sdirk3_s3"),
+    pytest.param(gauss2, id="gauss2_fully_implicit_s2"),
 ]
 
 ALL_CERTIFIED_METHODS = EXPLICIT_METHODS + IMPLICIT_METHODS

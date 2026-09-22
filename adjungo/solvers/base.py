@@ -26,6 +26,17 @@ class StepCache:
     shared between stages: precedent R-9 records a defect in which one
     stage's factorization was published for every stage of the step, giving
     the adjoint the transpose of the wrong matrix.
+
+    ``coupled_factorization`` is the exception that proves the rule, and it
+    is a different object with a different meaning. A tableau with a dense
+    ``A`` cannot be solved stage by stage at all: all ``s`` stages form one
+    ``(s·n) × (s·n)`` system whose Jacobian has blocks
+    ``δ_ij I - h A[i,j] F_j``. There is genuinely one matrix for the step,
+    and its transpose is exactly the operator of the adjoint stage system,
+    so the single factorization is reused by both. It is set only by
+    :class:`~adjungo.solvers.implicit.ImplicitStageSolver`, and
+    ``stage_factorizations`` is left ``None`` in that case: no per-stage
+    matrix exists to name.
     """
 
     Z: NDArray                          # (s, n) stage values
@@ -33,6 +44,7 @@ class StepCache:
     G: list[NDArray]                    # s control Jacobians, each (n, ν)
     stage_factorizations: list[Any] | None = None
     stage_matrix: NDArray | None = None
+    coupled_factorization: Any = None
 
 
 class StageSolver(ABC):

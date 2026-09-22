@@ -81,7 +81,12 @@ class StageSolveError(RuntimeError):
     """
 
     def __init__(
-        self, iterations: int, residual: float, tol: float, context: str
+        self,
+        iterations: int,
+        residual: float,
+        tol: float,
+        context: str,
+        residual_vector: NDArray | None = None,
     ) -> None:
         super().__init__(
             f"{context}: Newton failed to converge in {iterations} "
@@ -91,6 +96,14 @@ class StageSolveError(RuntimeError):
         self.iterations = iterations
         self.residual = residual
         self.tol = tol
+        #: The C-5.3 locator, kept verbatim so a caller can rebuild a more
+        #: specific message without parsing the formatted text of this one.
+        self.context = context
+        #: Final residual, kept so that a caller solving a *coupled* system
+        #: can report which stage block failed. C-5.3 requires the stage
+        #: index, and a coupled solve has no single failing stage until the
+        #: residual is examined per block.
+        self.residual_vector = residual_vector
 
 
 class NewtonMixin:
@@ -145,6 +158,7 @@ class NewtonMixin:
         z = np.array(z0, dtype=float)
         residual = np.inf
         tol = stage_solve_tolerance(z, y_scale)
+        r = np.zeros_like(z)
 
         for iteration in range(max_iter + 1):
             r = residual_fn(z)
@@ -158,4 +172,4 @@ class NewtonMixin:
             lu = scipy.linalg.lu_factor(jacobian_fn(z))
             z = z + scipy.linalg.lu_solve(lu, -r)
 
-        raise StageSolveError(max_iter, residual, tol, context)
+        raise StageSolveError(max_iter, residual, tol, context, r)
