@@ -74,6 +74,9 @@ adjungo/
                        factorization per step, shared by all stages.
     implicit.py        A dense: one (s*n)-by-(s*n) coupled Newton solve.
     newton.py          Newton iteration with explicit convergence criteria.
+    factorization.py   FactorizationStore: declaration-gated LU reuse,
+                       verified by exact comparison, with the counters
+                       C-15 certifies.
     factory.py         Dispatch from requirements to a stage solver.
 
   stepping/        the four sweeps over the whole trajectory
@@ -133,7 +136,8 @@ gradient(u)                      hessian_vector_product(u, v)
 ```
 
 `H v` costs two forward sweeps and two backward sweeps, independent of the
-control dimension. Assembling the Hessian column by column instead would cost
+control dimension, and -- on a declared-constant Jacobian -- exactly as many
+matrix factorizations as a single objective evaluation, which is one. Assembling the Hessian column by column instead would cost
 `O(N s nu)` tangent solves; see `NUMERICS.md` C-13 item 9.
 
 ### Refusal, not silent approximation
@@ -213,9 +217,9 @@ Stated here so that this document cannot be read as advertising.
 | `r > 1` multistep | Tableaux retained; refused. Needs a certified starting procedure. |
 | Partitioned methods (PRK, Nystrom) | Not built. |
 | Sparse or matrix-free linear algebra | Not built. `algebra/protocols.py` is the seam it would enter through. |
+| Reuse for a *varying* Jacobian (modified Newton, lagged Jacobian) | Not built, and not planned without an application benchmark. It would trade exactness for cost, which C-2 does not permit by default. |
 | Checkpointing | Not built. Storage is `O(N s n)`, everything retained. |
 | Generic scalar type | A C++ concern, not a Python one. See below. |
-| Instrumented factorization-count reuse | Milestone M6. Reuse is implemented; it is not yet *measured*. |
 
 ---
 
@@ -247,6 +251,14 @@ of what must carry forward; it currently has nine items. The short version:
    sweeps share a mistake.
 9. **Hold the mesh fixed when testing derivatives.** A wrong stage index
    produces an error that shrinks with `h`.
+10. **Gate factorization reuse on a declaration, and then verify the
+    declaration.** Reuse is worth having -- it turns 48 factorizations into 1
+    for `sdirk3` -- but it must never be decided by probing the problem (R-9),
+    and a caller's declaration is a promise rather than a fact. Compare the
+    stored matrix with the one being asked for, exactly, before returning
+    stored factors. Then *count* the factorizations and assert the count:
+    reuse is invisible to every accuracy test, working or broken, because
+    refactoring the same matrix gives the same answer. See C-15.
 
 Ergonomics that need not carry forward: the Python `Problem` protocol currently
 requires a linear problem to supply three second-derivative callbacks that

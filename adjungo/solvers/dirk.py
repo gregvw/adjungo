@@ -1,5 +1,6 @@
 """DIRK stage solver."""
 
+import functools
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,7 @@ from numpy.typing import NDArray
 from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
 from adjungo.solvers.base import StageSolver, StepCache
+from adjungo.solvers.factorization import FactorizationStore
 from adjungo.solvers.newton import NewtonMixin, stage_context
 
 
@@ -19,8 +21,20 @@ class DIRKStageSolver(NewtonMixin, StageSolver):
     triangular: stage ``i`` depends only on stages ``j < i``.
     """
 
-    def __init__(self, y_scale: float = 1.0) -> None:
+    def __init__(
+        self, y_scale: float = 1.0, reuse_across_steps: bool = False
+    ) -> None:
         self.y_scale = y_scale
+        #: A DIRK tableau has distinct diagonal entries, so each implicit
+        #: stage presents a different matrix ``I - h A[i,i] F`` even when
+        #: ``F`` is constant. Keying on ``A[i,i]`` therefore gives one
+        #: factorization per distinct diagonal coefficient for the entire
+        #: solve, not one per step. Stages sharing a coefficient share an
+        #: entry, which is sound for the same reason: the store compares the
+        #: matrices before reusing.
+        self.factorizations = FactorizationStore(
+            reuse_enabled=reuse_across_steps
+        )
 
     def solve_stages(
         self,
@@ -111,6 +125,9 @@ class DIRKStageSolver(NewtonMixin, StageSolver):
             rhs,
             y_scale=self.y_scale,
             context=stage_context("DIRK", stage, step, t_stage),
+            factor=functools.partial(
+                self.factorizations.factor, (a_ii, h)
+            ),
         )
 
     def solve_adjoint_stages(

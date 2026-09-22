@@ -146,6 +146,23 @@ Currently certified: explicit Runge-Kutta, DIRK, SDIRK, and fully implicit
 (dense `A`, one coupled `(s*n)` Newton solve per step). Refused: `r > 1`
 multistep, IMEX/additive.
 
+### Factorization reuse is gated on a declaration and verified
+
+Reuse of an LU factorization across stages or steps happens only when the
+caller declares `ProblemStructure(jacobian_constant=True)`, and only after the
+stored matrix is compared, element for element, with the one being asked for.
+Never infer reuse from probing the problem: precedent R-9 records a probe that
+varied the control and the time but not the state, which let a state-dependent
+Jacobian through and produced a 4.24e-05 relative gradient error with the whole
+suite passing.
+
+**Count factorizations; do not time them.** Reuse is the one optimization no
+accuracy test can check, because refactoring the same matrix gives the same
+answer. `tests/test_factorization_reuse.py` asserts the observed count against
+`SolverRequirements.factorizations_for_solve`, and separately asserts that
+nothing reaches `scipy.linalg.lu_factor` outside the store. That second check
+exists because a bypass was injected and no other test noticed (C-15.5).
+
 ## Oracle hierarchy
 
 When validating a derivative, prefer stronger oracles (C-14.1):

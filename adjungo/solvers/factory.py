@@ -40,7 +40,13 @@ def create_stage_solver(
         )
 
     if method.stage_type == StageType.DIRK:
-        return DIRKStageSolver(y_scale=y_scale)
+        return DIRKStageSolver(
+            y_scale=y_scale,
+            reuse_across_steps=requirements.can_reuse_across_steps,
+        )
 
     # Fully implicit (dense A): one coupled (s*n) Newton solve per step.
-    return ImplicitStageSolver(y_scale=y_scale)
+    return ImplicitStageSolver(
+        y_scale=y_scale,
+        reuse_across_steps=requirements.can_reuse_across_steps,
+    )

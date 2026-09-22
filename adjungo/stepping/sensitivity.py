@@ -139,13 +139,26 @@ def forward_sensitivity(
                         else None
                     )
                     if lu is None:
-                        delta_Z[step, i] = np.linalg.solve(
-                            np.eye(n) - h * gamma * cache.F[i], rhs_implicit
+                        # Unreachable given the forward solvers: an implicit
+                        # stage always records the factorization it used, and
+                        # an explicit one (a_ii = 0) took the branch above.
+                        #
+                        # This used to rebuild I - h a_ii F_i and call
+                        # np.linalg.solve. That produced the right answer, and
+                        # was still wrong to do. It is an LU factorization
+                        # that no FactorizationStore counts, so it would make
+                        # the C-15 certified count understate the real cost,
+                        # and it would do so precisely when the invariant this
+                        # module depends on had already broken -- the quietest
+                        # possible moment. Refusing states the invariant.
+                        raise RuntimeError(
+                            f"no factorization recorded for implicit stage "
+                            f"{i} of step {step} (A[{i},{i}] = {gamma}). The "
+                            "forward solve must publish the matrix it used, "
+                            "because the tangent solves with that same matrix "
+                            "(NUMERICS.md C-5.4)."
                         )
-                    else:
-                        delta_Z[step, i] = scipy.linalg.lu_solve(
-                            lu, rhs_implicit
-                        )
+                    delta_Z[step, i] = scipy.linalg.lu_solve(lu, rhs_implicit)
 
         # Propagate sensitivity: δy^n = V δy^{n-1} + h B Σ_i [F_i δZ_i + G_i δu_i]
         delta_Y[step + 1] = method.V @ delta_Y[step]

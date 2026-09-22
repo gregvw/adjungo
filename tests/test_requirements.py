@@ -114,8 +114,48 @@ def test_requirements_dirk():
 
     assert req.needs_newton is True
     assert req.newton_system_size == 5
-    assert req.factorizations_per_step == method.s  # One per stage
+    # Two distinct nonzero diagonals, 0.3 and 0.5, so two distinct stage
+    # matrices. The count is of distinct matrices, not of stages: asserting
+    # ``== method.s`` here would pass for the wrong reason, because this
+    # tableau happens to have one of each.
+    assert req.factorizations_per_step == 2
     assert req.can_reuse_across_stages is False
+
+
+def test_requirements_dirk_counts_distinct_diagonals_not_stages():
+    """A repeated or zero diagonal reduces the number of distinct matrices.
+
+    An ESDIRK-shaped tableau has an explicit first stage (``A[0,0] = 0``),
+    which needs no factorization at all, and the remaining implicit stages
+    here share a coefficient. Counting one factorization per stage would
+    overstate the cost threefold, and the C-15 count assertion in
+    ``tests/test_factorization_reuse.py`` compares against this prediction.
+    """
+    gamma = 0.4
+    A = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.2, gamma, 0.0],
+            [0.1, 0.3, gamma],
+        ]
+    )
+    U = np.ones((3, 1))
+    B = np.array([[0.2, 0.3, 0.5]])
+    V = np.array([[1.0]])
+    c = np.array([0.0, 0.6, 0.8])
+
+    method = GLMethod(A=A, U=U, B=B, V=V, c=c)
+    problem = ProblemStructure(
+        linearity=Linearity.NONLINEAR,
+        jacobian_constant=False,
+        jacobian_control_dependent=True,
+        has_second_derivatives=False,
+    )
+
+    req = deduce_requirements(method, problem, state_dim=4)
+
+    assert method.s == 3
+    assert req.factorizations_per_step == 1
 
 
 def test_requirements_implicit():

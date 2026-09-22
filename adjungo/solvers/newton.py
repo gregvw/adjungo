@@ -117,6 +117,7 @@ class NewtonMixin:
         y_scale: float = 1.0,
         max_iter: int = 50,
         context: str = "stage solve",
+        factor: Callable[[NDArray], Any] | None = None,
     ) -> tuple[NDArray, Any]:
         """
         Newton's method for a nonlinear stage equation.
@@ -145,6 +146,14 @@ class NewtonMixin:
                 of the C-5.1 threshold
             max_iter: Maximum iterations
             context: Text prefixed to a failure message, naming the caller
+            factor: How to factor a Jacobian. Defaults to
+                ``scipy.linalg.lu_factor``. A caller that owns a
+                :class:`~adjungo.solvers.factorization.FactorizationStore`
+                passes a bound method so that a constant Jacobian is factored
+                once rather than once per stage per step. Substituting this
+                cannot change the matrix that is solved with: the store
+                returns a stored factorization only after verifying that its
+                matrix is element-for-element identical to this one.
 
         Returns:
             ``(z, lu)``: the converged iterate and the LU factorization of
@@ -155,6 +164,8 @@ class NewtonMixin:
             StageSolveError: If the C-5.1 threshold is not reached within
                 ``max_iter`` iterations.
         """
+        lu_factor = scipy.linalg.lu_factor if factor is None else factor
+
         z = np.array(z0, dtype=float)
         residual = np.inf
         tol = stage_solve_tolerance(z, y_scale)
@@ -166,10 +177,10 @@ class NewtonMixin:
             tol = stage_solve_tolerance(z, y_scale)
             if residual <= tol:
                 # Factor at the converged iterate, not at a previous one.
-                return z, scipy.linalg.lu_factor(jacobian_fn(z))
+                return z, lu_factor(jacobian_fn(z))
             if iteration == max_iter:
                 break
-            lu = scipy.linalg.lu_factor(jacobian_fn(z))
+            lu = lu_factor(jacobian_fn(z))
             z = z + scipy.linalg.lu_solve(lu, -r)
 
         raise StageSolveError(max_iter, residual, tol, context, r)

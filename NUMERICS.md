@@ -10,6 +10,7 @@ from an approved clause), `OPEN` (no controlling decision yet).
 
 ---
 
+<a id="c-1"></a>
 ## C-1 Artifact class and caller-trust model — `APPROVED`
 
 Adjungo is a **reference / pilot implementation** for an eventual C++ library. It
@@ -33,6 +34,7 @@ Consequences:
 
 <a id="c-2-primary-accuracy-claim"></a>
 
+<a id="c-2"></a>
 ## C-2 Primary accuracy claim — `APPROVED`
 
 For every **certified** method family (see [C-6](#c-6-envelope-enforcement)), at a
@@ -57,6 +59,7 @@ not change the fact that the adjoint must differentiate that function exactly.
 
 <a id="c-3-accuracy-basis-and-derived-floors"></a>
 
+<a id="c-3"></a>
 ## C-3 Accuracy basis and derived floors — `APPROVED`
 
 Accuracy is measured relative to `max(‖∇J‖_∞, 1)`.
@@ -153,6 +156,7 @@ holding). A comment is a claim; that test is the evidence.
 
 <a id="c-4-continuous-accuracy"></a>
 
+<a id="c-4"></a>
 ## C-4 Continuous accuracy — `APPROVED`
 
 Stated and tested **separately** from C-2. Each certified method attains its
@@ -168,6 +172,7 @@ refine the mesh; C-2 tests hold it fixed.
 
 <a id="c-5-nonlinear-stage-solves"></a>
 
+<a id="c-5"></a>
 ## C-5 Nonlinear stage solves — `APPROVED`
 
 ### C-5.1 Convergence criterion
@@ -270,6 +275,7 @@ even when the residual is small.
 
 <a id="c-6-envelope-enforcement"></a>
 
+<a id="c-6"></a>
 ## C-6 Envelope enforcement — `APPROVED`
 
 ### C-6.1 Certified families
@@ -398,6 +404,7 @@ Uncertified tableau *definitions* are **retained** under
 
 <a id="c-7-no-silent-sentinels"></a>
 
+<a id="c-7"></a>
 ## C-7 No silent sentinels — `APPROVED`
 
 No certified path may return a zero array, a NaN, an infinity, or a default value
@@ -412,6 +419,7 @@ that output semantics. No clause currently does.
 
 ---
 
+<a id="c-8"></a>
 ## C-8 GLM convention — `APPROVED`
 
 Adjungo represents a General Linear Method by the tableau `(A, U, B, V, c)`.
@@ -439,6 +447,7 @@ coefficients in the rows of `A` is malformed, not merely unconventional.
 
 ---
 
+<a id="c-9"></a>
 ## C-9 Objective decomposition — `APPROVED`
 
 The discrete objective is the sum of exactly three kinds of term, which have
@@ -494,6 +503,7 @@ is *not* yet supported as well as about what is.
 
 ---
 
+<a id="c-10"></a>
 ## C-10 Control coordinates and inner product — `APPROVED`
 
 ### C-10.1 Two layers
@@ -592,6 +602,7 @@ method, and this clause is amended.
 
 ---
 
+<a id="c-11"></a>
 ## C-11 Platform, backend, and pinning — `APPROVED`
 
 ### C-11.1 Recording
@@ -621,6 +632,7 @@ basis certifies a machine, not a method, and is a review finding.
 
 ---
 
+<a id="c-12"></a>
 ## C-12 Degeneracy policies — `APPROVED`
 
 | Configuration | Policy |
@@ -634,6 +646,7 @@ basis certifies a machine, not a method, and is a review finding.
 
 ---
 
+<a id="c-13"></a>
 ## C-13 What a C++ reimplementation must preserve
 
 Recorded under C-1. A port that changes any of these produces different numbers:
@@ -709,6 +722,7 @@ Recorded under C-1. A port that changes any of these produces different numbers:
 
 <a id="c-14-the-certification-test-population"></a>
 
+<a id="c-14"></a>
 ## C-14 The certification test population — `APPROVED`
 
 A derivative check is only as strong as the problem it runs on. Certification
@@ -826,6 +840,176 @@ being cited as authority from three places. It was reconstructed from those
 citations rather than newly decided, and states no requirement that was not
 already being applied. The gap was found by
 `tests/test_documentation.py::test_cited_clause_is_defined`.
+
+---
+
+<a id="c-15"></a>
+## C-15 Factorization reuse is certified by count — `APPROVED`
+
+### C-15.1 Reuse must be gated on a declaration, never on a probe
+
+An implicit stage solver may reuse an LU factorization across stages, steps, or
+repeated calls **only** when the caller has declared
+`ProblemStructure(jacobian_constant=True)`.
+
+It may never decide to reuse by examining the problem at run time. Precedent
+[R-9](#r-9) records what that costs: a probe that evaluated `F` at
+`(y_history[0], u_i, t_i)` varied the control and the time but never the state,
+so a Jacobian depending on `y` alone passed it, the adjoint solved with
+`(I − hγF₀)ᵀ` at every stage, and the relative gradient error against the
+monolithic reference was 4.24e-05 — seven orders above the C-3 floor — while
+every test in the suite passed.
+
+The same prohibition applies to *deduction rules that amount to a probe*. Until
+M6, `deduce_requirements` computed
+
+```
+can_reuse_across_stages = jacobian_constant or not jacobian_control_dependent
+```
+
+The second disjunct is false for exactly the R-9 case: a state-dependent
+Jacobian is control-independent and still differs at every stage. It was inert
+only because nothing consumed the flag. **Correctness of a gate that nothing
+reads is not evidence that the gate is correct.**
+
+### C-15.2 A declaration is a promise; reuse requires the fact
+
+`ProblemStructure` is supplied by the caller and is not checked by declaring it.
+Before any stored factorization is returned, the matrix it was taken from is
+compared with the matrix now being asked for, **element for element**. Reuse is
+returned only on exact equality. Otherwise the declaration is false for this
+problem and `DeclaredStructureViolation` is raised.
+
+This is a hard guard with no override, per C-6. The alternative is a derivative
+computed from the transpose of a matrix the forward solve did not use, wrong by
+an amount that shrinks with `h` — which [C-3](#c-3) forbids reading as
+discretization error. The caller always has a correct alternative available at
+no cost in accuracy: declare `jacobian_constant=False`.
+
+The comparison is exact and carries no tolerance. That is not strictness; it is
+the governing condition. If two stage matrices differ in the last place they
+are different matrices, and reusing across them is an approximation of a
+quantity [C-2](#c-2) defines exactly. [C-12](#c-12) forbids inventing a
+tolerance where the condition is exact.
+
+Verification is affordable *because* it is not free: forming the matrix costs
+`O(n²)` and factoring it costs `O(n³)`, so the check is asymptotically cheaper
+than the work it guards. A guard that cost more than the optimization would be
+a reason to drop the optimization, not the guard.
+
+### C-15.3 The factorization count is a certified quantity — `OBSERVED`
+
+Reuse is the one optimization here that **no accuracy test can detect**. Working
+or silently broken, the answers are bit-identical: the matrix is the same, so
+its factors are the same. Only the cost moves, and a derivative test cannot see
+cost.
+
+The certified quantity is therefore the count. It is asserted **structurally**,
+against `SolverRequirements.factorizations_for_solve`, never by timing.
+
+| Family | Distinct stage matrices per step | Whole solve, `jacobian_constant=True` |
+|---|---|---|
+| Explicit | 0 | 0 — nothing to reuse; prediction is *not applicable*, not zero |
+| SDIRK | 1 (the constant diagonal γ) | **1**, independent of `N` |
+| DIRK | one per distinct nonzero `A[i,i]` | that many, independent of `N` |
+| Fully implicit | 1, of size `s·n` | **1**, independent of `N` |
+
+Without the declaration the count is **not predicted**:
+`factorizations_for_solve` returns `None`. Every Newton iteration factors, and
+the iteration count is a property of Newton and the initial guess, not of the
+dispatch. A number there would assert something the deduction does not know.
+
+Two consequences are asserted separately:
+
+- The adjoint, tangent and second-order adjoint sweeps add **nothing** to the
+  count. They apply the transpose via `lu_solve(..., trans=1)` on the forward
+  factors. Forming and factoring a transpose explicitly would pass every
+  accuracy test and move only this count.
+- A constant Jacobian means `f` is affine in `y`, so every implicit stage
+  equation is affine in its unknown and Newton converges in one step. There is
+  no constant-Jacobian problem that needs several Newton iterations; the
+  prediction is not evading a hard case.
+
+Measured at `N = 12`, `n = 3`, `ν = 2` on `ConstantJacobianQuadraticControl`,
+gradient evaluation, before and after M6:
+
+| Method | `s` | Before | After | Predicted |
+|---|---|---|---|---|
+| `implicit_midpoint` | 1 | 16 | 1 | 1 |
+| `implicit_trapezoid` | 2 | 16 | 1 | 1 |
+| `sdirk2` | 2 | 32 | 1 | 1 |
+| `sdirk3` | 3 | 48 | 1 | 1 |
+| `gauss2` | 2 | 16 (size 4) | 1 (size 4) | 1 |
+
+(The "before" figures are at `N = 8` on a 2-state LTI problem, the measurement
+that motivated the work; the ratio, not the absolute number, is the point. The
+factor of two over the naive `s·N` is Newton factoring both during its single
+iteration and again at the converged iterate, as [C-5.4](#c-5) requires.)
+
+### C-15.5 The count must be complete, not representative — `APPROVED`
+
+A count taken at the store measures the right quantity only if the store is the
+**sole** route to `lu_factor`. That is a claim about the code, and it must be
+tested, not asserted.
+
+`OBSERVED` — it was not, when first written. Injection M7 below restored a
+single direct `scipy.linalg.lu_factor` call in `newton_solve`, at the converged
+iterate, and **nothing failed**. The store still reported one factorization
+because the extra one never reached it, and the answers were unchanged because
+it factored the same matrix. A per-stage, per-step cost had returned while the
+certified count reported the optimization working perfectly.
+
+`tests/test_factorization_reuse.py::test_no_factorization_bypasses_the_store`
+now counts at `scipy.linalg.lu_factor` and requires the two numbers to agree,
+on the reusing and the non-reusing path.
+
+### C-15.6 Injection evidence — `OBSERVED`
+
+Under [R-11](#r-11) against a 349-test baseline with 0 failures:
+
+| Injected defect | Failing tests |
+|---|---|
+| Reuse without comparing the matrix (R-9, in declarative form) | 6 |
+| Reuse inferred from control-independence instead of the declaration | 1 |
+| The store silently stops recording entries | 13 |
+| The store keeps a view of the caller's buffer instead of a copy | 1 |
+| The DIRK count claims one factorization per stage | 2 |
+| Reuse enabled regardless of what the caller declared | 42 |
+| Newton bypasses the store for the converged-iterate factorization | 2 |
+| The prediction returns a number where the count is unpredictable | 6 |
+
+Two of these initially failed to be detected, and both are recorded because the
+reason is the same in each case: **a gate that nothing reads cannot be tested by
+behaviour.**
+
+- The control-independence deduction rule was wrong and inert, because no
+  solver consumed `can_reuse_across_stages`. It is now asserted directly.
+- The Newton bypass is invisible to every accuracy test and to the store's own
+  count; see C-15.5.
+
+The 42-failure result is the guard behaving correctly: enabling reuse against a
+false declaration converts what R-9 recorded as a silent 4.24e-05 gradient error
+into an immediate refusal.
+
+Evidence: `tests/test_factorization_reuse.py`,
+`tests/test_requirements.py::test_requirements_dirk_counts_distinct_diagonals_not_stages`.
+
+### C-15.4 Reuse must reproduce the unreused result exactly — `APPROVED`
+
+Enabling reuse must change **no** certified number, and the required agreement
+is bit-identity, not a tolerance.
+
+This is not a pinned float and does not conflict with
+[C-11](#c-11)'s prohibition on pinning: nothing is recorded, and no two
+different computations are compared. Under C-15.2 the stored matrix is
+identical to the matrix that would otherwise be factored, so a deterministic
+`lu_factor` yields identical factors and an identical right-hand side an
+identical solution. The argument holds on any platform and under any BLAS
+because it never crosses between two computations.
+
+If this agreement ever fails by a small amount, the correct reading is **not**
+roundoff. It is that some input was not identical and C-15.2's guard was
+reached with something it should have rejected.
 
 ---
 

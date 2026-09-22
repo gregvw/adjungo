@@ -33,10 +33,12 @@ from numpy.typing import NDArray
 
 __all__ = [
     "AnchorObjective",
+    "ConstantJacobianQuadraticControl",
     "CoupledNonlinear",
     "FullCostObjective",
     "LinearTimeVarying",
     "ScalarAnchor",
+    "StateDependentJacobian",
     "make_controls",
 ]
 
@@ -311,3 +313,109 @@ class FullCostObjective:
 
     def d2J_dy2_terminal(self, y_final: NDArray) -> NDArray:
         return self.Q_T.copy()
+
+
+class ConstantJacobianQuadraticControl:
+    """``y' = A y + B (u * u)``: ``F = A`` exactly, with real control curvature.
+
+    The M6 factorization-reuse fixture. It is deliberately the *hardest*
+    problem that still has a constant state Jacobian, and understanding why
+    there is no harder one is the point.
+
+    A constant ``F`` means ``f`` is affine in ``y``. That makes every implicit
+    stage equation affine in its unknown, so Newton converges in one step and
+    the stage matrix ``I - h a_ii A`` is the same at every stage of every step.
+    Reuse is therefore exact, and it is exact for a *mathematical* reason, not
+    a tolerance. There is no such thing as a constant-Jacobian problem that
+    nonetheless needs several Newton iterations.
+
+    What a constant ``F`` does **not** force is a trivial second-order path.
+    Here ``f`` is quadratic in ``u``, so ``F_uu`` is nonzero and the
+    Hessian-vector product exercises real curvature while ``F_yy`` and
+    ``F_yu`` vanish. The control Jacobian ``G = 2 B diag(u)`` varies with
+    ``u``, which keeps the tangent and second-order adjoint sweeps from
+    degenerating into constants.
+
+    ``A`` is non-normal and non-symmetric so that a transpose confusion cannot
+    hide, and ``B`` is rectangular with ``n = 3``, ``nu = 2``.
+    """
+
+    state_dim = 3
+    control_dim = 2
+
+    A = np.array(
+        [
+            [-0.70, 1.30, 0.00],
+            [-0.40, -0.25, 0.90],
+            [0.15, -0.60, -1.10],
+        ]
+    )
+    B = np.array([[1.0, 0.0], [0.30, 1.0], [-0.20, 0.45]])
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.A @ y + self.B @ (u * u)
+
+    def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.A
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return 2.0 * self.B * u[np.newaxis, :]
+
+    def F_yy_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return np.zeros((self.state_dim, self.state_dim))
+
+    def F_yu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return np.zeros((self.state_dim, self.control_dim))
+
+    def F_uu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        """``Σ_l v_l d²f_l/du²`` = ``2 diag(Bᵀ v)``, shape ``(ν, ν)``."""
+        return 2.0 * np.diag(self.B.T @ v)
+
+
+class StateDependentJacobian:
+    """``y' = A y + c * y*y + B u``: ``F`` varies with the state, not with ``u``.
+
+    The R-9 regression fixture. ``F = A + 2 c diag(y)`` depends on ``y`` alone,
+    so it is *control-independent* and *time-independent* while still differing
+    at every stage. A caller declaring ``jacobian_constant=True`` for it is
+    making a false statement, and the historical failure mode is that nothing
+    notices: the forward solve is unaffected, the method keeps its design
+    order, and only the adjoint -- which reuses the factorization -- is wrong.
+    """
+
+    state_dim = 2
+    control_dim = 2
+    c = 0.6
+
+    A = np.array([[-0.5, 0.9], [-0.7, -0.3]])
+    B = np.array([[1.0, 0.2], [0.0, 1.0]])
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.A @ y + self.c * y * y + self.B @ u
+
+    def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.A + 2.0 * self.c * np.diag(y)
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.B
+
+    def F_yy_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return 2.0 * self.c * np.diag(v)
+
+    def F_yu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return np.zeros((self.state_dim, self.control_dim))
+
+    def F_uu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return np.zeros((self.control_dim, self.control_dim))

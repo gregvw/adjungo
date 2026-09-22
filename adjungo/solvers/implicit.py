@@ -14,6 +14,7 @@ feature, so the bodies were deleted and construction was made to raise. This
 module now implements the solve.
 """
 
+import functools
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,7 @@ from numpy.typing import NDArray
 from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
 from adjungo.solvers.base import StageSolver, StepCache
+from adjungo.solvers.factorization import FactorizationStore
 from adjungo.solvers.newton import NewtonMixin, StageSolveError
 
 
@@ -119,8 +121,20 @@ class ImplicitStageSolver(NewtonMixin, StageSolver):
     certification for no numerical gain. See NUMERICS.md C-6.1.
     """
 
-    def __init__(self, y_scale: float = 1.0) -> None:
+    def __init__(
+        self, y_scale: float = 1.0, reuse_across_steps: bool = False
+    ) -> None:
         self.y_scale = y_scale
+        #: The coupled Newton Jacobian is ``I - h (A kron I) blockdiag(F_j)``
+        #: of size ``s*n``. With a constant ``F`` it is the same matrix at
+        #: every step, so the single ``O((s*n)^3)`` factorization is taken
+        #: once for the whole solve. This is the largest saving of the three
+        #: families, and it is also the one where an unverified reuse would
+        #: do the most damage: the adjoint, the tangent and the second-order
+        #: adjoint all solve with these same factors.
+        self.factorizations = FactorizationStore(
+            reuse_enabled=reuse_across_steps
+        )
 
     def solve_stages(
         self,
@@ -184,6 +198,9 @@ class ImplicitStageSolver(NewtonMixin, StageSolver):
                 base.ravel(),
                 y_scale=self.y_scale,
                 context=coupled_stage_context(step, t_n, h),
+                factor=functools.partial(
+                    self.factorizations.factor, ("coupled", h)
+                ),
             )
         except StageSolveError as exc:
             raise self._locate_failing_stage(exc, s, n) from None

@@ -156,8 +156,17 @@ and `s` the number of internal stages:
 
 **Total cost for adjoint sensitivity is about 1x an adjoint solve.**
 
-The factorization counts above are the claim; they are not yet enforced by an
-instrumented counter. Making reuse genuine and measured is milestone M6.
+These counts are enforced, not assumed. `NUMERICS.md` C-15 makes the observed
+number of `lu_factor` calls a certified quantity, and
+`tests/test_factorization_reuse.py` asserts it against the number
+`SolverRequirements.factorizations_for_solve` predicts -- structurally, never by
+timing.
+
+When the caller declares a constant Jacobian, the measured count for a whole
+solve is **1**, independent of the number of steps, for every certified
+implicit family; a Hessian-vector product takes no more than an objective
+evaluation. Before this was measured, `sdirk3` took 48 factorizations over 8
+steps while the deduction claimed 8.
 
 ## Key Advantages
 

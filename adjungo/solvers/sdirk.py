@@ -1,5 +1,6 @@
 """SDIRK stage solver with factorization reuse."""
 
+import functools
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,7 @@ from numpy.typing import NDArray
 from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
 from adjungo.solvers.base import StageSolver, StepCache
+from adjungo.solvers.factorization import FactorizationStore
 from adjungo.solvers.newton import NewtonMixin, stage_context
 
 
@@ -36,17 +38,31 @@ class SDIRKStageSolver(NewtonMixin, StageSolver):
 
     The substitution also bought nothing: Newton has already factored each
     stage by the time it converges, so sharing the object saved no work and
-    only risked the adjoint matrix. Skipping the factorization *work* requires
-    knowing constancy in advance, from a declared
-    :class:`~adjungo.core.problem.ProblemStructure`, not from a runtime probe
-    at points the stages do not visit. That is milestone M6.
+    only risked the adjoint matrix.
+
+    Skipping the factorization *work* is done instead by
+    :class:`~adjungo.solvers.factorization.FactorizationStore`, which this
+    class owns. It reuses only when the caller has declared a constant
+    Jacobian, and only after comparing the stored matrix with the one it is
+    asked to factor, element for element. On a declared-constant Jacobian an
+    entire solve takes one factorization rather than one per stage per Newton
+    iteration per step; measured at 1 against 48 for ``sdirk3`` at ``N = 8``.
+    See ``NUMERICS.md`` C-15.
     """
 
     def __init__(
         self, reuse_across_steps: bool = False, y_scale: float = 1.0
     ) -> None:
-        self._reuse_across_steps = reuse_across_steps
         self.y_scale = y_scale
+        #: All SDIRK implicit stages share one diagonal coefficient, so with
+        #: a declared-constant Jacobian every stage of every step presents
+        #: the same matrix ``I - h g F`` and exactly one factorization is
+        #: taken for the entire solve. The store verifies that claim against
+        #: each matrix before reusing; see
+        #: :mod:`adjungo.solvers.factorization`.
+        self.factorizations = FactorizationStore(
+            reuse_enabled=reuse_across_steps
+        )
 
     def solve_stages(
         self,
@@ -125,6 +141,9 @@ class SDIRKStageSolver(NewtonMixin, StageSolver):
                     rhs,
                     y_scale=self.y_scale,
                     context=stage_context("SDIRK", i, step, t_stage),
+                    factor=functools.partial(
+                        self.factorizations.factor, (gamma, h)
+                    ),
                 )
                 factorizations.append(lu)
 
