@@ -1,4 +1,34 @@
-Looking at the documentation, this is a well-thought-out mathematical framework. Let me devise a Python project plan that captures the key abstractions while economizing computational work across the various solver types.
+> **SUPERSEDED — historical record, not current documentation.**
+>
+> This file is an ad-hoc report written during earlier development. It is kept
+> because it contains the reasoning and measurements behind decisions that are
+> now recorded normatively elsewhere, and deleting it would destroy that
+> evidence. It is **not** maintained, and statements in it may describe code,
+> file paths, APIs, tolerances or test counts that no longer exist.
+>
+> For anything you intend to rely on, read instead:
+>
+> | Question | Authority |
+> |---|---|
+> | Accuracy claims, tolerances, envelope, refusals, defect precedents | [`NUMERICS.md`](../../NUMERICS.md) |
+> | What is certified and how to use it | [`README.md`](../../README.md) |
+> | Paths, commands, local conventions | [`AGENTS.md`](../../AGENTS.md) |
+> | The mathematics the code implements | [`docs/glm_opt.tex`](../glm_opt.tex) |
+>
+> See [`docs/history/README.md`](README.md) for the checklist recording where
+> each durable claim from this file now lives.
+
+> **Additional warning specific to this file.** This is a *pre-implementation
+> design proposal*, not a record of the implementation. Its Python blocks are
+> sketches, most with `...` bodies, and the signatures, module names and
+> algorithms in them differ from the delivered code in ways that matter. The
+> package is `adjungo`, not `glm_opt`. Do not port from this file. Read
+> [`docs/architecture.md`](../architecture.md) for the delivered structure, and
+> the code itself for the algorithms.
+
+---
+
+# Python implementation design proposal (pre-implementation)
 
 ## Project Architecture
 
@@ -897,5 +927,3 @@ class IMEXStageSolver(StageSolver):
 **Factorization sharing between passes:**
 - Forward state and forward sensitivity share `A_n` factorization
 - Backward adjoint and backward adjoint sensitivity share `A_n^T` factorization (same LU, transposed solve)
-
-This design gives you a clean separation of concerns while maximizing computational reuse. Shall I elaborate on any particular component?

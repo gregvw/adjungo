@@ -316,6 +316,12 @@ under [R-11](#r-11) against a 312-test baseline with 0 failures:
 | An archived report is dropped from the `docs/history/` accounting table | 1 |
 | An ad-hoc report reappears in the repository root | 1 |
 | An internal cross-reference anchor is deleted | 1 |
+| `docs/architecture.md` names a module that does not exist | 1 |
+| `docs/architecture.md` omits a module that does exist | 1 |
+| The `glm_opt.tex`-to-code symbol map cites a stale attribute | 1 |
+| The symbol-map table is removed | 1 |
+| `docs/architecture.md` stops recording IMEX as unbuilt | 1 |
+| `docs/architecture.md` lists a certified family as unbuilt | 1 |
 
 #### Additional evidence for the fully implicit family
 

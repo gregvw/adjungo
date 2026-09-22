@@ -252,10 +252,7 @@ def test_archived_reports_are_marked_superseded():
     documentation, and several of them contradict the current contract.
     """
     reports = _archived_reports()
-    assert len(reports) == 16, (
-        f"expected 16 archived reports, found {len(reports)}: "
-        f"{[p.name for p in reports]}"
-    )
+    assert reports, "docs/history/ holds no archived reports"
 
     for report in reports:
         first = report.read_text(encoding="utf-8").splitlines()[0]
@@ -273,16 +270,30 @@ def test_every_archived_report_is_accounted_for():
     """
     index = (HISTORY / "README.md").read_text(encoding="utf-8")
 
-    missing = [p.name for p in _archived_reports() if f"`{p.name}`" not in index]
+    present = {p.name for p in _archived_reports()}
+
+    missing = sorted(n for n in present if f"`{n}`" not in index)
     assert not missing, (
         "docs/history/README.md does not account for: " + ", ".join(missing)
+    )
+
+    # The converse. A row naming a file that is gone asserts that the file's
+    # content was accounted for and is still available to check, which is then
+    # false. That is worse than no row: the index is the stated precondition
+    # for deleting these files, so a stale row can authorise a second deletion.
+    cited = {m.group(1) for m in re.finditer(r"^\| `([A-Za-z0-9_]+\.md)`", index, re.MULTILINE)}
+    vanished = sorted(cited - present)
+    assert not vanished, (
+        "docs/history/README.md accounts for files that are not there: "
+        + ", ".join(vanished)
+        + ". Remove the row, or restore the file."
     )
 
 
 def test_no_ad_hoc_reports_remain_in_the_repository_root():
     """Only the four maintained documents live at the top level.
 
-    The 16 archived files accumulated there one session at a time, each
+    The archived files accumulated there one session at a time, each
     reasonable on its own, until the root held more obsolete reports than
     current documentation. This test is the ratchet.
     """
@@ -296,3 +307,157 @@ def test_no_ad_hoc_reports_remain_in_the_repository_root():
         + ". Session reports and working notes belong in docs/history/ with a "
         "superseded banner and an entry in docs/history/README.md."
     )
+
+
+# --------------------------------------------------------------------------
+# docs/architecture.md
+#
+# The document this replaced was an ASCII diagram of an intended design. It
+# listed `solvers/imex.py`, automatic differentiation of user callbacks, and
+# genericity over the scalar type, none of which were ever written; it omitted
+# `validation/`, which is the repository's primary oracle. Nothing detected the
+# drift because nothing could: no part of the document was checkable.
+#
+# These tests make the structural claims checkable. They deliberately do not
+# judge prose.
+# --------------------------------------------------------------------------
+
+ARCHITECTURE = ROOT / "docs" / "architecture.md"
+
+
+def _module_map() -> set[str]:
+    """Paths claimed by the fenced module map, as ``package/module.py``."""
+    text = ARCHITECTURE.read_text(encoding="utf-8")
+    block = re.search(r"```\nadjungo/\n(.*?)```", text, re.DOTALL)
+    assert block, "docs/architecture.md has no fenced module map beginning 'adjungo/'"
+
+    claimed: set[str] = set()
+    package = ""
+    for line in block.group(1).splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        token = line.strip().split()[0]
+        if token.endswith("/"):
+            # A nested package keeps its parent prefix; a top-level one resets.
+            package = token if indent <= 2 else package + token
+        elif token.endswith(".py"):
+            claimed.add(package + token)
+    return claimed
+
+
+def test_architecture_module_map_matches_the_package():
+    """Every module the map names exists, and every module is named.
+
+    Both directions matter, and for different reasons. A named module that does
+    not exist is the advertised-capability defect: `solvers/imex.py` appeared in
+    the design document and in the architecture diagram, and a reader had no way
+    to tell that no such file had ever been written. A module that exists but is
+    unnamed is the opposite failure -- `validation/reference.py`, the primary
+    oracle of C-14.1, was absent from the diagram entirely.
+    """
+    package_root = ROOT / "adjungo"
+    actual = {
+        str(p.relative_to(package_root))
+        for p in package_root.rglob("*.py")
+        if p.name != "__init__.py"
+    }
+    claimed = _module_map()
+
+    phantom = sorted(claimed - actual)
+    assert not phantom, (
+        "docs/architecture.md describes modules that do not exist: "
+        + ", ".join(phantom)
+        + ". Describing unwritten code as part of the architecture is the "
+        "defect class NUMERICS.md C-1 exists to prevent."
+    )
+
+    undocumented = sorted(actual - claimed)
+    assert not undocumented, (
+        "docs/architecture.md omits: "
+        + ", ".join(undocumented)
+        + ". A reimplementer reading the map would not know these exist."
+    )
+
+
+def test_architecture_symbol_map_resolves():
+    """Every code symbol in the glm_opt.tex-to-code table is a real attribute.
+
+    The symbol map is the bridge a reimplementer crosses between the derivation
+    and the code, and it is the only place recording that `V` is overloaded:
+    `glm_opt.tex` uses it both for the GLM propagation matrix, which is
+    `method.V`, and for an unrelated bilinear form that has no code symbol at
+    all. A stale attribute name here sends the reader to the wrong operator.
+    """
+    import adjungo
+    from adjungo.stepping.adjoint import AdjointTrajectory
+    from adjungo.stepping.sensitivity import (
+        AdjointSensitivityTrajectory,
+        SensitivityTrajectory,
+    )
+    from adjungo.stepping.trajectory import Trajectory
+
+    owners = {
+        "method": adjungo.GLMethod,
+        "problem": adjungo.Problem,
+        "trajectory": Trajectory,
+        "adjoint": AdjointTrajectory,
+        "sensitivity": SensitivityTrajectory,
+        "adj_sensitivity": AdjointSensitivityTrajectory,
+    }
+
+    text = ARCHITECTURE.read_text(encoding="utf-8")
+    table = text.split("## Symbol map")[1].split("\n---")[0]
+
+    checked = 0
+    unresolved = []
+    for row in table.splitlines():
+        if not row.startswith("|"):
+            continue
+        cells = row.split("|")
+        if len(cells) < 3:
+            continue
+        for ref in re.findall(r"`([a-z_]+)\.([A-Za-z_]+)", cells[2]):
+            owner, attribute = ref
+            if owner not in owners:
+                continue
+            checked += 1
+            target = owners[owner]
+            fields = set(getattr(target, "__annotations__", {}))
+            if not hasattr(target, attribute) and attribute not in fields:
+                unresolved.append(f"{owner}.{attribute}")
+
+    assert checked >= 10, (
+        f"only {checked} symbol-map entries were checkable; the table's shape "
+        "has changed and this test is no longer examining it"
+    )
+    assert not unresolved, (
+        "docs/architecture.md maps glm_opt.tex symbols onto attributes that do "
+        "not exist: " + ", ".join(sorted(set(unresolved)))
+    )
+
+
+def test_architecture_does_not_claim_uncertified_families():
+    """The 'not built' table and C-6.1 must not contradict each other.
+
+    The previous architecture document described additive/IMEX splitting and
+    partitioned methods as part of the design, in the same register as the
+    parts that worked. Both are refused by `GLMOptimizer`.
+    """
+    from adjungo.optimization.interface import CERTIFIED_STAGE_TYPES
+
+    text = ARCHITECTURE.read_text(encoding="utf-8")
+    not_built = text.split("## What is not built")[1].split("\n---")[0].lower()
+
+    for family, marker in (("imex", "IMEX"), ("multistep", "multistep")):
+        assert family in not_built, (
+            f"docs/architecture.md no longer records {marker} as unbuilt. "
+            "It is still refused by GLMOptimizer."
+        )
+
+    certified = {stage_type.name.lower() for stage_type in CERTIFIED_STAGE_TYPES}
+    for name in certified:
+        assert f"| {name} |" not in not_built.replace("`", ""), (
+            f"docs/architecture.md lists {name} as not built, but "
+            "CERTIFIED_STAGE_TYPES certifies it."
+        )

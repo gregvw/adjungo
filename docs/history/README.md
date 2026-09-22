@@ -1,6 +1,6 @@
 # Historical reports — archive and accounting checklist
 
-The 16 files in this directory were written during earlier development and kept
+The 17 files in this directory were written during earlier development and kept
 in the repository root. They are **superseded**. Each now carries a banner
 saying so.
 
@@ -54,6 +54,7 @@ than lost.
 | `HESSIAN_BUG_SUMMARY.md` | The terminal cost contributes curvature that a Gauss–Newton-shaped assembly drops entirely. | `NUMERICS.md` R-6. | `‖H_terminal‖ = 0.022` and the component values: no complete objective specified. |
 | `LTIC_CRANK_NICOLSON_PROGRESS.md` | Crank–Nicolson is order 2, and a single-mesh tolerance is not a test of that. | `tests/test_ltic_crank_nicolson.py::test_crank_nicolson_lti_observed_order`, which measures the rate over five meshes; `NUMERICS.md` C-4. | "Energy drift below 1% over 100 periods." No invariant, norm or horizon is defined well enough to test, and energy behaviour is not a certified claim. |
 | `NONLINEAR_AND_SENSITIVITY_STATUS.md` | Progress narration. | — | Quadratic-drag optimisation reaching "error < 0.5": no setup. |
+| `python_implementation.md` | The module layout, which the delivered package follows closely. Written *before* implementation as a design proposal; its Python blocks are sketches, most with `...` bodies, under the package name `glm_opt`. | Superseded by [`docs/architecture.md`](../architecture.md), which documents the delivered structure, the four sweeps, the `glm_opt.tex`-to-code symbol map, and an explicit list of what is *not* built. | A factorization-count table (`Explicit 0`, `SDIRK+linear 1`, `DIRK+linear s`, ...). The counts are plausible and are restated as a claim in `docs/adjoint_sensitivity_insight.md`, but nothing measures them. Milestone M6 adds an instrumented counter; until then they are not evidence. Also proposed `solvers/imex.py` and AD-based derivatives, neither of which exists. |
 | `SCIPY_VALIDATION.md` | Forward solvers were checked against SciPy and against analytical solutions; RK4 showed approximately fourth order over `N = 10, 20, 40, 80`. | Superseded. Order is now measured by rate over a refinement sequence against a closed-form `expm` solution in `tests/test_ltic_crank_nicolson.py` and `tests/test_fully_implicit.py`. | External agreement with SciPy as a *validation precedent*. SciPy solves the continuous problem adaptively; it is not an oracle for this repository's fixed-mesh discrete derivative (`NUMERICS.md` C-2). Retaining it as authority would invite exactly the confusion C-2 forbids. |
 | `SENSITIVITY_COMPLETE_STATUS.md` | Progress narration. | — | Scalar validation `0.03139691` against itself; Hessian discrepancy `2–3e-3` without setup. |
 | `SESSION_FINAL_SUMMARY.md` | Index of the other reports. | — | Nothing unique. |

@@ -264,12 +264,17 @@ The library is organized into several modules:
 
 ## Documentation
 
-See the `docs/` directory for detailed mathematical formulation and implementation notes:
-
-- `docs/architecture.md`: High-level architecture overview
-- `docs/python_implementation.md`: Detailed implementation guide
-- `docs/glm_opt.tex`: Mathematical framework
-- `docs/linalg_requirements.tex`: Linear algebra optimization strategies
+| Document | What it is |
+|---|---|
+| [`NUMERICS.md`](NUMERICS.md) | The approved contract. What is certified, what is refused, the accuracy basis, and the defect precedents. Authoritative where anything else disagrees. |
+| [`AGENTS.md`](AGENTS.md) | Paths, commands and local conventions for working in this repository. |
+| [`docs/architecture.md`](docs/architecture.md) | Module map, the four sweeps, the `glm_opt.tex`-to-code symbol map, an explicit list of what is **not** built, and what a C++ reimplementation must preserve. |
+| [`docs/adjoint_sensitivity_insight.md`](docs/adjoint_sensitivity_insight.md) | Why the adjoint and adjoint-sensitivity solves are linear and share one factorization, and the stage-index trap that makes a wrong version look correct. |
+| [`docs/glm_opt.tex`](docs/glm_opt.tex) | The mathematical derivation the code implements. |
+| [`docs/runge_kutta_opt.tex`](docs/runge_kutta_opt.tex) | The Runge-Kutta special case, second-order conditions. |
+| [`docs/multistep_opt.tex`](docs/multistep_opt.tex) | Multistep optimality conditions. The corresponding solver path is **refused**; this is theory, not a description of working code. |
+| [`docs/linalg_requirements.tex`](docs/linalg_requirements.tex) | Linear algebra requirements by method family. |
+| [`docs/history/`](docs/history/README.md) | Superseded development reports, kept as evidence. Not maintained; see the index for where each durable claim now lives. |
 
 ## Development
 
