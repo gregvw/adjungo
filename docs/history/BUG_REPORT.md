@@ -1,3 +1,25 @@
+> **SUPERSEDED — historical record, not current documentation.**
+>
+> This file is an ad-hoc report written during earlier development. It is kept
+> because it contains the reasoning and measurements behind decisions that are
+> now recorded normatively elsewhere, and deleting it would destroy that
+> evidence. It is **not** maintained, and statements in it may describe code,
+> file paths, APIs, tolerances or test counts that no longer exist.
+>
+> For anything you intend to rely on, read instead:
+>
+> | Question | Authority |
+> |---|---|
+> | Accuracy claims, tolerances, envelope, refusals, defect precedents | [`NUMERICS.md`](../../NUMERICS.md) |
+> | What is certified and how to use it | [`README.md`](../../README.md) |
+> | Paths, commands, local conventions | [`AGENTS.md`](../../AGENTS.md) |
+> | The mathematics the code implements | [`docs/glm_opt.tex`](../glm_opt.tex) |
+>
+> See [`docs/history/README.md`](README.md) for the checklist recording where
+> each durable claim from this file now lives.
+
+---
+
 # Bug Report from Test Results
 
 ## Test Results Summary

@@ -73,6 +73,23 @@ A diagnostic script is a **temporary** artifact. When it demonstrates something
 real, migrate the case into `tests/` as an assertion and delete the script. See
 `scripts/diagnostics/MIGRATION.md`.
 
+### No ad-hoc reports at the repository root
+
+Only `README.md`, `NUMERICS.md`, `AGENTS.md` and `CHANGELOG.md` belong at the
+top level. Session notes, bug reports and status summaries go in
+`docs/history/`, each with a superseded banner and a row in
+`docs/history/README.md` recording where its durable content now lives.
+
+Sixteen such files had accumulated in the root, one reasonable-looking session
+at a time, until there were more obsolete reports than current documentation and
+several of them contradicted the contract. Enforced by
+`tests/test_documentation.py::test_no_ad_hoc_reports_remain_in_the_repository_root`.
+
+**A measured number is durable only with its setup.** "Gradient error improved
+to 6.7e-4" cannot be rechecked and cannot fail, so it may not be quoted as
+evidence. State the problem, initial state, control, time span, mesh and norm,
+or do not state the number.
+
 ### Derivative tests hold the mesh fixed
 
 Per C-2 and C-4, these are two different claims and must live in two differently
@@ -119,6 +136,15 @@ confirm it fails when the code under test is broken.
 certified. **Do not describe a family as working in the README or docstrings
 before its milestone completes.** Advertised capability exceeding delivered
 capability is the defect class this contract exists to prevent.
+
+The C-6.1 table and `adjungo/optimization/interface.py::CERTIFIED_STAGE_TYPES`
+must agree, and are checked against each other by
+`tests/test_documentation.py::test_certified_families_agree_with_the_code`. Change
+both in the same commit, never one alone.
+
+Currently certified: explicit Runge-Kutta, DIRK, SDIRK, and fully implicit
+(dense `A`, one coupled `(s*n)` Newton solve per step). Refused: `r > 1`
+multistep, IMEX/additive.
 
 ## Oracle hierarchy
 

@@ -168,14 +168,33 @@ where we abbreviate $\Av_n := \Av(\uv^n)$, etc.
 
 Introduce Lagrange multipliers $\mv^n \in \CC^{ns}$ for the stage equations and $\lv^n \in \CC^{nr}$ for the propagation equations. The Lagrangian is:
 \begin{equation}
-\LL = J(\mathbf{Y}, \mathbf{u}) + 2\Re\sum_{n=1}^N \left[ (\mv^n)\herm \mathcal{E}^{(Z)}_n + (\lv^n)\herm \mathcal{E}^{(y)}_n \right]
+\label{eqn:glm_lagrangian}
+\LL = J(\mathbf{Y}, \mathbf{u}) - 2\Re\sum_{n=1}^N \left[ (\mv^n)\herm \mathcal{E}^{(Z)}_n + (\lv^n)\herm \mathcal{E}^{(y)}_n \right]
 \end{equation}
+
+\paragraph{Sign convention (corrected).}
+The minus sign is not cosmetic. Adjoining the constraints with $+$ instead
+negates $\mv$ and $\lv$, and therefore negates the weighted adjoint
+$\Lambda_k^n$ and the constraint term of the gradient. Earlier revisions of this
+document carried $+$ here while stating the terminal condition, the $\lv$
+recursion and the gradient in the convention that follows from $-$, so the
+derivation did not reproduce its own boxed results. The convention fixed here is
+the one the reference implementation uses and validates:
+\[
+  \lv^N = \pder{J}{\yv^{[N]}}, \qquad
+  \lv^n = \Uv\herm \mv^{n+1} + \Vv\herm \lv^{n+1} + \pder{J}{\yv^{[n]}}, \qquad
+  \nabla_{u} \hat J = \pder{J}{u} + 2h\Re\!\left[ (\Lambda)\herm V Z \right].
+\]
+Note that $\Av\herm \mv = \Bv\herm \lv$ is invariant under the sign flip,
+because it is homogeneous in the multipliers. Only the inhomogeneous
+relations --- the ones carrying $\partial J$ --- distinguish the two
+conventions, which is why the inconsistency survived review.
 
 \subsubsection{Adjoint Equations}
 
 Taking variations with respect to $Z_k^n$ (for each internal stage $k$ at step $n$):
 \begin{equation}
-\LL_{Z_k^n} = (\mv^n)\herm \Av_{:,k} - (\lv^n)\herm \Bv_{:,k} = 0
+\LL_{Z_k^n} = -(\mv^n)\herm \Av_{:,k} + (\lv^n)\herm \Bv_{:,k} = 0
 \end{equation}
 where $\Av_{:,k}$ denotes column $k$ of $\Av$. In block form:
 \begin{equation}
@@ -185,11 +204,15 @@ where $\Av_{:,k}$ denotes column $k$ of $\Av$. In block form:
 
 Taking variations with respect to $y_k^{[n]}$ (for each external stage $k$ at step $n$):
 \begin{itemize}
-\item From $\mathcal{E}^{(Z)}_{n+1}$: contributes $-\Uv\herm_{:,k} \mv^{n+1}$
-\item From $\mathcal{E}^{(y)}_n$: contributes $\lambda_k^n$
-\item From $\mathcal{E}^{(y)}_{n+1}$: contributes $-\Vv\herm_{:,k} \lv^{n+1}$
+\item From $\mathcal{E}^{(Z)}_{n+1}$: contributes $+\Uv\herm_{:,k} \mv^{n+1}$
+\item From $\mathcal{E}^{(y)}_n$: contributes $-\lambda_k^n$
+\item From $\mathcal{E}^{(y)}_{n+1}$: contributes $+\Vv\herm_{:,k} \lv^{n+1}$
 \item From $J$: contributes $\pder{J}{y_k^{[n]}}$
 \end{itemize}
+
+Setting the sum to zero and solving for $\lambda_k^n$ gives the recursion below.
+At $n = N$ only the second and fourth items are present, which is the terminal
+condition.
 
 In block form:
 \begin{equation}
@@ -214,7 +237,7 @@ The control $u_k^n$ appears in column $k$ of $\Av(\uv^n)$ and $\Bv(\uv^n)$:
 
 Taking variations:
 \begin{equation}
-\LL_{u_k^n} = \pder{J}{u_k^n} + 2\Re\left[ (\mv^n)\herm \pder{\Av_{:,k}}{u_k^n} Z_k^n - (\lv^n)\herm \pder{\Bv_{:,k}}{u_k^n} Z_k^n \right]
+\LL_{u_k^n} = \pder{J}{u_k^n} - 2\Re\left[ (\mv^n)\herm \pder{\Av_{:,k}}{u_k^n} Z_k^n - (\lv^n)\herm \pder{\Bv_{:,k}}{u_k^n} Z_k^n \right]
 \end{equation}
 
 Define the weighted adjoint sum:
@@ -224,8 +247,17 @@ Define the weighted adjoint sum:
 
 Then:
 \begin{equation}
-\boxed{\nabla_{u_k^n} \hat{J} = \pder{J}{u_k^n} - 2h\Re\left[ (\Lambda_k^n)\herm V Z_k^n \right]}
+\boxed{\nabla_{u_k^n} \hat{J} = \pder{J}{u_k^n} + 2h\Re\left[ (\Lambda_k^n)\herm V Z_k^n \right]}
 \end{equation}
+
+Substituting $\pder{\Av_{:,k}}{u_k^n} = -h\, a_{:,k} \otimes V$ and
+$\pder{\Bv_{:,k}}{u_k^n} = h\, b_{:,k} \otimes V$ into the variation above
+produces $+2h\Re[\cdot]$, because the two minus signs --- the one in
+$\pder{\Av}{u}$ and the one adjoining the constraints --- cancel. In the real
+case, where $V Z_k^n$ is the control Jacobian $G_k$ and the Wirtinger factor of
+two is absent, this is
+$\nabla_{u_k^n}\hat J = \pder{J}{u_k^n} + h\, G_k^{\mathsf{T}} \Lambda_k^n$, which is
+what \texttt{adjungo/optimization/gradient.py} computes.
 
 This generalizes both the RK formula (where $\Lambda$ involves the single $\lambda$ and the $\mu_i$'s) and the multistep formula (where there are no $\mu$'s but multiple $\lambda$'s from future steps).
 

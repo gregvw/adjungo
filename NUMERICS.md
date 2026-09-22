@@ -31,6 +31,8 @@ Consequences:
 
 ---
 
+<a id="c-2-primary-accuracy-claim"></a>
+
 ## C-2 Primary accuracy claim — `APPROVED`
 
 For every **certified** method family (see [C-6](#c-6-envelope-enforcement)), at a
@@ -52,6 +54,8 @@ Discretization error changes *which* function is being differentiated; it does
 not change the fact that the adjoint must differentiate that function exactly.
 
 ---
+
+<a id="c-3-accuracy-basis-and-derived-floors"></a>
 
 ## C-3 Accuracy basis and derived floors — `APPROVED`
 
@@ -147,6 +151,8 @@ holding). A comment is a claim; that test is the evidence.
 
 ---
 
+<a id="c-4-continuous-accuracy"></a>
+
 ## C-4 Continuous accuracy — `APPROVED`
 
 Stated and tested **separately** from C-2. Each certified method attains its
@@ -159,6 +165,8 @@ refine the mesh; C-2 tests hold it fixed.
 **C-4 never justifies a C-2 discrepancy.**
 
 ---
+
+<a id="c-5-nonlinear-stage-solves"></a>
 
 ## C-5 Nonlinear stage solves — `APPROVED`
 
@@ -260,6 +268,8 @@ even when the residual is small.
 
 ---
 
+<a id="c-6-envelope-enforcement"></a>
+
 ## C-6 Envelope enforcement — `APPROVED`
 
 ### C-6.1 Certified families
@@ -291,6 +301,21 @@ forward solve, gradient, **and** Hessian-vector product for it, against the
 The certified list and `adjungo/optimization/interface.py::CERTIFIED_STAGE_TYPES`
 must agree; adding an entry to either without the evidence above is a false
 certification.
+
+`OBSERVED` — the agreement is checked by
+`tests/test_documentation.py::test_certified_families_agree_with_the_code`,
+which reads this table and compares it with `CERTIFIED_STAGE_TYPES`. Measured
+under [R-11](#r-11) against a 312-test baseline with 0 failures:
+
+| Injected defect | Failing tests |
+|---|---|
+| Contract marks a refused family (`r > 1` multistep) as certified | 1 |
+| Contract downgrades a family the code certifies | 1 |
+| A fabricated family row is appended to the table | 1 |
+| An archived historical report loses its superseded banner | 1 |
+| An archived report is dropped from the `docs/history/` accounting table | 1 |
+| An ad-hoc report reappears in the repository root | 1 |
+| An internal cross-reference anchor is deleted | 1 |
 
 #### Additional evidence for the fully implicit family
 
@@ -364,6 +389,8 @@ Uncertified tableau *definitions* are **retained** under
 `experimental/` carries any accuracy claim.
 
 ---
+
+<a id="c-7-no-silent-sentinels"></a>
 
 ## C-7 No silent sentinels — `APPROVED`
 
@@ -654,8 +681,27 @@ Recorded under C-1. A port that changes any of these produces different numbers:
    converge to the correct stage values and still show order 4, while returning a
    wrong gradient. If the port does this deliberately it must factor the true
    Jacobian once at the converged iterate for the adjoint's use.
+9. **Why the terminal Hessian contribution is assembled by a backward sweep.**
+   The terminal cost contributes curvature through `∂²J/∂y²` at the final
+   external stage (precedent [R-6](#r-6)). Assembling that contribution
+   *directly* requires the state sensitivity `∂y^[N]/∂u` in full, which costs one
+   forward tangent solve per control component — `O(N·s·ν)` solves for a single
+   Hessian-vector product, making the operator more expensive than forming the
+   dense Hessian by differencing.
+
+   The implemented alternative propagates the terminal term as an initial
+   condition of a **second backward sweep** using the same operator as the
+   first-order adjoint with a different right-hand side. One extra sweep per
+   Hessian-vector product, matrix-free, independent of `ν`.
+
+   A port that reaches for the direct form because it is easier to derive will
+   be correct and unusably slow, and the slowness will not appear until `ν`
+   grows. Recorded because the cost argument is not visible from the code, which
+   simply performs the cheap version.
 
 ---
+
+<a id="c-14-the-certification-test-population"></a>
 
 ## C-14 The certification test population — `APPROVED`
 
@@ -733,6 +779,48 @@ In decreasing order of authority:
    repository held a symmetric Hessian accurate to `8.7e-19` in symmetry while
    being wrong by `3.8e-3` in value.
 
+### C-14.2 A test must be shown to fail — `APPROVED`
+
+A test earns its place as evidence only when it has been **observed to fail
+against the defect it guards**. Passing proves nothing on its own: a test that
+asserts a tautology, compares a value to itself, or never reaches the code it
+names passes exactly as convincingly as one that works.
+
+Concretely, for every claim certified in this contract:
+
+1. The defect the test guards against is **injected** into the source.
+2. The suite is run and the number of failing tests is **recorded**.
+3. The injection is **reverted** and the suite is run again, returning to the
+   baseline.
+
+Both runs must follow the cache-invalidation procedure of
+[R-11](#r-11); a count obtained otherwise may not be quoted here, because a
+stale `.pyc` can report zero failures for a defect the interpreter never ran.
+
+The count is reported in the clause it supports, not merely in a commit message,
+so that a later reader can tell whether a test population that has since been
+edited still has the sensitivity originally claimed. A count that falls to zero
+after a refactor is a finding.
+
+**The load-bearing direction is a test that fails to fail.** A test that fails
+when it should pass is noisy and gets fixed immediately. A test that passes when
+it should fail is silent, and is counted as evidence for as long as it exists.
+Every precedent in this document from [R-2](#r-2) onward is an instance of the
+second kind.
+
+`OBSERVED` — the oracle itself is protected this way:
+`tests/test_oracle_gradient.py::test_oracle_detects_the_b0_stage_index_defect`
+re-installs the pre-fix adjoint recursion and **requires the oracle to reject
+it**, so the acceptance criterion cannot decay into a tautology while continuing
+to report success.
+
+**Status note.** This clause was practised from the beginning — every milestone
+in this repository recorded injection counts — but was never written down, while
+being cited as authority from three places. It was reconstructed from those
+citations rather than newly decided, and states no requirement that was not
+already being applied. The gap was found by
+`tests/test_documentation.py::test_cited_clause_is_defined`.
+
 ---
 
 ## Open questions
@@ -753,6 +841,8 @@ stage solve, and a second-order adjoint missing its terminal term) were
 attributed to time-discretization error on the basis of one-sided checks at a
 single ε. Both showed ε-independent plateaus under a sweep. Superseded by C-3.3.
 
+<a id="r-2"></a>
+
 **R-2 — Test populations conceal stage-index errors.**
 The adjoint stage recursion applied the wrong stage Jacobian to its coupling
 term. Eighty-nine tests passed. The error is identically invisible at `s = 1`
@@ -766,6 +856,8 @@ by C-14.1 item 5.
 **R-4 — A placeholder that returns zeros is a contract violation.**
 `ImplicitStageSolver` returned `Z = 0` with no warning, so a Gauss-2 forward
 solve returned the initial condition unchanged. Superseded by C-7.
+
+<a id="r-5"></a>
 
 **R-5 — The B0 stage-index defect, cured and measured.** — `OBSERVED`
 Differentiating the stage equations gives
@@ -800,6 +892,8 @@ legitimately uses `F_j`, because there the Jacobian genuinely belongs to stage
 `j`. Tangent and adjoint therefore did not share this mistake, which is why
 duality would not have caught it either — see C-14.1 item 4.
 
+<a id="r-6"></a>
+
 **R-6 — The second-order adjoint returned zero curvature for a terminal cost.**
 — `OBSERVED`
 Three independent defects compounded in the Hessian path:
@@ -816,7 +910,7 @@ Three independent defects compounded in the Hessian path:
 4. `assemble_hessian_vector_product` used `−h` on all three constraint terms
    where differentiating `g = ∂J/∂u + h Gᵀ Λ` gives `+h` on each.
 
-Severity, measured on the C-14.2 closed-form anchor
+Severity, measured on the C-14.1 item 2 closed-form anchor
 (`y₁ = y₀ + h u`, `J = ½y₁²`, `h = 0.37`, exact `Hv = h²v = 0.1369 v`):
 
 | | Before | After |
@@ -905,6 +999,8 @@ and the resulting gradient is the exact derivative of *no* discrete map.
    [C-3.4](#c-34-certified-tolerance-implicit-methods--derived).
 
 ---
+
+<a id="r-9"></a>
 
 ### R-9 A reuse probe must vary every argument the matrix depends on — `APPROVED`
 
@@ -1011,6 +1107,8 @@ This does not prohibit performance regression tests. It requires that they be
 named and reported as performance, never as evidence for C-2.
 
 **Evidence.** `tests/test_examples.py::test_exact_hessian_reaches_a_sharper_stationary_point`.
+
+<a id="r-11"></a>
 
 ### R-11 A defect-injection check must invalidate the bytecode cache — `APPROVED`
 
