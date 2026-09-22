@@ -28,14 +28,36 @@ def assemble_hessian_vector_product(
     t0: float = 0.0,
 ) -> NDArray:
     """
-    From glm_opt.tex:
+    Assemble the Hessian-vector product by differentiating the gradient.
 
-    [∇²Ĵ]δu = J_{uu}δu + H_{uΛ}δΛ + H_{uZ}δZ + H_{uu}^{constr}δu
+    The reduced gradient (see
+    :func:`adjungo.optimization.gradient.assemble_gradient`) is
 
-    At stage (n, k):
-        (H_{uΛ}δΛ)_k^n = -h (G_k^n)^T δΛ_k^n
-        (H_{uZ}δZ)_k^n = -h F_{yu}^{n,k}[Λ_k^n]^T δZ_k^n
-        (H_{uu}^{constr}δu)_k^n = -h F_{uu}^{n,k}[Λ_k^n] δu_k^n
+        g_k^n = ∂J/∂u_k^n + h (G_k^n)^T Λ_k^n
+
+    Differentiating in the direction ``δu`` gives every term below, and every
+    one of them carries a **plus** sign:
+
+        [∇²Ĵ δu]_k^n = J_uu δu_k^n
+                     + h (F_yu[Λ_k^n])^T δZ_k^n
+                     + h  F_uu[Λ_k^n]   δu_k^n
+                     + h (G_k^n)^T δΛ_k^n
+
+    The first three come from ``h (δG_k)^T Λ_k``, since ``G = ∂f/∂u`` and
+
+        [(δG_k)^T Λ_k]_b = Σ_ℓ Λ_ℓ ( Σ_a ∂²f_ℓ/∂u_b∂y_a δZ_a
+                                    + Σ_c ∂²f_ℓ/∂u_b∂u_c δu_c ).
+
+    Two consequences are load-bearing (NUMERICS.md C-14.1):
+
+    * The sign is ``+h`` throughout, matching ``assemble_gradient``. The
+      opposite sign would make ``⟨v, H v⟩`` change sign on the dominant term
+      while leaving the operator symmetric, so symmetry cannot detect it.
+    * ``F_yu_action`` and ``F_uu_action`` must be contracted against the
+      weighted adjoint ``Λ_k``, not against ``δZ`` or ``δu``. Their ``v``
+      argument sums over the equation index ℓ, which has length ``n``; for
+      ``n ≠ ν`` contracting ``F_uu_action`` against ``δu`` is not even
+      shape-conformable.
 
     Args:
         trajectory: Forward solution trajectory
@@ -48,40 +70,56 @@ def assemble_hessian_vector_product(
         method: GLM tableau
         problem: Problem specification
         h: Step size
+        t0: Initial time
 
     Returns:
         Hessian-vector product (N, s, ν)
+
+    Raises:
+        NotImplementedError: If the problem lacks ``F_yu_action`` or
+            ``F_uu_action``. Skipping the curvature terms would return a
+            Gauss-Newton-like approximation while claiming an exact Hessian.
     """
+    for name in ("F_yu_action", "F_uu_action"):
+        if getattr(problem, name, None) is None:
+            raise NotImplementedError(
+                f"exact Hessian-vector products require problem.{name}(); "
+                f"{type(problem).__name__} does not provide it"
+            )
+
     N, s, _nu = u.shape
     hvp = np.zeros_like(u)
 
     for step in range(N):
         cache = trajectory.caches[step]
         Lambda_k = adjoint.WeightedAdj[step]  # Weighted adjoints
+        t_n = t0 + step * h
 
         for k in range(s):
-            # J_{uu} δu (from objective)
-            hvp[step, k] = objective.d2J_du2(u[step, k], step, k) @ delta_u[step, k]
+            z_k, u_k = trajectory.Z[step, k], u[step, k]
+            t_k = t_n + method.c[k] * h
 
-            # -h G_k^T δΛ_k (adjoint sensitivity contribution)
+            # J_uu δu (from objective)
+            hvp[step, k] = (
+                objective.d2J_du2(u_k, step, k) @ delta_u[step, k]
+            )
+
+            # +h G_k^T δΛ_k (adjoint sensitivity contribution)
             delta_Lambda_k = adj_sensitivity.delta_WeightedAdj[step, k]
-            hvp[step, k] -= h * cache.G[k].T @ delta_Lambda_k
+            hvp[step, k] += h * cache.G[k].T @ delta_Lambda_k
 
-            # Second-order terms from constraint Hessian
-            if hasattr(problem, 'F_yu_action') and hasattr(problem, 'F_uu_action'):
-                y_k = trajectory.Z[step, k]
-                u_k = u[step, k]
-                t_n = t0 + step * h
-                t_k = t_n + method.c[k] * h
+            # +h (F_yu[Λ_k])^T δZ_k
+            F_yu_Lambda = np.asarray(
+                problem.F_yu_action(z_k, u_k, t_k, Lambda_k[k])
+            )
+            hvp[step, k] += (
+                h * F_yu_Lambda.T @ sensitivity.delta_Z[step, k]
+            )
 
-                # -h F_{yu}[Λ_k]^T δZ_k
-                # This is the transpose of F_{yu}[Λ_k], so we compute it as:
-                # (δZ_k)^T F_{yu}[Λ_k]
-                F_yu_Lambda = problem.F_yu_action(y_k, u_k, t_k, Lambda_k[k])
-                hvp[step, k] -= h * sensitivity.delta_Z[step, k].T @ F_yu_Lambda
-
-                # -h F_{uu}[Λ_k] δu_k
-                F_uu_du = problem.F_uu_action(y_k, u_k, t_k, delta_u[step, k])
-                hvp[step, k] -= h * Lambda_k[k].T @ F_uu_du
+            # +h F_uu[Λ_k] δu_k
+            F_uu_Lambda = np.asarray(
+                problem.F_uu_action(z_k, u_k, t_k, Lambda_k[k])
+            )
+            hvp[step, k] += h * F_uu_Lambda @ delta_u[step, k]
 
     return hvp

@@ -30,6 +30,7 @@ from adjungo.methods.runge_kutta import explicit_euler, heun, rk4
 from adjungo.optimization.interface import GLMOptimizer
 from adjungo.solvers.explicit import ExplicitStageSolver
 from adjungo.stepping.forward import forward_solve
+from adjungo.stepping.sensitivity import forward_sensitivity
 from adjungo.validation import (
     reference_gradient,
     reference_hessian,
@@ -294,4 +295,59 @@ def test_gradient_finite_difference_sweep(method_factory):
         f"derivative {exact:.8e}; best relative agreement {sweep[best_eps]:.3e} "
         f"at eps={best_eps:.0e}. Full sweep: {detail}. A flat plateau across "
         f"the sweep indicates a wrong derivative, not round-off."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Level 4: duality. Corroboration only (C-14.1 item 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method_factory", EXPLICIT_METHODS)
+def test_tangent_adjoint_duality(method_factory):
+    """``<grad J, v>`` from the adjoint equals the tangent directional derivative.
+
+    The tangent solve propagates ``δZ`` and ``δY`` forward; contracting those
+    with the objective's first derivatives gives ``dJ·v`` without touching the
+    adjoint recursion at all.
+
+    This is **corroboration, not certification** (NUMERICS.md C-14.1 item 4).
+    Finding B0 is the concrete reason: ``forward_sensitivity`` legitimately
+    uses ``F_j`` because there the Jacobian genuinely belongs to stage ``j``,
+    so tangent and adjoint did *not* share that mistake — but a duality test
+    passes whenever they do share one, and cannot distinguish the cases. The
+    monolithic reference above is what certifies.
+    """
+    problem, objective, method, t_span, N, y0, u = _make_case(
+        method_factory, N=4
+    )
+    opt = GLMOptimizer(problem, objective, method, t_span, N, y0)
+    rng = np.random.default_rng(5)
+    v = rng.standard_normal(u.shape)
+
+    from_adjoint = float(np.sum(opt.gradient(u) * v))
+
+    opt._ensure_forward(u)
+    traj = opt._trajectory
+    sens = forward_sensitivity(
+        traj, v, method, opt.stage_solver, problem, opt.h
+    )
+
+    from_tangent = float(
+        np.sum(objective.dJ_dy_terminal(traj.Y[N]) * sens.delta_Y[N])
+    )
+    for n in range(N):
+        from_tangent += float(
+            np.sum(objective.dJ_dy(traj.Y[n], n) * sens.delta_Y[n])
+        )
+    for n in range(N):
+        for k in range(method.s):
+            from_tangent += float(
+                np.dot(objective.dJ_du(u[n, k], n, k), v[n, k])
+            )
+
+    scale = max(abs(from_tangent), 1.0)
+    assert abs(from_adjoint - from_tangent) / scale < 1e-12, (
+        f"duality gap: adjoint gives {from_adjoint:.12e}, tangent gives "
+        f"{from_tangent:.12e}"
     )

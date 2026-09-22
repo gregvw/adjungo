@@ -280,6 +280,16 @@ Each of the three kinds requires first, second, **and mixed** derivatives:
 An objective that omits a required derivative is refused under C-6.2 rather than
 silently treated as zero.
 
+Implemented — `OBSERVED` — for the terminal and node terms as the `Objective`
+protocol methods `dJ_dy_terminal`, `dJ_dy`, `dJ_du`, `d2J_du2`, `d2J_dy2`, and
+`d2J_dy2_terminal`. `adjoint_sensitivity` and
+`assemble_hessian_vector_product` raise `NotImplementedError` naming the
+missing callback. The stage-quadrature row (C-9.3) is **not yet implemented**;
+no `dJ_dZ` exists and the discrete objective the adjoint differentiates has no
+`Z` dependence. `adjungo/validation/reference.py` documents the same gap at
+`_objective_state_gradient`, so the reference and the package agree about what
+is *not* yet supported as well as about what is.
+
 ---
 
 ## C-10 Control coordinates and inner product — `APPROVED`
@@ -529,3 +539,48 @@ Two lessons are recorded rather than the fix alone:
 legitimately uses `F_j`, because there the Jacobian genuinely belongs to stage
 `j`. Tangent and adjoint therefore did not share this mistake, which is why
 duality would not have caught it either — see C-14.1 item 4.
+
+**R-6 — The second-order adjoint returned zero curvature for a terminal cost.**
+— `OBSERVED`
+Three independent defects compounded in the Hessian path:
+
+1. `delta_Lambda[N]` was set to `0` with a comment asserting that the terminal
+   term "is handled through the gradient assembly". It is not. The derivation
+   requires `δλ^[N] = J_yy^terminal(y^[N]) δy^[N]`; zero is correct only for an
+   **affine** terminal cost.
+2. The running `J_yy δy^[n]` term was absent, marked `# For now omitted`.
+3. `F_yy_action`, `F_yu_action` and `F_uu_action` were contracted against `δZ`
+   and `δu` instead of against the weighted adjoint `Λ_k`. Their `v` argument
+   sums over the *equation* index `ℓ`. Since `∂²f_ℓ/∂y_a∂y_b` is symmetric in
+   `(a,b)` but carries no symmetry in `ℓ`, this sums the wrong index.
+4. `assemble_hessian_vector_product` used `−h` on all three constraint terms
+   where differentiating `g = ∂J/∂u + h Gᵀ Λ` gives `+h` on each.
+
+Severity, measured on the C-14.2 closed-form anchor
+(`y₁ = y₀ + h u`, `J = ½y₁²`, `h = 0.37`, exact `Hv = h²v = 0.1369 v`):
+
+| | Before | After |
+|---|---|---|
+| Anchor `Hv` | **0.0** | 0.1369 |
+
+For a terminal-cost-only problem the operator returned **identically zero**,
+because defect 1 removed the only path by which terminal curvature could reach
+the gradient. It was nevertheless symmetric — see R-3.
+
+Against `reference_hessian` on `CoupledNonlinear` (`n = 3`, `ν = 2`), `N = 4`,
+relative error of the fully materialized operator:
+
+| Method | `s` | After |
+|---|---|---|
+| `explicit_euler` | 1 | 2.44e-15 |
+| `heun` | 2 | 2.20e-16 |
+| `rk4` | 4 | 5.55e-17 |
+
+Defect 3 is a direct vindication of the `n ≠ ν` requirement in C-14: with
+`n = 3` and `ν = 2` the wrong contraction **raises `IndexError`**. Every
+historical test used `n = ν = 1`, where contracting the wrong index is
+silently shape-conformable and merely returns a wrong number.
+
+Consequent policy, now enforced: a missing second-derivative callback raises
+(C-7) rather than dropping the term. Dropping it returns a Gauss-Newton-like
+operator while the public method still promises the exact Hessian.

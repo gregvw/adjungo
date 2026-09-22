@@ -230,6 +230,8 @@ class GLMOptimizer:
             self.stage_solver,
             self.problem,
             self.h,
+            self.t_span[0],
+            self.objective,
         )
 
         return assemble_hessian_vector_product(

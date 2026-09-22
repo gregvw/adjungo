@@ -43,13 +43,13 @@ class MildlyNonlinearProblem:
         """Second derivative: ∂²f/∂y² [v] = -0.6*y*v."""
         return np.array([[-0.6 * y[0] * v[0]]])
 
-    def F_yu_action(self, y, u, t, v_u):
-        """Mixed derivative: ∂²f/∂y∂u [v_u] = 0."""
-        return np.zeros((1,))
+    def F_yu_action(self, y, u, t, v):
+        """Mixed derivative: sum_l v_l d2 f_l / dy du = 0, shape (n, nu)."""
+        return np.zeros((1, 1))
 
-    def F_uu_action(self, y, u, t, v_u):
-        """Second derivative: ∂²f/∂u² [v_u] = 0."""
-        return np.zeros((1,))
+    def F_uu_action(self, y, u, t, v):
+        """Second derivative: sum_l v_l d2 f_l / du du = 0, shape (nu, nu)."""
+        return np.zeros((1, 1))
 
 
 class QuadraticDragProblem:
@@ -98,6 +98,14 @@ class SimpleObjective:
 
     def d2J_du2(self, u_stage, step, stage):
         return self.R * np.eye(len(u_stage))
+
+    def d2J_dy2(self, y, step):
+        """No running state cost, so the running state Hessian vanishes."""
+        return np.zeros((1, 1))
+
+    def d2J_dy2_terminal(self, y_final):
+        """Terminal cost is 0.5*(y - target)^2, so J_yy = 1."""
+        return np.ones((1, 1))
 
 
 @pytest.mark.skip(reason="DIRK solver needs Newton iteration for nonlinear problems")
@@ -258,20 +266,13 @@ def test_forward_sensitivity_finite_difference():
         f"Sensitivity: {sens.delta_Y[-1]}, FD: {delta_y_fd[-1]}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="U-M1.3: sensitivity.py sets delta_Lambda[N]=0 where the derivation "
-           "requires J_yy*delta_y^[N]. Observed eps-independent plateau 3.14e-2 "
-           "against a reference of the same magnitude. Remove this marker when "
-           "the terminal term lands; xfail_strict will flag it as XPASS.",
-)
 def test_adjoint_sensitivity_finite_difference():
     """Test adjoint sensitivity δλ against finite differences.
 
-    Marked xfail pending the terminal-Hessian cure (NUMERICS.md precedent R-1,
-    plan unit U-M1.3). ``sensitivity.py`` sets ``delta_Lambda[N] = 0`` where the
-    derivation requires ``J_yy δy^[N]``, so δλ currently recovers only about 3%
-    of its true magnitude.
+    Cured by unit U-M1.3. Previously ``sensitivity.py`` set
+    ``delta_Lambda[N] = 0`` where the derivation requires
+    ``J_yy^terminal δy^[N]``, so δλ recovered only about 3% of its true
+    magnitude and the error showed an ε-independent plateau at 3.14e-2.
 
     Before this test was made real it asserted only ``is not None`` on two
     dataclass fields that are unconditionally assigned arrays, so it could never
@@ -310,7 +311,8 @@ def test_adjoint_sensitivity_finite_difference():
     # Adjoint sensitivity: δλ from δy
     adj_sens = adjoint_sensitivity(
         trajectory, adjoint, sens, u, delta_u, method,
-        optimizer.stage_solver, optimizer.problem, optimizer.h
+        optimizer.stage_solver, optimizer.problem, optimizer.h,
+        optimizer.t_span[0], optimizer.objective,
     )
 
     # Central difference on the adjoint, at a FIXED mesh (NUMERICS.md C-2).
@@ -348,19 +350,20 @@ def test_adjoint_sensitivity_finite_difference():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="U-M1.3: the Hessian-vector product omits the terminal J_yy*delta_y "
-           "term (delta_Lambda[N] is set to 0) and the running J_yy*delta_y "
-           "term. Finite differences of the gradient plateau at 3.82152e-3 "
-           "independently of eps, which per C-3.3 proves the operator is not "
-           "the Hessian of the implemented discrete objective. The dense "
-           "operator is symmetric to 8.7e-19 while being wrong, so symmetry is "
-           "no defence (precedent R-3). Remove this marker when M1.3 lands; "
-           "xfail_strict will flag it as XPASS.",
-)
 def test_hessian_vector_product_finite_difference():
-    """Test Hessian-vector product [∇²J]v against finite differences."""
+    """Test Hessian-vector product [∇²J]v against central differences.
+
+    Cured by unit U-M1.3. The operator previously omitted the terminal and
+    running ``J_yy δy`` terms and contracted the problem's second-derivative
+    callbacks over the wrong tensor index; finite differences of the gradient
+    plateaued at 3.82152e-3 independently of ε. The dense operator was
+    symmetric to 8.7e-19 throughout, which is why symmetry is corroboration
+    and never a correctness argument (NUMERICS.md precedent R-3).
+
+    Central differences are used rather than the one-sided quotient the
+    original test used: a forward difference carries O(ε) truncation, which at
+    ε=1e-5 is the same order as the defect it was supposed to detect.
+    """
     problem = MildlyNonlinearProblem()
     objective = SimpleObjective(y_target=1.0, R=0.1)
     method = explicit_euler()
@@ -380,29 +383,25 @@ def test_hessian_vector_product_finite_difference():
         ),
     )
 
-    # Control point
     u = np.ones((10, 1, 1)) * 0.5
+    v = np.random.default_rng(4).standard_normal((10, 1, 1)) * 0.1
 
-    # Direction vector
-    v = np.random.randn(10, 1, 1) * 0.1
+    Hv = optimizer.hessian_vector_product(u, v)
 
-    # Hessian-vector product via second-order adjoint
-    try:
-        Hv = optimizer.hessian_vector_product(u, v)
+    # Central difference of the exact gradient. Truncation is O(eps^2)~1e-10
+    # and cancellation O(eps_mach*|g|/eps)~1e-11, so 1e-6 relative is loose by
+    # several decades and any failure is a genuine defect.
+    eps = 1e-5
+    Hv_fd = (
+        optimizer.gradient(u + eps * v) - optimizer.gradient(u - eps * v)
+    ) / (2 * eps)
 
-        # Finite difference on gradient
-        eps = 1e-5
-        grad_0 = optimizer.gradient(u)
-        grad_eps = optimizer.gradient(u + eps * v)
-
-        Hv_fd = (grad_eps - grad_0) / eps
-
-        # Should match
-        assert np.allclose(Hv, Hv_fd, rtol=1e-2, atol=1e-4), \
-            f"Max error: {np.max(np.abs(Hv - Hv_fd)):.6e}"
-
-    except NotImplementedError:
-        pytest.skip("Second derivatives not fully implemented yet")
+    scale = max(float(np.max(np.abs(Hv_fd))), 1.0)
+    err = float(np.max(np.abs(Hv - Hv_fd)))
+    assert err / scale < 1e-6, (
+        f"Hessian-vector product disagrees with central differences of the "
+        f"gradient: max abs error {err:.6e}, reference scale {scale:.6e}."
+    )
 
 
 def test_gradient_nonlinear_vs_linear():

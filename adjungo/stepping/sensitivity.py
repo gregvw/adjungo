@@ -141,6 +141,27 @@ def adjoint_sensitivity(
     where Γ^n contains second-derivative terms:
         Γ_k^n = h[F_{yy}^{n,k}[Λ_k^n] δZ_k^n + F_{yu}^{n,k}[Λ_k^n] δu_k^n]
 
+    Derivation (NUMERICS.md C-2, C-9.4). The first-order adjoint stage
+    relation is ``μ_i = h F_i^T Λ_i``. Differentiating it in the direction
+    ``δu`` gives
+
+        δμ_i = h F_i^T δΛ_i + h (δF_i)^T Λ_i
+
+    and the second term expands, component by component, as
+
+        [(δF_i)^T Λ_i]_b = Σ_ℓ Λ_ℓ ( Σ_a ∂²f_ℓ/∂y_b∂y_a δZ_a
+                                    + Σ_c ∂²f_ℓ/∂y_b∂u_c δu_c )
+
+    so that ``Γ_i`` contracts the problem's second-derivative callbacks
+    against the **weighted adjoint** ``Λ_i`` and then applies the resulting
+    matrix to ``δZ_i`` and ``δu_i``. Contracting against ``δZ`` or ``δu``
+    instead sums over the wrong tensor index: ``∂²f_ℓ/∂y_a∂y_b`` is symmetric
+    in ``(a, b)`` but carries no symmetry in ``ℓ``, and for ``n ≠ ν`` the
+    mixed term is not even shape-conformable.
+
+    The terminal condition is ``δλ^[N] = J_yy^terminal(y^[N]) δy^[N]``, not
+    zero. Zero is correct only for an affine terminal cost.
+
     Key insight: This is a LINEAR problem (same structure as adjoint solve)!
     - For explicit methods: backward substitution
     - For implicit methods: reuse transposed factorization from adjoint
@@ -157,11 +178,40 @@ def adjoint_sensitivity(
         problem: Problem specification
         h: Step size
         t0: Initial time (default 0.0)
-        objective: Objective function (for J_{yy} term)
+        objective: Objective function, supplying the terminal and running
+            state Hessians. Required.
 
     Returns:
         Adjoint sensitivity trajectory
+
+    Raises:
+        ValueError: If ``objective`` is omitted. There is no defensible
+            default: dropping the objective Hessian silently returns the
+            second-order adjoint of a different problem (NUMERICS.md C-7).
+        NotImplementedError: If the problem or objective lacks a required
+            second-derivative callback.
     """
+    if objective is None:
+        raise ValueError(
+            "adjoint_sensitivity requires an objective: the terminal "
+            "condition δλ^[N] = J_yy^terminal δy^[N] and the running term "
+            "J_yy δy^[n] both come from it. Passing None would silently "
+            "compute the Hessian of a different objective."
+        )
+
+    for name in ("F_yy_action", "F_yu_action"):
+        if getattr(problem, name, None) is None:
+            raise NotImplementedError(
+                f"second-order adjoint requires problem.{name}(); "
+                f"{type(problem).__name__} does not provide it"
+            )
+    for name in ("d2J_dy2", "d2J_dy2_terminal"):
+        if getattr(objective, name, None) is None:
+            raise NotImplementedError(
+                f"second-order adjoint requires objective.{name}(); "
+                f"{type(objective).__name__} does not provide it"
+            )
+
     N = trajectory.N
     s, r, n = method.s, method.r, trajectory.n
     A = method.A
@@ -171,55 +221,37 @@ def adjoint_sensitivity(
     delta_Mu = np.zeros((N, s, n))
     delta_WeightedAdj = np.zeros((N, s, n))
 
-    # Terminal condition for adjoint sensitivity
-    # δλ[N] should capture how the terminal objective Hessian couples with state sensitivity
-    # For terminal cost J(y_final), we have: δλ[N] depends on d²J/dy² δy_final
-    # BUT in the discrete adjoints paper, this is handled through the gradient assembly
-    # So the terminal condition here should indeed be zero for the Lagrangian formulation
-    delta_Lambda[N] = 0
-
-    # TODO: Verify if we need terminal Hessian contribution here or in gradient assembly
+    # Terminal condition: δλ^[N] = J_yy^terminal(y^[N]) δy^[N].
+    # Zero is correct only for an affine terminal cost.
+    J_yy_T = np.asarray(objective.d2J_dy2_terminal(trajectory.Y[N]))
+    for row in range(r):
+        delta_Lambda[N, row] = J_yy_T @ sensitivity.delta_Y[N, row]
 
     # Backward sweep (same direction as adjoint solve)
     for step in range(N - 1, -1, -1):
         cache = trajectory.caches[step]
         Lambda_k = adjoint.WeightedAdj[step]  # Weighted adjoints Λ_k
 
-        # Compute second-derivative forcing terms Γ_k
-        # Γ_k = h [F_{yy}[Λ_k] δZ_k + F_{yu}[Λ_k] δu_k]
+        # Second-derivative forcing:
+        #   Γ_k = h [ F_yy[Λ_k] δZ_k + F_yu[Λ_k] δu_k ]
+        # The callbacks contract their ``v`` argument over the equation index
+        # ℓ, so ``v`` must be the weighted adjoint Λ_k.
         Gamma = np.zeros((s, n))
-
+        t_n = t0 + step * h
         for k in range(s):
-            # Check if problem has second derivatives
-            if hasattr(problem, 'F_yy_action') and hasattr(problem, 'F_yu_action'):
-                # Compute time at this step
-                t_n = t0 + step * h
+            t_k = t_n + method.c[k] * h
+            z_k, u_k = trajectory.Z[step, k], u[step, k]
 
-                # Compute Hessian-vector products
-                # Γ_k = h * Λ_kᵀ [F_{yy} δZ_k + F_{yu} δu_k]
-                # Using bilinearity of Hessian forms
-
-                # F_{yy} δZ_k term
-                F_yy_dZ = problem.F_yy_action(
-                    trajectory.Z[step, k],
-                    u[step, k],
-                    t_n + method.c[k] * h,
-                    sensitivity.delta_Z[step, k]
-                )
-
-                # F_{yu} δu_k term
-                F_yu_du = problem.F_yu_action(
-                    trajectory.Z[step, k],
-                    u[step, k],
-                    t_n + method.c[k] * h,
-                    delta_u[step, k]
-                )
-
-                # Contract with weighted adjoint
-                Gamma[k] = h * Lambda_k[k].T @ (F_yy_dZ + F_yu_du)
-
-        # Solve adjoint sensitivity system: A^T δμ = B^T δλ + Γ
-        # Same structure as adjoint solve, just enhanced RHS
+            F_yy_Lam = np.asarray(
+                problem.F_yy_action(z_k, u_k, t_k, Lambda_k[k])
+            )
+            F_yu_Lam = np.asarray(
+                problem.F_yu_action(z_k, u_k, t_k, Lambda_k[k])
+            )
+            Gamma[k] = h * (
+                F_yy_Lam @ sensitivity.delta_Z[step, k]
+                + F_yu_Lam @ delta_u[step, k]
+            )
 
         delta_lambda_ext = delta_Lambda[step + 1]
 
@@ -240,13 +272,13 @@ def adjoint_sensitivity(
             # Add second-derivative forcing
             delta_Mu[step, i] += Gamma[i]
 
-            # For implicit stages (a_{ii} ≠ 0), would solve:
-            # (I - h a_{ii} F_i^T) δμ_i = rhs
-            # Using cached transpose factorization
             if not np.isclose(A[i, i], 0):
-                # For now, just note that implicit case needs factorization
-                # In production, would reuse cache.factorization with trans=True
-                pass
+                raise NotImplementedError(
+                    "second-order adjoint for implicit stages requires the "
+                    "transposed stage solve (I - h a_ii F_i^T)^-1, which is "
+                    "not implemented; tracked as unit U-M2.1. Refusing "
+                    "rather than returning the explicit-stage answer."
+                )
 
         # Compute weighted adjoint sensitivities for Hessian assembly
         # δΛ_k = Σ_j a_{jk} δμ_j + Σ_j b_{jk} δλ_j
@@ -256,13 +288,16 @@ def adjoint_sensitivity(
                 B[:, k] @ delta_Lambda[step + 1]  # Σ_j b_{jk} δλ_j
             )
 
-        # Propagate external stages backward
-        # δλ^{n-1} = U^T δμ + V^T δλ + J_{yy} δy^{n-1}
+        # Propagate external stages backward:
+        #   δλ^[n] = U^T δμ^n + V^T δλ^[n+1] + J_yy(y^[n], n) δy^[n]
+        # The running term mirrors the ∂J/∂y^[n] term in adjoint_solve; it is
+        # present for n = 0 .. N-1, while node N is the terminal condition.
         delta_Lambda[step] = method.U.T @ delta_Mu[step]
         delta_Lambda[step] += method.V.T @ delta_lambda_ext
 
-        # Add objective Hessian term J_{yy} δy (running cost contribution)
-        # For now omitted - would need objective.d2J_dy2(y[step], step)
+        J_yy = np.asarray(objective.d2J_dy2(trajectory.Y[step], step))
+        for row in range(r):
+            delta_Lambda[step, row] += J_yy @ sensitivity.delta_Y[step, row]
 
     return AdjointSensitivityTrajectory(
         delta_Lambda=delta_Lambda,
