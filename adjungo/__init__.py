@@ -14,10 +14,18 @@ __version__ = "0.1.0"
 from adjungo.core.method import GLMethod, PropType, StageType
 from adjungo.core.problem import Problem, ProblemStructure
 from adjungo.optimization.interface import GLMOptimizer
+from adjungo.optimization.parametrization import (
+    AffineControlParametrization,
+    NodalControl,
+    PiecewiseConstantControl,
+)
 
 __all__ = [
+    "AffineControlParametrization",
     "GLMOptimizer",
     "GLMethod",
+    "NodalControl",
+    "PiecewiseConstantControl",
     "Problem",
     "ProblemStructure",
     "PropType",

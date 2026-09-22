@@ -396,7 +396,7 @@ is *not* yet supported as well as about what is.
 - **Adapter layer.** The optimization adapter maps a parameter vector `θ` to
   stage controls and returns derivatives in `θ`.
 
-### C-10.2 Affine parametrizations — `DERIVED`
+### C-10.2 Affine parametrizations — `DERIVED`, implemented
 
 For `u = P θ + q`:
 
@@ -407,6 +407,55 @@ H_θ v  = Pᵀ H_u (P v)
 
 Piecewise-constant-per-step and nodal-interpolation-to-abscissae are both affine
 and are therefore both expressed by `P`.
+
+Implemented in `adjungo/optimization/parametrization.py` as
+`PiecewiseConstantControl` and `NodalControl`, and reached through the
+`parametrization=` argument of `scipy_interface` and `scipy_hessp`. `P` is never
+formed at run time; the three operations `expand`, `push` and `pullback` are
+implemented directly.
+
+**The transpose must not be validated against itself.** A transposition error in
+this layer does not raise, does not produce a nonfinite value, and does not
+change the shape of the result. It returns a vector that is merely not the
+gradient, so a line search still makes progress and convergence degrades
+silently. The required chain of evidence is:
+
+1. `expand` is definitional — it produces the stage controls the solver
+   integrates.
+2. `P` is materialised by differencing `expand` on Cartesian basis vectors.
+   Because the map is affine this difference is the linear part **exactly**,
+   with no truncation term to bound, so the materialised `P` inherits `expand`'s
+   authority.
+3. `push` is checked against that `P`.
+4. `pullback` is checked against `Pᵀ`, that is against `push`.
+5. The parameter-space gradient and Hessian are checked against the independent
+   monolithic reference in `u`, composed with the validated transpose.
+
+Hessian symmetry is corroboration only here, as everywhere: `Pᵀ H P` is
+symmetric whenever `H` is, so it cannot detect a wrong-but-symmetric `H`.
+
+**Direction versus point.** `push` applies the linear part only. Applying the
+full affine map to a Hessian direction would add the offset `q` to a quantity
+that is not a point. Both shipped maps have `q = 0`, so this error would be
+dormant until the first map with a nonzero offset; the operations are therefore
+kept distinct rather than merged into one that happens to be correct today.
+
+**Evidence.** `tests/test_parametrization.py` (48 tests). Checked against four
+injected defects, each measured under the R-11 procedure:
+
+| Injected defect | Tests failed |
+|---|---|
+| none (baseline) | 0 |
+| `pullback` averages over stages instead of summing | 7 |
+| `NodalControl.pullback` swaps the interpolation weights | 12 |
+| `NodalControl` ignores `c` and uses the left endpoint | 2 |
+| `pullback` keeps the first stage instead of contracting | 9 |
+
+The swapped-weights row is the important one: it is the transposition error this
+layer is designed against, and it is caught by the dedicated transpose test, by
+the reference-gradient test, by the reference-HVP test and by symmetry. It
+affects only the `nodal` cases, confirming that the checks are specific to the
+defective map rather than globally sensitive.
 
 ### C-10.3 Nonlinear parametrizations — `APPROVED`, unimplemented
 
@@ -810,3 +859,122 @@ object saved no work and only risked the adjoint operator.
 4. The C-14 population is extended with a state-only-Jacobian problem
    (`tests/test_implicit_solvers.py::StateOnlyJacobian`). A population in which
    every Jacobian depends on `u` cannot certify a control-independent path.
+
+### R-10 An iteration count is not a correctness discriminator — `APPROVED`
+
+**Context.** The planned acceptance criterion for the SciPy `hessp` adapter was
+"`Newton-CG` / `trust-ncg` with `hessp` converges in strictly fewer iterations
+than `L-BFGS-B`". The reasoning was that the minimum-energy oscillator has
+linear dynamics and a quadratic cost, so the reduced objective `J(u)` is an
+exactly quadratic form, and a Newton method given the exact Hessian should
+therefore beat a method that must accumulate curvature.
+
+**Observation.** On the shipped example at `N = 20` (80 control variables),
+`trust-ncg` with the exact `hessp` took **6** iterations and `L-BFGS-B` took
+**5**. The criterion failed against a Hessian that is exact to rounding level.
+
+**Why the reasoning was wrong.** The two methods do not count the same thing.
+`L-BFGS-B` terminates on relative reduction of `f`; `trust-ncg` terminates on
+gradient norm. One `L-BFGS-B` iteration performs a line search with multiple
+function and gradient evaluations, while a trust-region iteration performs a CG
+subproblem solve. The comparison measures SciPy's stopping rules and work
+accounting, not the quality of the curvature information. It would also be
+sensitive to the conditioning of any particular test problem, so tightening or
+loosening it would amount to tuning a correctness gate against an unrelated
+quantity.
+
+**The attributable quantity.** Final stationarity distinguishes the two
+decisively and for the right reason. Both methods find the same minimiser and
+agree on the objective to 9 significant figures. `trust-ncg` with the exact
+Hessian leaves `‖∇J‖_∞ ≈ 1e-17`; `L-BFGS-B` stops at `≈ 1e-9`, limited by its
+own curvature-approximation error. A Hessian that was merely *close* to exact
+could not reach rounding-level stationarity, so this check has the discriminating
+power the iteration count was assumed to have.
+
+**Rule.** An acceptance criterion for a derivative claim must be a property of
+the derivative: agreement with an independently assembled reference, or the
+stationarity achieved by a method that consumes it. Iteration counts, wall-clock
+times, and evaluation counts across *different* algorithms may be reported as
+observations. They may not be assertions in a correctness gate.
+
+This does not prohibit performance regression tests. It requires that they be
+named and reported as performance, never as evidence for C-2.
+
+**Evidence.** `tests/test_examples.py::test_exact_hessian_reaches_a_sharper_stationary_point`.
+
+### R-11 A defect-injection check must invalidate the bytecode cache — `APPROVED`
+
+**Why this clause exists.** Much of this repository's evidence has the form
+"this test fails against the defective code and passes against the cure"
+(C-14.2). That procedure requires that the interpreter actually execute the
+code just written to disk. On CPython it sometimes does not.
+
+**Mechanism.** A `.pyc` file records exactly two facts about its source: the
+source modification time **as a whole number of seconds**, and the source size
+in bytes. If a rewritten source file has the same size and the same integer
+mtime as the one the cache was built from, the validator treats the cache as
+current and the interpreter runs the **previous** bytecode. An inject-run-restore
+cycle completes here in well under one second, and a defect injected by
+exchanging two characters — `F[i]` for `F[j]`, `self._w[:, 0]` for
+`self._w[:, 1]`, `sum` for a same-length alternative — preserves the size
+exactly. Both conditions are met routinely.
+
+Demonstrated directly: a module whose body was changed from `return 111` to
+`return 222` within the same second continued to return `111` in a fresh
+interpreter; the same edit made more than one second later returned the new
+value. Header inspection confirmed the stored mtime and size were identical to
+the source's.
+
+**Observed here.** During U-M1.7 the nodal `pullback` was restored from a
+same-size defect injection. The source on disk was correct, `inspect.getsource`
+printed the correct body, and a hand-evaluation of the same expressions gave the
+correct result — while the method itself returned the defective answer and 12
+tests failed. The source was not at fault and no cure was warranted.
+
+**The failure direction that matters.** The case above is loud: correct code
+appears to fail, and the discrepancy forces investigation. The dangerous case is
+the mirror image. Inject a defect, observe that the suite still passes, and
+conclude that the tests are insensitive to it — when in fact the interpreter
+never ran the defect. That conclusion would be used to justify writing a *weaker*
+test, or to dismiss a real finding as unreachable. A stale cache can therefore
+manufacture false evidence for exactly the claims C-14.2 exists to protect.
+
+**Required procedure.** Any measurement of the form "N tests fail against the
+injected defect" must, for each injection *and each restoration*:
+
+1. remove every `__pycache__` directory in the tree, excluding `.venv`, and
+2. run with `PYTHONDONTWRITEBYTECODE=1` and `-p no:cacheprovider`.
+
+A count obtained without both steps is not evidence and may not be quoted in
+this document. Sleeping between edits is **not** an acceptable substitute: it
+depends on filesystem timestamp resolution and on the edit happening to cross a
+second boundary.
+
+**Standing consequence.** The B0 stage-index cure (R-5) was originally verified
+with `git stash`, which rewrites files in place and is subject to the same
+hazard. It was therefore re-verified under this procedure. Re-injecting the
+historical defective form
+
+```
+mu[i] = h F_i^T (B[:, i] @ lambda_ext)
+for j > i:  mu[i] += h A[j, i] F_j^T mu[j]
+```
+
+fails 22 tests, spanning the gradient oracle, the Hessian oracle, the
+finite-difference sweeps, duality, the parametrization layer and the shipped
+example. Every failure is on a method with `s > 1` (`heun`, `rk4`); no
+`explicit_euler` case fails, because its coupling sum is empty and the defect is
+unreachable there. That is the pattern the derivation predicts, so R-5 stands on
+re-verified evidence.
+
+**Evidence.** The clause is procedural and is enforced by review of how a count
+was produced, not by a test. The B0 re-verification above is its first
+application.
+
+**Addendum.** Applying this clause exposed eight `.pyc` files tracked in the
+repository (`adjungo/**/__pycache__/*.cpython-312.pyc`), committed before
+`.gitignore` covered them; `.gitignore` does not untrack files already in the
+index. They were compiled for CPython 3.12 while the pinned environment runs
+3.14, so they were inert for current work, but a contributor on 3.12 could have
+received cached bytecode for a source file they then edited — R-11's hazard made
+durable and distributable. They have been removed from the index.

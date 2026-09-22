@@ -11,6 +11,9 @@ from adjungo.core.problem import Linearity, Problem, ProblemStructure
 from adjungo.core.requirements import deduce_requirements
 from adjungo.optimization.gradient import assemble_gradient
 from adjungo.optimization.hessian import assemble_hessian_vector_product
+from adjungo.optimization.parametrization import (
+    AffineControlParametrization,
+)
 from adjungo.solvers.factory import create_stage_solver
 from adjungo.stepping.adjoint import AdjointTrajectory, adjoint_solve
 from adjungo.stepping.forward import forward_solve
@@ -284,29 +287,98 @@ class GLMOptimizer:
             self.t_span[0],
         )
 
-    def scipy_interface(self) -> tuple[Callable, Callable]:
-        """
-        Returns (fun, jac) for scipy.optimize.minimize.
+    def scipy_interface(
+        self,
+        parametrization: AffineControlParametrization | None = None,
+    ) -> tuple[Callable, Callable]:
+        """Return ``(fun, jac)`` for :func:`scipy.optimize.minimize`.
+
+        Args:
+            parametrization: Optional C-10.1 adapter layer. When ``None``
+                (the default) the optimisation variables are the stage
+                controls themselves, flattened in ``ravel`` order. When
+                given, the variables are that map's parameters ``θ``, and
+                the returned gradient is ``Pᵀ g_u``.
 
         Returns:
-            fun: Objective function taking flat array
-            jac: Gradient function taking flat array
+            ``fun`` evaluating the objective at a flat variable vector, and
+            ``jac`` returning the gradient in the same flat coordinates.
+
+        The gradient is the **coordinate** derivative in the flat variable
+        vector, per C-10.4 -- the quantity ``∂J/∂x_i`` for which
+        ``J(x + δ) ≈ J(x) + Σ_i (∂J/∂x_i) δ_i``. It is not a Riesz
+        representative under an ``h``-weighted inner product, which would be
+        natural for this problem class and would cause
+        ``scipy.optimize.minimize`` to take silently wrong steps rather than
+        to raise.
 
         See also:
             :meth:`scipy_hessp` for the Hessian-vector callable accepted by
-            ``trust-ncg``, ``trust-krylov`` and ``Newton-CG``.
+            ``trust-ncg``, ``trust-krylov`` and ``Newton-CG``. Pass it the
+            same ``parametrization``, or the two operators describe
+            different variables.
         """
-        def fun(u_flat: NDArray) -> float:
-            u = u_flat.reshape(self.N, self.method.s, self.problem.control_dim)
-            return self.objective_value(u)
+        expand, pullback = self._coordinate_maps(parametrization)
 
-        def jac(u_flat: NDArray) -> NDArray:
-            u = u_flat.reshape(self.N, self.method.s, self.problem.control_dim)
-            return self.gradient(u).ravel()
+        def fun(x_flat: NDArray) -> float:
+            return self.objective_value(expand(x_flat))
+
+        def jac(x_flat: NDArray) -> NDArray:
+            return pullback(self.gradient(expand(x_flat))).ravel()
 
         return fun, jac
 
-    def scipy_hessp(self) -> Callable[[NDArray, NDArray], NDArray]:
+    def _coordinate_maps(
+        self,
+        parametrization: AffineControlParametrization | None,
+    ) -> tuple[Callable[[NDArray], NDArray], Callable[[NDArray], NDArray]]:
+        """Resolve a parametrization into ``(expand, pullback)`` callables.
+
+        Both are captured once, here, and the returned closures consume only
+        what is captured. A caller that mutates the parametrization object
+        afterwards does not change the operator SciPy is already driving,
+        which is the same ownership rule the stage solvers follow for
+        ``y_scale``.
+        """
+        shape = (self.N, self.method.s, self.problem.control_dim)
+
+        if parametrization is None:
+            def expand(x_flat: NDArray) -> NDArray:
+                return np.asarray(x_flat, dtype=float).reshape(shape)
+
+            def pullback(g: NDArray) -> NDArray:
+                return g
+
+            return expand, pullback
+
+        self._check_parametrization(parametrization)
+        p = parametrization
+        return p.expand, p.pullback
+
+    def _check_parametrization(
+        self, parametrization: AffineControlParametrization
+    ) -> None:
+        """Refuse a parametrization built for a different discretisation.
+
+        A map whose stage-control shape disagrees with this optimizer's
+        would otherwise fail deep inside a reshape, or -- worse, when the
+        sizes happen to coincide -- succeed while silently permuting the
+        controls.
+        """
+        expected = (self.N, self.method.s, self.problem.control_dim)
+        if parametrization.stage_shape != expected:
+            raise ValueError(
+                f"{type(parametrization).__name__} produces stage controls "
+                f"of shape {parametrization.stage_shape}, but this "
+                f"optimizer integrates shape {expected} "
+                f"(N={self.N}, s={self.method.s}, "
+                f"control_dim={self.problem.control_dim})."
+            )
+
+    def scipy_hessp(
+        self,
+        parametrization: AffineControlParametrization | None = None,
+    ) -> Callable[[NDArray, NDArray], NDArray]:
         """Return ``hessp(x, p)`` for SciPy's Hessian-free Newton methods.
 
         SciPy passes the current point and the direction as separate flat
@@ -323,18 +395,34 @@ class GLMOptimizer:
         affordable here: one nonlinear solve per outer iteration, one
         second-order adjoint sweep per inner product.
 
+        Args:
+            parametrization: Optional C-10.1 adapter layer, which must be
+                the same one passed to :meth:`scipy_interface`. The operator
+                becomes ``H_θ v = Pᵀ H_u (P v)`` per C-10.2.
+
         Raises:
             NotImplementedError: If the objective or problem does not supply
                 the second derivatives the exact Hessian requires. The
                 operator is never silently replaced by a Gauss-Newton
                 approximation; see NUMERICS.md C-7.
         """
-        shape = (self.N, self.method.s, self.problem.control_dim)
+        expand, pullback = self._coordinate_maps(parametrization)
 
-        def hessp(u_flat: NDArray, p_flat: NDArray) -> NDArray:
-            u = np.asarray(u_flat, dtype=float).reshape(shape)
-            p = np.asarray(p_flat, dtype=float).reshape(shape)
-            return self.hessian_vector_product(u, p).ravel()
+        if parametrization is None:
+            push = expand
+        else:
+            push = parametrization.push
+
+        def hessp(x_flat: NDArray, v_flat: NDArray) -> NDArray:
+            x = expand(x_flat)
+            # The direction is pushed with the *linear* part only. Using
+            # ``expand`` here would add the affine offset ``q`` to a
+            # direction, which is not a direction. Both shipped maps have
+            # ``q = 0``, so the error would be dormant until the first map
+            # with an offset -- hence the separate operation rather than a
+            # reuse that happens to work today.
+            v = push(np.asarray(v_flat, dtype=float))
+            return pullback(self.hessian_vector_product(x, v)).ravel()
 
         return hessp
 

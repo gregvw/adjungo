@@ -31,12 +31,31 @@ shell; each command runs in a fresh process.
 |---|---|
 | Full test suite | `.venv/bin/python -m pytest` |
 | Single file | `.venv/bin/python -m pytest tests/test_glm_core.py` |
-| Lint | `.venv/bin/python -m ruff check adjungo tests` |
-| Lint, autofix | `.venv/bin/python -m ruff check --fix adjungo tests` |
+| Lint | `.venv/bin/python -m ruff check adjungo tests examples` |
+| Lint, autofix | `.venv/bin/python -m ruff check --fix adjungo tests examples` |
 | Type check | `.venv/bin/python -m mypy adjungo` |
+| Run the example | `.venv/bin/python examples/minimum_energy_oscillator.py` |
 
 The full suite runs in well under a second, so **the full suite is the fast
 tier**. There is no reason to select a subset of tests; run all of them.
+
+### Defect injection
+
+When measuring how many tests fail against a deliberately broken version of the
+code -- the standard evidence for a cure here -- use:
+
+```bash
+find . -name __pycache__ -type d -not -path './.venv/*' -exec rm -rf {} + 2>/dev/null
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider
+```
+
+Clear the cache **before the injected run and again before the restored run**.
+CPython validates a `.pyc` against the source's size and its modification time
+*truncated to whole seconds*. A one-character swap such as `F[i]` to `F[j]`
+changes neither, and an inject-run-restore cycle here takes far less than a
+second, so the interpreter will silently execute the previous bytecode. This has
+already produced a false result in this repository; see NUMERICS.md R-11 for the
+mechanism and for why the quiet failure direction is the dangerous one.
 
 `pytest` collection is configured in `pyproject.toml` under
 `[tool.pytest.ini_options]` with `testpaths = ["tests"]`. Bare `pytest` and

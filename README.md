@@ -58,13 +58,52 @@ Hessian-vector product. If they are missing, adjungo raises. It does not
 silently fall back to a Gauss–Newton operator, because that is a different
 operator and the method promises the exact Hessian.
 
+### Control parametrisation
+
+Derivatives are computed with respect to the *stage* controls
+`u ∈ ℝ^(N×s×ν)`, which is where the exactness claim is stated. That is rarely
+the layer you want to optimise in: stage controls are tied to the tableau, so
+switching from `heun` to `rk4` changes the number of unknowns even though the
+physical control being sought did not.
+
+An optional adapter layer maps a parameter vector `θ` to stage controls and
+maps derivatives back. For an affine map `u = Pθ + q`, `g_θ = Pᵀg_u` and
+`H_θv = PᵀH_u(Pv)`. Two maps ship, both affine:
+
+```python
+from adjungo import NodalControl, PiecewiseConstantControl
+
+# One value per step, held across that step's stages: N*nu unknowns,
+# independent of the tableau.
+theta_map = PiecewiseConstantControl(N, method.s, control_dim=1)
+
+# Or: values at the N+1 step nodes, linearly interpolated to the stage
+# abscissae, giving a control continuous across step boundaries.
+theta_map = NodalControl(N, control_dim=1, c=method.c)
+
+fun, jac = optimizer.scipy_interface(parametrization=theta_map)
+hessp = optimizer.scipy_hessp(parametrization=theta_map)
+result = minimize(fun, np.zeros(theta_map.n_parameters), jac=jac,
+                  hessp=hessp, method="trust-ncg")
+u_stages = theta_map.expand(result.x)
+```
+
+The gradient returned is the **coordinate** derivative in the flat variable
+vector, not a Riesz representative under an `h`-weighted inner product.
+`scipy.optimize.minimize` interprets `jac` that way, so returning a
+representative would cause silently wrong steps rather than an error.
+
+Nonlinear parametrisations are specified in `NUMERICS.md` C-10.3 and are not
+implemented. They need an extra curvature term; omitting it yields a
+Gauss-Newton operator, which may not be presented as the exact Hessian.
+
 ### Not yet implemented
 
 - Factorisation **reuse** across stages or steps. Each stage is factored at its
   own converged iterate. An earlier reuse path was removed after it was found
   to hand the adjoint another stage's matrix; see precedent R-9 in
   `NUMERICS.md`.
-- Control parametrisation layers, sparse operators, and checkpointing.
+- Nonlinear control parametrisation, sparse operators, and checkpointing.
 
 ## Installation
 
