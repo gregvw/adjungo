@@ -1266,6 +1266,32 @@ solve returned the initial condition unchanged. Superseded by C-7.
 <a id="r-5"></a>
 
 **R-5 — The B0 stage-index defect, cured and measured.** — `OBSERVED`
+
+**Extension, recorded later: the specification carried the same defect.**
+`docs/runge_kutta_opt.tex` is named in the README as authority for the
+Runge-Kutta case. It was never audited while the code was being repaired. It
+stated the stage adjoint as
+`μ_i = h Σ_j a_ji (F_j)ᵀ μ_j + h b_i (F_i)ᵀ λ`, placing the Jacobian at the
+summation index — the identical error, in the document a reimplementation
+would follow. Ten equations were affected: the stage adjoint, the block
+matrix `M_k`, the reduced gradient, the stage adjoint sensitivity and its
+forcing, and the `H_uu`, `H_uz` and `H_uμ` Hessian blocks.
+
+The document also contradicted itself. It claimed `M_k = A_kᵀ`, but with
+forward blocks `(A_k)_ij = δ_ij I − h a_ij F_j`, the transpose is
+`(A_kᵀ)_ij = δ_ij I − h a_ji (F_i)ᵀ`, whose Jacobian index is the **row**.
+The document's `M_k` used the column. Assembling both for `d = 2`, `n = 3`
+with distinct per-stage Jacobians: `‖A_kᵀ − M_k^{doc}‖_∞ = 4.02e-01`, while
+the row-indexed form matches `A_kᵀ` exactly.
+
+**The lesson is about audit scope, not about the derivation.** Curing a
+defect in code does not cure it in the document that specifies the code, and
+the repository's own correctness work did not look there for six milestones.
+Documents carrying normative equations need the same guards as code:
+`tests/test_documentation.py` now fails if any `Σ_j a_ji` in that document
+weights a `j`-indexed derivative tensor, and asserts numerically that the
+row-indexed block matrix is the forward transpose while the column-indexed
+one is not.
 Differentiating the stage equations gives
 `μ_i = h Fᵢᵀ ( Σ_j A[j,i] μ_j + Σ_l B[l,i] λ_l )`. The stage Jacobian is
 evaluated at stage `i` and factors out of the **entire** weighted sum, because

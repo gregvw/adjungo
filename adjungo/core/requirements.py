@@ -68,7 +68,14 @@ def deduce_requirements(
     problem: ProblemStructure,
     state_dim: int,
 ) -> SolverRequirements:
-    """Dispatch logic from linalg_requirements.tex."""
+    """Dispatch logic following ``docs/linalg_requirements.tex``.
+
+    That document is a design document, and its reuse rules were refuted by
+    the certification work behind C-15: it derived factorization reuse from
+    the tableau alone. Its status preamble records the correction. What is
+    followed here is its classification of stage structure, not its
+    conclusions about reuse.
+    """
 
     is_explicit = method.stage_type == StageType.EXPLICIT
 

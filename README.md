@@ -271,9 +271,9 @@ The library is organized into several modules:
 | [`docs/architecture.md`](docs/architecture.md) | Module map, the four sweeps, the `glm_opt.tex`-to-code symbol map, an explicit list of what is **not** built, and what a C++ reimplementation must preserve. |
 | [`docs/adjoint_sensitivity_insight.md`](docs/adjoint_sensitivity_insight.md) | Why the adjoint and adjoint-sensitivity solves are linear and share one factorization, and the stage-index trap that makes a wrong version look correct. |
 | [`docs/glm_opt.tex`](docs/glm_opt.tex) | The mathematical derivation the code implements. |
-| [`docs/runge_kutta_opt.tex`](docs/runge_kutta_opt.tex) | The Runge-Kutta special case, second-order conditions. |
+| [`docs/runge_kutta_opt.tex`](docs/runge_kutta_opt.tex) | The Runge-Kutta special case, second-order conditions. Ten of its equations carried the same stage-index defect as the code (precedent R-5) and were corrected; its correction notice records what changed and why. |
 | [`docs/multistep_opt.tex`](docs/multistep_opt.tex) | Multistep optimality conditions. The corresponding solver path is **refused**; this is theory, not a description of working code. |
-| [`docs/linalg_requirements.tex`](docs/linalg_requirements.tex) | Linear algebra requirements by method family. |
+| [`docs/linalg_requirements.tex`](docs/linalg_requirements.tex) | Linear algebra requirements by method family. A **design** document for the eventual C++ library, not a description of this code. Its status preamble lists four rules it stated that were later refuted, and the clauses that correct them. |
 | [`docs/history/`](docs/history/README.md) | Superseded development reports, kept as evidence. Not maintained; see the index for where each durable claim now lives. |
 
 ## Development

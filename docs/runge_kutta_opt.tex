@@ -19,6 +19,48 @@
 \author{Greg von Winckel}
 \maketitle
 
+\section*{Correction notice: the stage index in the adjoint}
+
+The adjoint and Hessian equations in this document were corrected after the
+implementation was certified against an independently assembled discrete
+reference. The original text placed the Jacobian at the \emph{summation}
+index, writing the stage adjoint as
+\[
+\mu_k^i \;=\; h\sum_{j=1}^d a_{ji}\,(F_k^j)\tp \mu_k^j \;+\; h\,b_i\,(F_k^i)\tp \lambda_k .
+\]
+That is wrong. Differentiating the stage residual gives
+$\partial f_k^j/\partial z_k^i = \delta_{ji}F_k^i$, so only one term of the
+sum survives and the surviving Jacobian is always the one at the stage being
+differentiated. $(F_k^i)\tp$ therefore factors out of the \emph{entire}
+weighted sum:
+\[
+\mu_k^i \;=\; h\,(F_k^i)\tp\Lambda_k^i,
+\qquad
+\Lambda_k^i := \sum_{j=1}^d a_{ji}\,\mu_k^j + b_i\,\lambda_k .
+\]
+The two forms coincide whenever $F$ is constant, or whenever $d=1$ makes the
+sum a single term. That is precisely why the error survived: every derivative
+test in the repository used a one-stage method or a constant Jacobian. The
+same defect was present in the implementation, where it made every
+multi-stage method return an inexact gradient, and it is recorded as
+precedent R-5.
+
+The correction is equivalent to the statement that the adjoint stage matrix is
+the transpose of the forward one. With forward blocks
+$(\mathcal{A}_k)_{ij} = \delta_{ij}I - h\,a_{ij}F_k^j$, the transpose has
+blocks $(\mathcal{A}_k\tp)_{ij} = \delta_{ij}I - h\,a_{ji}(F_k^i)\tp$, whose
+Jacobian index is the \emph{row}. The matrix $\mathcal{M}_k$ below now
+satisfies $\mathcal{M}_k = \mathcal{A}_k\tp$; as originally written it did
+not, contradicting this document's own claim.
+
+Ten equations were affected: the stage adjoint, the block matrix
+$\mathcal{M}_k$, the reduced gradient, the stage adjoint sensitivity and its
+forcing, and the $\mathcal{H}_{uu}$, $\mathcal{H}_{uz}$ and
+$\mathcal{H}_{u\mu}$ Hessian blocks. The curvature operators are contracted
+against the whole aggregate $\Lambda_k^i$ for the same reason. Signs and the
+Lagrangian convention are unchanged; only the stage index was wrong.
+
+
 \section{Problem Formulation}
 
 Consider the optimal control problem
@@ -104,16 +146,18 @@ Taking variations with respect to $y_k$ and $z_k^i$ and setting them to zero yie
 \begin{equation}
 \label{eqn:mu_solve}
 \boxed{
-\mu_k^i = h\sum_{j=1}^d a_{ji} (F_k^j)\tp \mu_k^j + h b_i (F_k^i)\tp \lambda_k
+\mu_k^i = h (F_k^i)\tp \Lambda_k^i,
+\qquad
+\Lambda_k^i := \sum_{j=1}^d a_{ji}\,\mu_k^j + b_i\,\lambda_k
 }
 \end{equation}
 For implicit methods, this is a coupled linear system in $\mu_k^1,\ldots,\mu_k^d$. Define the $nd\times nd$ matrix
 \begin{equation}
 \mathcal{M}_k := I_{nd} - h \begin{pmatrix}
-a_{11}(F_k^1)\tp & a_{21}(F_k^2)\tp & \cdots & a_{d1}(F_k^d)\tp \\
-a_{12}(F_k^1)\tp & a_{22}(F_k^2)\tp & \cdots & a_{d2}(F_k^d)\tp \\
+a_{11}(F_k^1)\tp & a_{21}(F_k^1)\tp & \cdots & a_{d1}(F_k^1)\tp \\
+a_{12}(F_k^2)\tp & a_{22}(F_k^2)\tp & \cdots & a_{d2}(F_k^2)\tp \\
 \vdots & \vdots & \ddots & \vdots \\
-a_{1d}(F_k^1)\tp & a_{2d}(F_k^2)\tp & \cdots & a_{dd}(F_k^d)\tp
+a_{1d}(F_k^d)\tp & a_{2d}(F_k^d)\tp & \cdots & a_{dd}(F_k^d)\tp
 \end{pmatrix}
 \end{equation}
 and the forcing vector
@@ -131,7 +175,7 @@ The gradient of the reduced objective $\hat{J}(u) := J(y(u),u)$ with respect to 
 \begin{equation}
 \label{eqn:gradient}
 \boxed{
-\nabla_{u_k^i} \hat{J} = \pder{J}{u_k^i} - h b_i (G_k^i)\tp \lambda_k - h\sum_{j=1}^d a_{ji} (G_k^j)\tp \mu_k^j
+\nabla_{u_k^i} \hat{J} = \pder{J}{u_k^i} - h (G_k^i)\tp \Lambda_k^i
 }
 \end{equation}
 
@@ -202,19 +246,27 @@ where $J_{y_N u}\,\delta u$ collects any cross terms if the objective couples $y
 \label{eqn:delta_mu}
 \boxed{
 \begin{aligned}
-\delta\mu_k^i &= h\sum_{j=1}^d a_{ji} \Big[ (F_k^j)\tp \delta\mu_k^j + F_{zz}^{k,j}[\mu_k^j]\, \delta z_k^j + F_{zu}^{k,j}[\mu_k^j]\, \delta u_k^j \Big] \\[4pt]
-&\quad + h b_i \Big[ (F_k^i)\tp \delta\lambda_k + F_{zz}^{k,i}[\lambda_k]\, \delta z_k^i + F_{zu}^{k,i}[\lambda_k]\, \delta u_k^i \Big]
+\delta\mu_k^i &= h (F_k^i)\tp \delta\Lambda_k^i
+   + h\, F_{zz}^{k,i}[\Lambda_k^i]\, \delta z_k^i
+   + h\, F_{zu}^{k,i}[\Lambda_k^i]\, \delta u_k^i, \\[4pt]
+\delta\Lambda_k^i &:= \sum_{j=1}^d a_{ji}\,\delta\mu_k^j + b_i\,\delta\lambda_k
 \end{aligned}
 }
 \end{equation}
 
-The terms $F_{zz}^{k,j}[\mu_k^j]$ and $F_{zz}^{k,i}[\lambda_k]$ arise from differentiating $(F_k^j)\tp \mu_k^j$ with respect to $z_k^j$, and similarly for the $F_{zu}$ terms.
+The curvature terms arise from differentiating the product $(F_k^i)\tp \Lambda_k^i$
+with respect to $z_k^i$ and $u_k^i$. Both are contracted against the
+\emph{whole} aggregate $\Lambda_k^i$ and carry the stage index $i$, because
+$\partial f_k^j/\partial z_k^i = \delta_{ji} F_k^i$ leaves only one surviving
+term. Contracting them against the individual $\mu_k^j$ inside the sum is the
+same index error described in the correction notice above.
 
 In block form, define the forcing
 \begin{equation}
 \begin{aligned}
-\gamma_k^i &:= h\sum_{j=1}^d a_{ji} \Big[ F_{zz}^{k,j}[\mu_k^j]\, \delta z_k^j + F_{zu}^{k,j}[\mu_k^j]\, \delta u_k^j \Big] \\
-&\quad + h b_i \Big[ (F_k^i)\tp \delta\lambda_k + F_{zz}^{k,i}[\lambda_k]\, \delta z_k^i + F_{zu}^{k,i}[\lambda_k]\, \delta u_k^i \Big]
+\gamma_k^i &:= h b_i\, (F_k^i)\tp \delta\lambda_k
+   + h\, F_{zz}^{k,i}[\Lambda_k^i]\, \delta z_k^i
+   + h\, F_{zu}^{k,i}[\Lambda_k^i]\, \delta u_k^i
 \end{aligned}
 \end{equation}
 Then \eqref{eqn:delta_mu} becomes
@@ -237,7 +289,7 @@ The individual components at control index $(k,i)$ are:
 
 \paragraph{Direct control Hessian:}
 \begin{equation}
-(\mathcal{H}_{uu}\,\delta u)_k^i = \pder{^2 J}{(u_k^i)^2}\,\delta u_k^i - h b_i\, F_{uu}^{k,i}[\lambda_k]\,\delta u_k^i - h\sum_{j=1}^d a_{ji}\, F_{uu}^{k,j}[\mu_k^j]\,\delta u_k^j
+(\mathcal{H}_{uu}\,\delta u)_k^i = \pder{^2 J}{(u_k^i)^2}\,\delta u_k^i - h\, F_{uu}^{k,i}[\Lambda_k^i]\,\delta u_k^i
 \end{equation}
 
 \paragraph{Control-state cross term:}
@@ -248,14 +300,14 @@ where this collects any objective cross-derivatives between $u_k^i$ and state va
 
 \paragraph{Control-stage cross term:}
 \begin{equation}
-(\mathcal{H}_{uz}\,\delta z)_k^i = -h b_i\, F_{zu}^{k,i}[\lambda_k]\tp \delta z_k^i - h\sum_{j=1}^d a_{ji}\, F_{zu}^{k,j}[\mu_k^j]\tp \delta z_k^j
+(\mathcal{H}_{uz}\,\delta z)_k^i = -h\, F_{zu}^{k,i}[\Lambda_k^i]\tp \delta z_k^i
 \end{equation}
-Note the transpose on $F_{zu}$: the operator $F_{zu}^{k,j}[v]$ maps $\RR^\nu\to\RR^n$, so its transpose maps $\RR^n\to\RR^\nu$.
+Note the transpose on $F_{zu}$: the operator $F_{zu}^{k,i}[v]$ maps $\RR^\nu\to\RR^n$, so its transpose maps $\RR^n\to\RR^\nu$.
 
 \paragraph{Adjoint coupling terms:}
 \begin{align}
 (\mathcal{H}_{u\lambda}\,\delta\lambda)_k^i &= -h b_i\, (G_k^i)\tp \delta\lambda_k \\[4pt]
-(\mathcal{H}_{u\mu}\,\delta\mu)_k^i &= -h\sum_{j=1}^d a_{ji}\, (G_k^j)\tp \delta\mu_k^j
+(\mathcal{H}_{u\mu}\,\delta\mu)_k^i &= -h\, (G_k^i)\tp \sum_{j=1}^d a_{ji}\, \delta\mu_k^j
 \end{align}
 
 %==============================================================================

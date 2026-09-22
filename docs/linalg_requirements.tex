@@ -12,7 +12,66 @@
 \author{Greg von Winckel}
 \maketitle
 
+\section*{Status: design document, superseded on four points}
+
+This is a \emph{design} document for the eventual C++ library. It is not a
+description of the delivered Python implementation, and its pseudocode
+describes intended interfaces rather than existing ones. Sparse and
+matrix-free backends, Krylov solves, preconditioning, IMEX splitting, and
+automatic differentiation appear below as design options; none of them is
+built. Linear multistep methods with $r>1$ are refused by the implementation.
+
+Four rules stated below were subsequently \emph{refuted} by the certification
+work recorded in \texttt{NUMERICS.md}. They are corrected in place, but they
+are listed here because a reimplementation that follows the original text will
+reintroduce defects that have already been found and cured once.
+
+\begin{enumerate}[leftmargin=*]
+
+\item \textbf{A tableau cannot establish factorization reuse} (clause C-15.1).
+The original text derived reuse from the stage type: an SDIRK tableau has
+$a_{ii}=\gamma$ constant, therefore one factorization serves all stages. Equal
+diagonal coefficients are \emph{not} sufficient. The matrix actually solved is
+$K_{ii} = I - h\,a_{ii}F_i$, and it also depends on $F_i$, which may differ
+between stages even when $a_{ii}$ does not. Reuse requires the assembled
+matrices to coincide, which is established by an $O(n^2)$ element-wise
+comparison guarding the $O(n^3)$ factorization, never by reading the tableau.
+
+\item \textbf{A caller's declaration is a promise, not a fact} (clause C-15.2).
+Setting \texttt{can\_reuse\_factorization = prob.jacobian\_constant} accepts an
+unverified claim. The declaration selects the route; the element-wise check
+above is what permits reuse on it.
+
+\item \textbf{Linearity in the state does not bound curvature in the control}
+(clause C-16.1). The classification below defines \textsc{Linear} as
+$f = F(t)y + g(u,t)$ and \textsc{Quasilinear} as $f = F(u,t)y + g(u,t)$, in
+both cases describing $F$ as independent of $y$. Neither constrains $g$, so
+$f_{uu} = \partial^2 g/\partial u^2$ need not vanish. A rule of the form
+``linear, therefore skip the curvature terms'' silently returns a
+Gauss--Newton approximation while the caller has been promised an exact
+Hessian. Skipping dynamics curvature requires a separate fact about $g$, and
+in the delivered implementation that fact is established by \emph{construction}
+rather than by declaration, because no cheap check can verify it.
+
+\item \textbf{Cholesky eligibility is a property of the assembled matrix}
+(clause C-16). The factorization interface below offers ``LU, Cholesky, etc.''
+without stating what selects between them. Cholesky requires the assembled
+matrix to be symmetric positive definite. The stage-residual Jacobian
+$K_{ij} = \delta_{ij}I - h\,a_{ij}F_j$ is not symmetric for a general $F$, so
+no tableau classification can establish eligibility, and none may be read as
+doing so.
+
+\end{enumerate}
+
+Section~\ref{sec:classification}'s three orthogonal factors survive, and are
+the basis of the delivered dispatch, with one correction: the third factor must
+be read as linearity \emph{of the stage equations in their unknowns}, which is
+what decides whether an iteration is needed. It does not decide which curvature
+terms vanish.
+
+
 \section{Classification Dimensions}
+\label{sec:classification}
 
 The computational requirements for a single time step depend on three orthogonal factors:
 
@@ -38,7 +97,8 @@ Structure & Definition & Solve type & Cost \\
 \midrule
 \textsc{Explicit} & $A$ strictly lower triangular & Forward substitution & $O(s \cdot n \cdot \text{eval})$ \\
 \textsc{DIRK} & $A$ lower triangular, $a_{ii} \neq 0$ & $s$ sequential $n\times n$ solves & $O(s \cdot n^3)$ \\
-\textsc{SDIRK} & DIRK with $a_{ii} = \gamma$ constant & $s$ solves, 1 factorization & $O(n^3 + s \cdot n^2)$ \\
+\textsc{SDIRK} & DIRK with $a_{ii} = \gamma$ constant & $s$ solves; 1 factorization \emph{only if} the & $O(n^3 + s \cdot n^2)$ \\
+ & & assembled $I-h\gamma F_i$ coincide (C-15.1) & \\
 \textsc{Implicit} & $A$ dense & Coupled $ns \times ns$ solve & $O((ns)^3)$ \\
 \bottomrule
 \end{tabular}
@@ -154,7 +214,11 @@ struct TableauStructure {
     bool is_fully_explicit() const { 
         return stage_type == StageType::Explicit; 
     }
-    bool has_reusable_factorization() const {
+    // A necessary condition only. Equal diagonal coefficients do not make
+    // the assembled stage matrices equal; I - h*a_ii*F_i also depends on
+    // F_i. Reuse is permitted by comparing the assembled matrices
+    // element-wise (C-15.1), never by this predicate alone.
+    bool may_attempt_factorization_reuse() const {
         return stage_type == StageType::SDIRK;
     }
 };
@@ -255,7 +319,10 @@ auto deduce_requirements(TableauStructure tab, ProblemStructure prob)
         switch (tab.stage_type) {
             case SDIRK:
                 req.factorizations_per_step = prob.jacobian_constant ? 1 : tab.s;
-                req.can_reuse_factorization = prob.jacobian_constant;
+                // A declaration by the caller, which selects the route. The
+                // route must still verify that the assembled matrices are
+                // equal before reusing a factorization (C-15.2).
+                req.reuse_declared = prob.jacobian_constant;
                 req.solves_per_step = tab.s;
                 req.factorization_size = n;
                 break;
@@ -398,7 +465,8 @@ Given: Tableau (A, U, B, V), Problem f(y, u, t)
 
 3. Combine:
    - EXPLICIT + anything: just evaluate f
-   - SDIRK + LINEAR: 1 factorization, s solves
+   - SDIRK + LINEAR: s solves, and 1 factorization if the assembled
+     stage matrices are verified equal; otherwise s factorizations (C-15.1)
    - SDIRK + BILINEAR: s factorizations (u changes), s solves
    - DIRK + LINEAR/BILINEAR: s factorizations, s solves
    - IMPLICIT + LINEAR/BILINEAR: 1 block factorization, 1 block solve
@@ -431,7 +499,11 @@ concept LinearAlgebraBackend = requires {
     Vector matvec_add(Matrix A, Vector x, Vector y); // y <- Ax + y
     
     // For implicit stages: factorization + solve
-    Factorization factor(Matrix A);               // LU, Cholesky, etc.
+    // LU is the general choice. Cholesky requires A symmetric positive
+    // definite, which is a property of the assembled A and cannot be
+    // inferred from the tableau: I - h*A(x)F is not symmetric for a
+    // general F (C-16).
+    Factorization factor(Matrix A);
     Vector solve(Factorization F, Vector b);      // x <- A^{-1}b
     
     // For transpose solves (adjoints)

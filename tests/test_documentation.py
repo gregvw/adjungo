@@ -14,6 +14,7 @@ the code cites, still point at something.
 import re
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -469,3 +470,187 @@ def test_architecture_does_not_claim_uncertified_families():
             f"docs/architecture.md lists {name} as not built, but "
             "CERTIFIED_STAGE_TYPES certifies it."
         )
+
+
+# ---------------------------------------------------------------------------
+# The LaTeX design documents
+# ---------------------------------------------------------------------------
+
+#: Rules stated in ``docs/linalg_requirements.tex`` that later certification
+#: work refuted, each paired with the clause that corrects it. The document is
+#: the design source for the eventual C++ library, so a reimplementer who
+#: reads it without the correction reintroduces a defect that has already been
+#: found and cured once.
+REFUTED_DESIGN_RULES = ["C-15.1", "C-15.2", "C-16.1", "C-16"]
+
+
+def _linalg_requirements() -> str:
+    """The document with runs of whitespace collapsed.
+
+    LaTeX source is hard-wrapped, so a phrase this guard looks for is very
+    likely to straddle a line break.
+    """
+    text = (ROOT / "docs" / "linalg_requirements.tex").read_text(encoding="utf-8")
+    return re.sub(r"\s+", " ", text)
+
+
+def test_linalg_requirements_declares_itself_a_design_document():
+    """The document must not read as a description of delivered code.
+
+    It specifies sparse and matrix-free backends, Krylov solves, IMEX
+    splitting, automatic differentiation, and multistep paths. None of those
+    is built, and one of them is explicitly refused.
+    """
+    text = _linalg_requirements()
+    assert "Status: design document" in text
+    assert "not a description of the delivered" in text
+
+
+@pytest.mark.parametrize("clause", REFUTED_DESIGN_RULES)
+def test_linalg_requirements_records_its_refuted_rules(clause):
+    """Each refuted rule names the clause that corrects it."""
+    assert clause in _linalg_requirements(), (
+        f"docs/linalg_requirements.tex no longer cites {clause}. Its status "
+        f"preamble is what stops a C++ port re-deriving factorization reuse "
+        f"from the tableau, or reading state linearity as zero curvature."
+    )
+
+
+def test_linalg_requirements_does_not_derive_reuse_from_the_tableau():
+    """The refuted predicate must not return under its old name.
+
+    ``has_reusable_factorization() { return stage_type == SDIRK; }`` reads as
+    a settled fact. Equal diagonal coefficients do not make the assembled
+    stage matrices equal, because ``I - h*a_ii*F_i`` also depends on ``F_i``.
+    The name now says the tableau only permits an attempt.
+    """
+    text = _linalg_requirements()
+    assert "has_reusable_factorization" not in text
+    assert "may_attempt_factorization_reuse" in text
+
+
+def test_sources_citing_the_design_document_carry_the_caveat():
+    """A citation of the design document must not present it as settled.
+
+    Two dispatch modules name this document as the decision tree they
+    implement. Both implement rules the document states incorrectly, so an
+    unqualified citation points a reader at a refuted source.
+    """
+    citing = [
+        path
+        for path in (ROOT / "adjungo").rglob("*.py")
+        if "linalg_requirements" in path.read_text(encoding="utf-8")
+    ]
+    assert citing, "no source cites linalg_requirements.tex; update this guard"
+
+    uncaveated = [
+        path.relative_to(ROOT)
+        for path in citing
+        if "refuted" not in path.read_text(encoding="utf-8")
+    ]
+    assert not uncaveated, (
+        "these modules cite docs/linalg_requirements.tex without recording "
+        "that parts of it were refuted:\n  "
+        + "\n  ".join(str(p) for p in uncaveated)
+    )
+
+
+#: Derivative tensors that must never appear under a ``\sum_j a_{ji}`` in
+#: ``docs/runge_kutta_opt.tex``. Differentiating the stage residual gives
+#: ``df_j/dz_i = delta_ji F_i``, so the surviving Jacobian carries the free
+#: index ``i`` and factors out of the sum. Writing index ``j`` inside the sum
+#: is precedent R-5, the defect that made every multi-stage method in this
+#: repository return an inexact gradient.
+SUMMATION_INDEXED_TENSORS = [
+    r"\(F_k\^j\)",
+    r"\(G_k\^j\)",
+    r"F_\{zz\}\^\{k,j\}",
+    r"F_\{zu\}\^\{k,j\}",
+    r"F_\{uu\}\^\{k,j\}",
+]
+
+
+def _runge_kutta_opt() -> str:
+    return (ROOT / "docs" / "runge_kutta_opt.tex").read_text(encoding="utf-8")
+
+
+def _runge_kutta_opt_body() -> list[tuple[int, str]]:
+    """The document with its correction notice removed.
+
+    The notice has to quote the defective equation in order to explain it, so
+    scanning the whole file would flag the explanation as the defect.
+    """
+    lines = _runge_kutta_opt().splitlines()
+    start = next(
+        (n for n, line in enumerate(lines) if line.startswith(r"\section{")),
+        0,
+    )
+    assert start, "no numbered section found; the notice boundary moved"
+    return [(n + 1, line) for n, line in enumerate(lines) if n >= start]
+
+
+def test_runge_kutta_opt_records_its_stage_index_correction():
+    """The document once stated the adjoint with the R-5 defect in it.
+
+    It is the specification a C++ port would follow, so the correction has to
+    be visible in it, not only in the commit that made it.
+    """
+    text = re.sub(r"\s+", " ", _runge_kutta_opt())
+    assert "Correction notice: the stage index in the adjoint" in text
+    assert "precedent R-5" in text
+
+
+@pytest.mark.parametrize("tensor", SUMMATION_INDEXED_TENSORS)
+def test_runge_kutta_opt_never_indexes_a_tensor_by_the_summation_index(tensor):
+    """No ``a_{ji}`` may be followed by a ``j``-indexed derivative tensor.
+
+    The aggregate definitions legitimately weight ``mu_k^j`` by ``a_{ji}``;
+    what may not appear is a Jacobian or curvature operator carrying ``j``
+    inside that sum.
+    """
+    offenders = [
+        (number, line.strip())
+        for number, line in _runge_kutta_opt_body()
+        if re.search(r"a_\{ji\}", line) and re.search(tensor, line)
+    ]
+    assert not offenders, (
+        f"docs/runge_kutta_opt.tex indexes {tensor} by the summation index "
+        f"inside a sum weighted by a_{{ji}}. The Jacobian must carry the free "
+        f"stage index and factor out of the sum (precedent R-5):\n  "
+        + "\n  ".join(f"line {n}: {t}" for n, t in offenders)
+    )
+
+
+def test_the_adjoint_block_matrix_is_the_forward_transpose():
+    """``M_k`` must carry its Jacobian on the row, not the column.
+
+    This is the same statement as the test above, checked on the assembled
+    block matrix where the original document contradicted its own claim that
+    ``M_k = A_k^T``.
+    """
+    rng = np.random.default_rng(0)
+    n, d, h = 3, 2, 0.17
+    a = rng.normal(size=(d, d))
+    F = [rng.normal(size=(n, n)) for _ in range(d)]
+    eye = np.eye(n)
+
+    def assemble(block):
+        out = np.zeros((d * n, d * n))
+        for i in range(d):
+            for j in range(d):
+                out[i * n : (i + 1) * n, j * n : (j + 1) * n] = block(i, j)
+        return out
+
+    forward = assemble(lambda i, j: (eye if i == j else 0.0) - h * a[i, j] * F[j])
+    row_indexed = assemble(
+        lambda i, j: (eye if i == j else 0.0) - h * a[j, i] * F[i].T
+    )
+    column_indexed = assemble(
+        lambda i, j: (eye if i == j else 0.0) - h * a[j, i] * F[j].T
+    )
+
+    assert np.allclose(forward.T, row_indexed, rtol=0.0, atol=1e-14)
+    assert not np.allclose(forward.T, column_indexed, atol=1e-8), (
+        "the two forms agree, so this fixture cannot discriminate; it needs "
+        "distinct per-stage Jacobians and a non-symmetric tableau"
+    )

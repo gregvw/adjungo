@@ -17,7 +17,11 @@ def create_stage_solver(
     y_scale: float = 1.0,
 ) -> StageSolver:
     """
-    Decision tree from linalg_requirements.tex Section 6.
+    Decision tree following ``docs/linalg_requirements.tex`` Section 6, whose
+    status preamble records the four rules of that document which were
+    subsequently refuted. The three-axis separation below is that document's
+    own Section 1, which survived; its single ordered linearity test, which
+    merged the axes, did not.
 
     Three independent axes decide the route, and merging them is how a wrong
     rule gets written:
