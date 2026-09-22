@@ -10,116 +10,205 @@ The first-person singular form follows Latin verbs that survive in English as ac
 
 ## Overview
 
-Adjungo provides a framework for solving optimal control problems using General Linear Methods (GLMs) with support for:
+Adjungo computes **exact discrete derivatives** for optimal-control problems
+discretised by General Linear Methods.
 
-- **Forward state solving**: Efficient propagation of state trajectories
-- **Backward adjoint computation**: Gradient computation via adjoint methods
-- **Sensitivity analysis**: First and second-order sensitivity equations
-- **Optimization interface**: Compatible with SciPy and other optimizers
+"Exact discrete" is the whole claim, and it is narrower and stronger than it
+may sound. The gradient and Hessian-vector product adjungo returns are the
+derivatives of the objective **as the code actually discretises it, at the
+mesh you give it** — not approximations to the derivatives of the underlying
+continuous problem. A disagreement with a finite difference of that same
+discrete objective is a defect, never "time-discretisation error". Convergence
+to the continuous problem is a separate claim, tested separately.
 
-## Features
+The governing contract is [`NUMERICS.md`](NUMERICS.md). Where this README and
+that document disagree, `NUMERICS.md` is authoritative.
 
-### Method Support
+## What is supported
 
-- **Runge-Kutta methods**: Explicit and implicit RK methods
-- **Linear multistep methods**: Adams-Bashforth, Adams-Moulton, BDF
-- **IMEX methods**: Implicit-explicit pairs for stiff problems
-- **Custom GLM tableaux**: Define your own general linear methods
+Adjungo **refuses at construction** rather than returning a plausible-looking
+number from an uncertified path. A method family appears below as certified
+only when a completed milestone validated its forward solve, gradient **and**
+Hessian-vector product against an independently assembled reference.
 
-### Solver Optimizations
+| Method family | Status |
+|---|---|
+| Explicit Runge–Kutta (`explicit_euler`, `heun`, `rk4`) | **certified** |
+| DIRK (`implicit_trapezoid` / Crank–Nicolson) | **certified** |
+| SDIRK (`implicit_midpoint`, `sdirk2`, `sdirk3`) | **certified** |
+| Fully implicit, dense `A` (`gauss2`) | **refused** — needs a coupled Newton solve |
+| BDF (`bdf2`, `bdf3`) | **refused** — `r > 1` has no starting procedure |
+| Adams (`adams_bashforth2`, `adams_moulton2`) | **refused** — tableau not representable |
+| IMEX / additive splitting | **refused** |
 
-- **Factorization reuse**: SDIRK methods reuse LU factorizations across stages
-- **Automatic dispatch**: Solver selection based on method structure
-- **Efficient adjoints**: Share factorizations between forward and adjoint solves
+Tableaux for the refused families are kept under
+`adjungo/methods/experimental/` as reference material, not as endorsement.
+`GLMOptimizer` raises `NotImplementedError` for the ones that are
+representable; the Adams tableaux need per-history stage coefficients and are
+rejected earlier, by `GLMethod` validation itself.
 
-### Problem Types
+### Problem types
 
-- Linear, bilinear, quasilinear, and nonlinear dynamics
-- Control-dependent and control-independent Jacobians
-- Optional second derivatives for Newton-type optimization
+Linear, bilinear, quasilinear and nonlinear dynamics; control-dependent and
+control-independent Jacobians.
+
+Second derivatives (`F_yy_action`, `F_yu_action`, `F_uu_action`, and the
+objective's `d2J_dy2` and `d2J_dy2_terminal`) are **required** for the exact
+Hessian-vector product. If they are missing, adjungo raises. It does not
+silently fall back to a Gauss–Newton operator, because that is a different
+operator and the method promises the exact Hessian.
+
+### Not yet implemented
+
+- Factorisation **reuse** across stages or steps. Each stage is factored at its
+  own converged iterate. An earlier reuse path was removed after it was found
+  to hand the adjoint another stage's matrix; see precedent R-9 in
+  `NUMERICS.md`.
+- Control parametrisation layers, sparse operators, and checkpointing.
 
 ## Installation
 
 ```bash
-pip install -e .
+python -m venv .venv
+.venv/bin/pip install -e ".[dev]"
 ```
 
-For development:
+## Quick start
+
+The complete, runnable version of the code below is
+[`examples/minimum_energy_oscillator.py`](examples/minimum_energy_oscillator.py),
+which is executed by the test suite. Run it with:
 
 ```bash
-pip install -e ".[dev]"
+.venv/bin/python examples/minimum_energy_oscillator.py
 ```
 
-## Quick Start
+It drives a damped mass–spring oscillator (`m = 1 kg`, `k = 4 N/m`,
+`c = 0.4 N·s/m`, so `ω₀ = 2 rad/s` and `ζ = 0.1`) from rest at `x = 1 m` to
+rest at the origin over 4 s, minimising control energy.
+
+### Define the dynamics
 
 ```python
 import numpy as np
+
+class DampedOscillator:
+    state_dim = 2      # y = (position, velocity)
+    control_dim = 1    # u = applied force
+
+    def __init__(self, mass=1.0, stiffness=4.0, damping=0.4):
+        self.mass, self.stiffness, self.damping = mass, stiffness, damping
+
+    def f(self, y, u, t):
+        x, v = y[0], y[1]
+        return np.array(
+            [v, (u[0] - self.stiffness * x - self.damping * v) / self.mass]
+        )
+
+    def F(self, y, u, t):          # df/dy
+        return np.array([[0.0, 1.0],
+                         [-self.stiffness / self.mass, -self.damping / self.mass]])
+
+    def G(self, y, u, t):          # df/du
+        return np.array([[0.0], [1.0 / self.mass]])
+
+    # Required for the exact Hessian. Exactly zero here because f is affine
+    # in (y, u) -- a fact about this problem, not a simplification. adjungo
+    # cannot infer it, and raises rather than assuming it.
+    def F_yy_action(self, y, u, t, v): return np.zeros((2, 2))
+    def F_yu_action(self, y, u, t, v): return np.zeros((2, 1))
+    def F_uu_action(self, y, u, t, v): return np.zeros((1, 1))
+```
+
+### Define the objective
+
+```python
+class MinimumEnergyObjective:
+    """J = 0.5 * q_T * |y(T) - y_target|^2 + 0.5 * r * sum(u^2)."""
+
+    def __init__(self, y_target=np.zeros(2), terminal_weight=100.0,
+                 control_weight=0.01):
+        self.y_target = y_target
+        self.terminal_weight = terminal_weight
+        self.control_weight = control_weight
+
+    def evaluate(self, trajectory, u):
+        miss = trajectory.Y[-1][0] - self.y_target
+        return float(0.5 * self.terminal_weight * np.dot(miss, miss)
+                     + 0.5 * self.control_weight * np.sum(u ** 2))
+
+    def dJ_dy_terminal(self, y_final):
+        return self.terminal_weight * (y_final - self.y_target)
+
+    def dJ_dy(self, y, step):                 # no running state cost
+        return np.zeros(2)
+
+    def dJ_du(self, u_stage, step, stage):
+        return self.control_weight * u_stage
+
+    def d2J_du2(self, u_stage, step, stage):
+        return self.control_weight * np.eye(1)
+
+    def d2J_dy2(self, y, step):
+        return np.zeros((2, 2))
+
+    def d2J_dy2_terminal(self, y_final):
+        return self.terminal_weight * np.eye(2)
+```
+
+### Optimise
+
+```python
+from scipy.optimize import minimize
 from adjungo import GLMOptimizer
 from adjungo.methods.runge_kutta import rk4
 
-# Define your problem
-class MyProblem:
-    @property
-    def state_dim(self):
-        return 2
-
-    @property
-    def control_dim(self):
-        return 1
-
-    def f(self, y, u, t):
-        # Dynamics: ẏ = f(y, u, t)
-        return np.array([y[1], u[0] - y[0]])
-
-    def F(self, y, u, t):
-        # State Jacobian ∂f/∂y
-        return np.array([[0, 1], [-1, 0]])
-
-    def G(self, y, u, t):
-        # Control Jacobian ∂f/∂u
-        return np.array([[0], [1]])
-
-# Define objective function
-class MyObjective:
-    def evaluate(self, trajectory, u):
-        # J = ||y(T) - y_target||^2 + ||u||^2
-        y_final = trajectory.Y[-1, 0]
-        return np.sum((y_final - self.y_target)**2) + 0.01 * np.sum(u**2)
-
-    def dJ_dy_terminal(self, y_final):
-        return np.array([2 * (y_final - self.y_target), [0]])
-
-    def dJ_dy(self, y, step):
-        return np.zeros((1, 2))
-
-    def dJ_du(self, u_stage, step, stage):
-        return 0.02 * u_stage
-
-    def d2J_du2(self, u_stage, step, stage):
-        return 0.02 * np.eye(1)
-
-# Setup optimizer
-problem = MyProblem()
-objective = MyObjective()
 method = rk4()
+N = 80
 
 optimizer = GLMOptimizer(
-    problem=problem,
-    objective=objective,
+    problem=DampedOscillator(),
+    objective=MinimumEnergyObjective(),
     method=method,
-    t_span=(0.0, 10.0),
-    N=100,
+    t_span=(0.0, 4.0),
+    N=N,
     y0=np.array([1.0, 0.0]),
 )
 
-# Use with scipy.optimize
-from scipy.optimize import minimize
-
 fun, jac = optimizer.scipy_interface()
-u_init = np.zeros((100, 4, 1))  # N=100 steps, s=4 stages, ν=1 control
+u0 = np.zeros(N * method.s * optimizer.problem.control_dim)
 
-result = minimize(fun, u_init.ravel(), jac=jac, method='L-BFGS-B')
-u_optimal = result.x.reshape(100, 4, 1)
+# Exact Hessian-vector products, so a Newton-Krylov method is usable directly.
+result = minimize(fun, u0, jac=jac, hessp=optimizer.scipy_hessp(),
+                  method="trust-ncg", options={"gtol": 1e-10})
+
+u_optimal = result.x.reshape(N, method.s, optimizer.problem.control_dim)
+y_final = optimizer.trajectory(u_optimal).Y[-1][0]
+```
+
+On the shipped parameters this converges in 5 trust-region iterations to
+`|∇J|_∞ ≈ 2e-17`, bringing the mass from `x = 1 m` to `x(T) ≈ 5.7e-4 m`.
+`L-BFGS-B` with `jac` alone also works and finds the same minimiser, but
+stops several orders short in stationarity.
+
+## Validation
+
+Correctness is established against an **independently assembled** reference
+(`adjungo/validation/reference.py`) that writes the entire discretisation as a
+single residual `R(w, u) = 0` and forms
+
+```
+dJ/du = J_u - J_w (dR/dw)^-1 dR/du
+```
+
+by a dense solve. It shares no code with the stepping and adjoint
+implementations, so it cannot share a mistake with them. Duality
+(dot-product) tests and Hessian symmetry are used as corroboration only: this
+repository has held a Hessian symmetric to `8.7e-19` while it was wrong by
+`3.8e-3` in value.
+
+```bash
+.venv/bin/python -m pytest
 ```
 
 ## Architecture

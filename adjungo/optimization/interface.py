@@ -179,6 +179,39 @@ class GLMOptimizer:
         assert self._trajectory is not None
         return self.objective.evaluate(self._trajectory, u)
 
+    def trajectory(self, u: NDArray) -> Trajectory:
+        """Return the forward trajectory at ``u``.
+
+        Without this a caller can optimize but cannot inspect the state the
+        optimal control produces, which makes the result unusable for
+        anything but reporting the objective value.
+
+        The returned ``Y`` and ``Z`` are **copies**. The optimizer caches the
+        trajectory keyed on ``u``, so handing out the live arrays would let a
+        caller mutate the state that every subsequent gradient and Hessian is
+        computed from while the cache key still matched: the derivatives
+        would then belong to a trajectory that no forward solve ever
+        produced.
+
+        ``caches`` is shared rather than copied. It holds LU factorization
+        objects that are not meaningfully copyable, and it is an internal
+        record of the solve rather than caller-facing data.
+
+        Args:
+            u: Control array (N, s, ν)
+
+        Returns:
+            The trajectory, with ``Y`` of shape ``(N+1, r, n)`` and ``Z`` of
+            shape ``(N, s, n)``.
+        """
+        self._ensure_forward(u)
+        assert self._trajectory is not None
+        return Trajectory(
+            Y=self._trajectory.Y.copy(),
+            Z=self._trajectory.Z.copy(),
+            caches=self._trajectory.caches,
+        )
+
     def gradient(self, u: NDArray) -> NDArray:
         """
         ∇J(u) - runs forward + adjoint if needed.
@@ -258,6 +291,10 @@ class GLMOptimizer:
         Returns:
             fun: Objective function taking flat array
             jac: Gradient function taking flat array
+
+        See also:
+            :meth:`scipy_hessp` for the Hessian-vector callable accepted by
+            ``trust-ncg``, ``trust-krylov`` and ``Newton-CG``.
         """
         def fun(u_flat: NDArray) -> float:
             u = u_flat.reshape(self.N, self.method.s, self.problem.control_dim)
@@ -268,6 +305,38 @@ class GLMOptimizer:
             return self.gradient(u).ravel()
 
         return fun, jac
+
+    def scipy_hessp(self) -> Callable[[NDArray, NDArray], NDArray]:
+        """Return ``hessp(x, p)`` for SciPy's Hessian-free Newton methods.
+
+        SciPy passes the current point and the direction as separate flat
+        arrays and expects a flat array back. Both are reshaped to the
+        ``(N, s, ν)`` control layout, which is the only layout in which the
+        Hessian operator is defined: ``ravel`` order is
+        :ref:`C-10 <numerics>`'s coordinate convention and a caller that
+        flattens differently gets a different operator.
+
+        The direction is **not** cached. Only ``u`` selects the trajectory
+        and adjoint; ``p`` is a free argument of the resulting linear
+        operator, so repeated calls at fixed ``u`` with different ``p`` reuse
+        the forward and adjoint solves. This is what makes a Krylov method
+        affordable here: one nonlinear solve per outer iteration, one
+        second-order adjoint sweep per inner product.
+
+        Raises:
+            NotImplementedError: If the objective or problem does not supply
+                the second derivatives the exact Hessian requires. The
+                operator is never silently replaced by a Gauss-Newton
+                approximation; see NUMERICS.md C-7.
+        """
+        shape = (self.N, self.method.s, self.problem.control_dim)
+
+        def hessp(u_flat: NDArray, p_flat: NDArray) -> NDArray:
+            u = np.asarray(u_flat, dtype=float).reshape(shape)
+            p = np.asarray(p_flat, dtype=float).reshape(shape)
+            return self.hessian_vector_product(u, p).ravel()
+
+        return hessp
 
     def _ensure_forward(self, u: NDArray) -> None:
         """Run forward solve if not cached or u changed.
