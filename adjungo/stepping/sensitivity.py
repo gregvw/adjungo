@@ -6,9 +6,10 @@ import numpy as np
 import scipy.linalg
 from numpy.typing import NDArray
 
+from adjungo.core.affine import affine_dynamics_verified
 from adjungo.core.method import GLMethod
 from adjungo.core.objective import Objective
-from adjungo.core.problem import Problem
+from adjungo.core.problem import Problem, ProblemStructure
 from adjungo.solvers.base import StageSolver
 from adjungo.solvers.implicit import (
     solve_coupled,
@@ -183,6 +184,7 @@ def adjoint_sensitivity(
     h: float,
     t0: float = 0.0,
     objective: Objective | None = None,
+    structure: "ProblemStructure | None" = None,
 ) -> AdjointSensitivityTrajectory:
     """
     Algorithm 4: Backward adjoint sensitivity from glm_opt.tex Section 7.
@@ -252,12 +254,39 @@ def adjoint_sensitivity(
             "compute the Hessian of a different objective."
         )
 
-    for name in ("F_yy_action", "F_yu_action"):
-        if getattr(problem, name, None) is None:
-            raise NotImplementedError(
-                f"second-order adjoint requires problem.{name}(); "
-                f"{type(problem).__name__} does not provide it"
-            )
+    # Both conditions are required, and the second is the load-bearing one.
+    #
+    # ``structure`` is a public constructor argument of GLMOptimizer, so
+    # ``jointly_affine=True`` can be *declared* by any caller for any problem.
+    # Unlike the constant-Jacobian declaration of M6, that claim has no cheap
+    # exact check: the residual test inside the affine stage solve establishes
+    # that ``f`` is affine in the *state*, and says nothing about curvature in
+    # the control. A problem with ``f = M y + b(u)`` would pass every stage
+    # check and still have a nonzero ``f_uu``, so believing the declaration
+    # alone would return a Gauss-Newton approximation from a function that
+    # promises an exact Hessian (C-16.5). That is the shape of precedent R-9.
+    #
+    # ``affine_dynamics_verified`` is not a declaration. It checks that the
+    # problem is an AffineDynamics whose guaranteeing methods are still the
+    # ones that class defines, by object identity. A declaration that fails it
+    # simply does not open the skip: the terms are computed, the callbacks are
+    # required, and the caller gets more work rather than a wrong answer.
+    skip_dynamics_curvature = (
+        structure is not None
+        and structure.jointly_affine
+        and affine_dynamics_verified(problem)
+    )
+    if not skip_dynamics_curvature:
+        for name in ("F_yy_action", "F_yu_action"):
+            if getattr(problem, name, None) is None:
+                raise NotImplementedError(
+                    f"second-order adjoint requires problem.{name}(); "
+                    f"{type(problem).__name__} does not provide it. "
+                    f"A problem with no dynamics curvature can be "
+                    f"expressed as an adjungo.core.affine."
+                    f"AffineDynamics, for which the term is skipped "
+                    f"and no callback is needed."
+                )
     for name in ("d2J_dy2", "d2J_dy2_terminal"):
         if getattr(objective, name, None) is None:
             raise NotImplementedError(
@@ -291,20 +320,21 @@ def adjoint_sensitivity(
         # ℓ, so ``v`` must be the weighted adjoint Λ_k.
         Gamma = np.zeros((s, n))
         t_n = t0 + step * h
-        for k in range(s):
-            t_k = t_n + method.c[k] * h
-            z_k, u_k = trajectory.Z[step, k], u[step, k]
+        if not skip_dynamics_curvature:
+            for k in range(s):
+                t_k = t_n + method.c[k] * h
+                z_k, u_k = trajectory.Z[step, k], u[step, k]
 
-            F_yy_Lam = np.asarray(
-                problem.F_yy_action(z_k, u_k, t_k, Lambda_k[k])
-            )
-            F_yu_Lam = np.asarray(
-                problem.F_yu_action(z_k, u_k, t_k, Lambda_k[k])
-            )
-            Gamma[k] = h * (
-                F_yy_Lam @ sensitivity.delta_Z[step, k]
-                + F_yu_Lam @ delta_u[step, k]
-            )
+                F_yy_Lam = np.asarray(
+                    problem.F_yy_action(z_k, u_k, t_k, Lambda_k[k])
+                )
+                F_yu_Lam = np.asarray(
+                    problem.F_yu_action(z_k, u_k, t_k, Lambda_k[k])
+                )
+                Gamma[k] = h * (
+                    F_yy_Lam @ sensitivity.delta_Z[step, k]
+                    + F_yu_Lam @ delta_u[step, k]
+                )
 
         delta_lambda_ext = delta_Lambda[step + 1]
 

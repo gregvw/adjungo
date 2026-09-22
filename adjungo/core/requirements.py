@@ -71,7 +71,17 @@ def deduce_requirements(
     """Dispatch logic from linalg_requirements.tex."""
 
     is_explicit = method.stage_type == StageType.EXPLICIT
-    is_linear = problem.linearity in (
+
+    # A stage equation is linear in its unknown exactly when f is affine in
+    # the state. `state_affine` says that directly. The enum membership test
+    # below is the legacy route, kept because a caller may still construct a
+    # ProblemStructure by declaring only `linearity`: all three of these
+    # members describe an f that is affine in y (LINEAR: f = M(t)y + b(u,t);
+    # BILINEAR: f = (H + uV)y; QUASILINEAR: F depends on u alone). It is a
+    # weaker and more fragile statement of the same fact, since it requires
+    # reading three enum descriptions as "affine in y", which is why
+    # `state_affine` now exists.
+    is_linear = problem.state_affine or problem.linearity in (
         Linearity.LINEAR,
         Linearity.BILINEAR,
         Linearity.QUASILINEAR,

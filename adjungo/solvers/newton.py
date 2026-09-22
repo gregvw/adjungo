@@ -7,6 +7,8 @@ import numpy as np
 import scipy.linalg
 from numpy.typing import NDArray
 
+from adjungo.solvers.linear_stage import linear_stage_solve
+
 #: Relative term of the C-5.1 stage-solve convergence test.
 NEWTON_RTOL = 1e-13
 
@@ -107,7 +109,22 @@ class StageSolveError(RuntimeError):
 
 
 class NewtonMixin:
-    """Mixin providing Newton iteration for nonlinear stage equations."""
+    """Mixin providing Newton iteration for nonlinear stage equations.
+
+    ``newton_entries`` counts calls to :meth:`newton_solve` on this instance.
+    It exists because the affine route added in milestone M7 is invisible to
+    every accuracy test: a direct linear solve and a converged Newton solve
+    produce the same stage values to solver tolerance, so no assertion on a
+    gradient, a Hessian or an order rate can tell which one ran. The dispatch is
+    therefore certified by counting, exactly as factorization reuse is (C-15.1,
+    C-16.3).
+    """
+
+    #: Calls to :meth:`newton_solve` since the last :meth:`reset_newton_count`.
+    newton_entries: int = 0
+
+    def reset_newton_count(self) -> None:
+        self.newton_entries = 0
 
     def newton_solve(
         self,
@@ -166,6 +183,8 @@ class NewtonMixin:
         """
         lu_factor = scipy.linalg.lu_factor if factor is None else factor
 
+        self.newton_entries += 1
+
         z = np.array(z0, dtype=float)
         residual = np.inf
         tol = stage_solve_tolerance(z, y_scale)
@@ -184,3 +203,57 @@ class NewtonMixin:
             z = z + scipy.linalg.lu_solve(lu, -r)
 
         raise StageSolveError(max_iter, residual, tol, context, r)
+
+
+class StageDispatchMixin(NewtonMixin):
+    """Chooses between the Newton route and the exact affine route.
+
+    Both routes take the same arguments and return the same pair, so the choice
+    is made in one place rather than repeated in each solver. Repeating it would
+    put the same three-line branch in three files, which is how two of them stay
+    correct and one does not.
+
+    The choice is driven by ``needs_newton``, which
+    :func:`~adjungo.core.requirements.deduce_requirements` computes and which,
+    before milestone M7, nothing consumed: every implicit method entered Newton
+    regardless of whether its stage equations were linear.
+
+    The default is ``True``. A solver constructed without an opinion iterates,
+    which is correct for every problem and merely slower than necessary for
+    some. The error direction is toward doing more work, never toward asserting
+    a structure the problem does not have.
+    """
+
+    #: Whether stage equations must be solved by iteration. ``False`` selects
+    #: :func:`~adjungo.solvers.linear_stage.linear_stage_solve`, which is exact
+    #: for a residual that is affine in its unknown and which verifies that
+    #: affineness by testing the residual at the value it returns.
+    needs_newton: bool = True
+
+    def solve_stage_equation(
+        self,
+        residual_fn: Callable[[NDArray], NDArray],
+        jacobian_fn: Callable[[NDArray], NDArray],
+        z0: NDArray,
+        y_scale: float = 1.0,
+        context: str = "stage solve",
+        factor: Callable[[NDArray], Any] | None = None,
+    ) -> tuple[NDArray, Any]:
+        """Solve one stage equation by whichever route the structure allows."""
+        if self.needs_newton:
+            return self.newton_solve(
+                residual_fn,
+                jacobian_fn,
+                z0,
+                y_scale=y_scale,
+                context=context,
+                factor=factor,
+            )
+        return linear_stage_solve(
+            residual_fn,
+            jacobian_fn,
+            z0,
+            y_scale=y_scale,
+            context=context,
+            factor=factor,
+        )

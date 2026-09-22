@@ -11,10 +11,10 @@ from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
 from adjungo.solvers.base import StageSolver, StepCache
 from adjungo.solvers.factorization import FactorizationStore
-from adjungo.solvers.newton import NewtonMixin, stage_context
+from adjungo.solvers.newton import StageDispatchMixin, stage_context
 
 
-class DIRKStageSolver(NewtonMixin, StageSolver):
+class DIRKStageSolver(StageDispatchMixin, StageSolver):
     """DIRK stage solver (each stage has a different diagonal element).
 
     Stages are solved one at a time in order, because ``A`` is lower
@@ -22,9 +22,17 @@ class DIRKStageSolver(NewtonMixin, StageSolver):
     """
 
     def __init__(
-        self, y_scale: float = 1.0, reuse_across_steps: bool = False
+        self,
+        y_scale: float = 1.0,
+        reuse_across_steps: bool = False,
+        needs_newton: bool = True,
     ) -> None:
         self.y_scale = y_scale
+        #: Whether stage equations are solved by iteration. Set from
+        #: :attr:`~adjungo.core.requirements.SolverRequirements.needs_newton`,
+        #: which was computed and unconsumed before milestone M7. ``False``
+        #: routes each stage through one exact linear solve.
+        self.needs_newton = needs_newton
         #: A DIRK tableau has distinct diagonal entries, so each implicit
         #: stage presents a different matrix ``I - h A[i,i] F`` even when
         #: ``F`` is constant. Keying on ``A[i,i]`` therefore gives one
@@ -119,7 +127,7 @@ class DIRKStageSolver(NewtonMixin, StageSolver):
                 eye - h * a_ii * problem.F(z, u_i, t_stage), dtype=float
             )
 
-        return self.newton_solve(
+        return self.solve_stage_equation(
             residual,
             jacobian,
             rhs,
@@ -153,7 +161,7 @@ class DIRKStageSolver(NewtonMixin, StageSolver):
           implicit, which is the defect recorded as B2.
 
         ``lu_solve(..., trans=1)`` reuses the forward factorization of
-        ``I - h A[i,i] F_i``, which :class:`NewtonMixin` computed at the
+        ``I - h A[i,i] F_i``, which the stage solve computed at the
         converged stage value.
         """
         s = method.s

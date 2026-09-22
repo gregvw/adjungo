@@ -25,7 +25,7 @@ from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
 from adjungo.solvers.base import StageSolver, StepCache
 from adjungo.solvers.factorization import FactorizationStore
-from adjungo.solvers.newton import NewtonMixin, StageSolveError
+from adjungo.solvers.newton import StageDispatchMixin, StageSolveError
 
 
 def coupled_stage_context(step: int | None, t_n: float, h: float) -> str:
@@ -76,7 +76,7 @@ def solve_coupled_transposed(factorization: Any, rhs: NDArray) -> NDArray:
     return np.asarray(solution, dtype=float).reshape(s, n)
 
 
-class ImplicitStageSolver(NewtonMixin, StageSolver):
+class ImplicitStageSolver(StageDispatchMixin, StageSolver):
     """Solve all stages of a dense-``A`` tableau simultaneously by Newton.
 
     **Forward.** The stage equations are
@@ -122,9 +122,17 @@ class ImplicitStageSolver(NewtonMixin, StageSolver):
     """
 
     def __init__(
-        self, y_scale: float = 1.0, reuse_across_steps: bool = False
+        self,
+        y_scale: float = 1.0,
+        reuse_across_steps: bool = False,
+        needs_newton: bool = True,
     ) -> None:
         self.y_scale = y_scale
+        #: Whether stage equations are solved by iteration. Set from
+        #: :attr:`~adjungo.core.requirements.SolverRequirements.needs_newton`,
+        #: which was computed and unconsumed before milestone M7. ``False``
+        #: routes each stage through one exact linear solve.
+        self.needs_newton = needs_newton
         #: The coupled Newton Jacobian is ``I - h (A kron I) blockdiag(F_j)``
         #: of size ``s*n``. With a constant ``F`` it is the same matrix at
         #: every step, so the single ``O((s*n)^3)`` factorization is taken
@@ -150,11 +158,15 @@ class ImplicitStageSolver(NewtonMixin, StageSolver):
 
         The unknown handed to Newton is the flattened ``(s·n)`` vector of all
         stage values. Reusing
-        :meth:`~adjungo.solvers.newton.NewtonMixin.newton_solve` rather than
-        writing a second iteration here means this route inherits the C-5.1
-        scaled convergence test, the C-5.4 factor-at-the-converged-iterate
-        guarantee, and the C-7 raise-on-failure behaviour, instead of
-        restating them and risking divergence between the two.
+        :meth:`~adjungo.solvers.newton.StageDispatchMixin.solve_stage_equation`
+        rather than writing a second iteration here means this route
+        inherits the C-5.1 scaled convergence test, the C-5.4
+        factor-at-the-converged-iterate guarantee, and the C-7
+        raise-on-failure behaviour, instead of restating them and risking
+        divergence between the two. It also inherits the affine route: a
+        coupled system whose ``f`` is affine in the state is solved by one
+        ``(s*n)`` linear solve, which is where avoiding Newton actually
+        pays, since assembling the coupled Jacobian costs ``s^2`` blocks.
         """
         s, n = method.s, problem.state_dim
         A, U = method.A, method.U
@@ -192,7 +204,7 @@ class ImplicitStageSolver(NewtonMixin, StageSolver):
             return J
 
         try:
-            z_flat, lu = self.newton_solve(
+            z_flat, lu = self.solve_stage_equation(
                 residual,
                 jacobian,
                 base.ravel(),

@@ -11,10 +11,10 @@ from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
 from adjungo.solvers.base import StageSolver, StepCache
 from adjungo.solvers.factorization import FactorizationStore
-from adjungo.solvers.newton import NewtonMixin, stage_context
+from adjungo.solvers.newton import StageDispatchMixin, stage_context
 
 
-class SDIRKStageSolver(NewtonMixin, StageSolver):
+class SDIRKStageSolver(StageDispatchMixin, StageSolver):
     """
     SDIRK stage solver: a constant diagonal coefficient ``γ`` means every
     implicit stage has a matrix of the same *form*, ``I - h γ F``.
@@ -51,9 +51,17 @@ class SDIRKStageSolver(NewtonMixin, StageSolver):
     """
 
     def __init__(
-        self, reuse_across_steps: bool = False, y_scale: float = 1.0
+        self,
+        reuse_across_steps: bool = False,
+        y_scale: float = 1.0,
+        needs_newton: bool = True,
     ) -> None:
         self.y_scale = y_scale
+        #: Whether stage equations are solved by iteration. Set from
+        #: :attr:`~adjungo.core.requirements.SolverRequirements.needs_newton`,
+        #: which was computed and unconsumed before milestone M7. ``False``
+        #: routes each stage through one exact linear solve.
+        self.needs_newton = needs_newton
         #: All SDIRK implicit stages share one diagonal coefficient, so with
         #: a declared-constant Jacobian every stage of every step presents
         #: the same matrix ``I - h g F`` and exactly one factorization is
@@ -135,7 +143,7 @@ class SDIRKStageSolver(NewtonMixin, StageSolver):
                         eye - h * gamma * problem.F(z, _u, _t), dtype=float
                     )
 
-                Z[i], lu = self.newton_solve(
+                Z[i], lu = self.solve_stage_equation(
                     residual,
                     jac,
                     rhs,

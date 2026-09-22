@@ -33,6 +33,7 @@ from numpy.typing import NDArray
 
 __all__ = [
     "AnchorObjective",
+    "BilinearStateAffine",
     "ConstantJacobianQuadraticControl",
     "CoupledNonlinear",
     "FullCostObjective",
@@ -414,6 +415,88 @@ class StateDependentJacobian:
         self, y: NDArray, u: NDArray, t: float, v: NDArray
     ) -> NDArray:
         return np.zeros((self.state_dim, self.control_dim))
+
+    def F_uu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return np.zeros((self.control_dim, self.control_dim))
+
+
+class BilinearStateAffine:
+    """``y' = (A + u_0 V) y + C u``: affine in the state, curved in ``(y, u)``.
+
+    This fixture exists to reach the *second-order adjoint's* curvature skip,
+    which the other affine fixtures cannot.
+
+    The distinguishing property is the pattern of nonzero curvature blocks:
+
+    ===============  =======  ====================================
+    Block            Value    Reached by
+    ===============  =======  ====================================
+    ``F_yy``         zero     ``adjoint_sensitivity``
+    ``F_yu``         nonzero  ``adjoint_sensitivity``
+    ``F_uu``         zero     ``assemble_hessian_vector_product``
+    ===============  =======  ====================================
+
+    ``ConstantJacobianQuadraticControl`` has the opposite pattern -- nonzero
+    ``F_uu`` and zero ``F_yu`` -- so a defect that wrongly skips the dynamics
+    curvature in ``adjoint_sensitivity`` alone changes nothing for it, and a
+    test built on it reports a pass. That gap was found by defect injection
+    (M7-6) and is why both fixtures are needed.
+
+    ``f`` is affine in ``y`` for fixed ``u``, so a stage equation is linear in
+    its unknown and the direct affine solve applies and verifies. ``F`` depends
+    on ``u``, so the Jacobian is *not* constant and no factorization may be
+    reused across stages; that keeps this fixture from also depending on the
+    M6 route.
+    """
+
+    state_dim = 3
+    control_dim = 2
+
+    A = np.array(
+        [
+            [-0.55, 0.90, 0.20],
+            [-0.30, -0.40, 0.75],
+            [0.10, -0.50, -0.95],
+        ]
+    )
+    V = np.array(
+        [
+            [0.25, -0.40, 0.10],
+            [0.60, 0.15, -0.30],
+            [-0.20, 0.35, 0.45],
+        ]
+    )
+    C = np.array([[1.0, 0.0], [0.30, 1.0], [-0.20, 0.45]])
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return (self.A + u[0] * self.V) @ y + self.C @ u
+
+    def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.A + u[0] * self.V
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        out = self.C.copy()
+        out[:, 0] = out[:, 0] + self.V @ y
+        return out
+
+    def F_yy_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return np.zeros((self.state_dim, self.state_dim))
+
+    def F_yu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        """``[j, k] = sum_l v_l d2f_l/(dy_j du_k)``.
+
+        Only ``k = 0`` contributes, and ``d2f_l/(dy_j du_0) = V[l, j]``, so
+        column 0 is ``V^T v`` and column 1 is zero.
+        """
+        out = np.zeros((self.state_dim, self.control_dim))
+        out[:, 0] = self.V.T @ v
+        return out
 
     def F_uu_action(
         self, y: NDArray, u: NDArray, t: float, v: NDArray

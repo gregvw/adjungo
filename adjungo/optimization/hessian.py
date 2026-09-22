@@ -3,9 +3,10 @@
 import numpy as np
 from numpy.typing import NDArray
 
+from adjungo.core.affine import affine_dynamics_verified
 from adjungo.core.method import GLMethod
 from adjungo.core.objective import Objective
-from adjungo.core.problem import Problem
+from adjungo.core.problem import Problem, ProblemStructure
 from adjungo.stepping.adjoint import AdjointTrajectory
 from adjungo.stepping.sensitivity import (
     AdjointSensitivityTrajectory,
@@ -26,6 +27,7 @@ def assemble_hessian_vector_product(
     problem: Problem,
     h: float,
     t0: float = 0.0,
+    structure: "ProblemStructure | None" = None,
 ) -> NDArray:
     """
     Assemble the Hessian-vector product by differentiating the gradient.
@@ -80,12 +82,36 @@ def assemble_hessian_vector_product(
             ``F_uu_action``. Skipping the curvature terms would return a
             Gauss-Newton-like approximation while claiming an exact Hessian.
     """
-    for name in ("F_yu_action", "F_uu_action"):
-        if getattr(problem, name, None) is None:
-            raise NotImplementedError(
-                f"exact Hessian-vector products require problem.{name}(); "
-                f"{type(problem).__name__} does not provide it"
-            )
+    # Both conditions are required, and the second is the load-bearing one.
+    #
+    # ``structure`` is a public constructor argument of GLMOptimizer, so
+    # ``jointly_affine=True`` can be *declared* by any caller for any problem.
+    # Unlike the constant-Jacobian declaration of M6, that claim has no cheap
+    # exact check: the residual test inside the affine stage solve establishes
+    # that ``f`` is affine in the *state*, and says nothing about curvature in
+    # the control. A problem with ``f = M y + b(u)`` would pass every stage
+    # check and still have a nonzero ``f_uu``, so believing the declaration
+    # alone would return a Gauss-Newton approximation from a function that
+    # promises an exact Hessian. That is the shape of precedent R-9, and it is
+    # what clause C-16.5 forbids.
+    #
+    # ``affine_dynamics_verified`` is not a declaration. It checks that the
+    # problem is an AffineDynamics whose guaranteeing methods are still the
+    # ones that class defines, by object identity. A declaration that fails it
+    # simply does not open the skip: the terms are computed, the callbacks are
+    # required, and the caller gets more work rather than a wrong answer.
+    skip_dynamics_curvature = (
+        structure is not None
+        and structure.jointly_affine
+        and affine_dynamics_verified(problem)
+    )
+    if not skip_dynamics_curvature:
+        for name in ("F_yu_action", "F_uu_action"):
+            if getattr(problem, name, None) is None:
+                raise NotImplementedError(
+                    f"exact Hessian-vector products require problem.{name}(); "
+                    f"{type(problem).__name__} does not provide it"
+                )
 
     N, s, _nu = u.shape
     hvp = np.zeros_like(u)
@@ -107,6 +133,9 @@ def assemble_hessian_vector_product(
             # +h G_k^T δΛ_k (adjoint sensitivity contribution)
             delta_Lambda_k = adj_sensitivity.delta_WeightedAdj[step, k]
             hvp[step, k] += h * cache.G[k].T @ delta_Lambda_k
+
+            if skip_dynamics_curvature:
+                continue
 
             # +h (F_yu[Λ_k])^T δZ_k
             F_yu_Lambda = np.asarray(

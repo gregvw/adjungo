@@ -5,6 +5,7 @@ from collections.abc import Callable
 import numpy as np
 from numpy.typing import NDArray
 
+from adjungo.core.affine import affine_dynamics_verified
 from adjungo.core.method import GLMethod, StageType
 from adjungo.core.objective import Objective
 from adjungo.core.problem import Linearity, Problem, ProblemStructure
@@ -111,6 +112,11 @@ class GLMOptimizer:
         # Deduce problem structure if not provided
         if problem_structure is None:
             problem_structure = self._deduce_problem_structure()
+        #: Retained because the second-order path reads it: a problem whose
+        #: dynamics are affine by construction has identically zero
+        #: dynamics-curvature blocks, and the terms they would contribute are
+        #: skipped rather than computed as additions of zero.
+        self.problem_structure = problem_structure
 
         # Deduce requirements and create appropriate solver
         self.requirements = deduce_requirements(
@@ -158,6 +164,23 @@ class GLMOptimizer:
             callable(getattr(self.problem, name, None))
             for name in second_derivative_hooks
         )
+
+        # Affineness is established by construction, never by declaration: the
+        # problem must *be* an unmodified AffineDynamics, which computes f, F
+        # and G from coefficient arrays it owns. There is no cheap exact check
+        # that an opaque callback has zero curvature -- sampling f would be a
+        # probe, and generalising a probe from visited to unvisited points is
+        # precedent R-9 -- so no flag is offered for it. See
+        # adjungo.core.affine.
+        if affine_dynamics_verified(self.problem):
+            return ProblemStructure(
+                linearity=Linearity.LINEAR,
+                jacobian_constant=True,
+                jacobian_control_dependent=False,
+                has_second_derivatives=True,
+                state_affine=True,
+                jointly_affine=True,
+            )
 
         # Only a problem that declares linearity may claim a constant Jacobian.
         jacobian_constant = linearity is Linearity.LINEAR
@@ -276,6 +299,7 @@ class GLMOptimizer:
             self.h,
             self.t_span[0],
             self.objective,
+            structure=self.problem_structure,
         )
 
         return assemble_hessian_vector_product(
@@ -290,6 +314,7 @@ class GLMOptimizer:
             self.problem,
             self.h,
             self.t_span[0],
+            structure=self.problem_structure,
         )
 
     def scipy_interface(

@@ -19,6 +19,19 @@ def create_stage_solver(
     """
     Decision tree from linalg_requirements.tex Section 6.
 
+    Three independent axes decide the route, and merging them is how a wrong
+    rule gets written:
+
+    * the **tableau** fixes the shape of the solve -- none, sequential, or one
+      coupled ``(s*n)`` system -- and is known statically from ``GLMethod``;
+    * the **vector field** decides whether that solve is linear, through
+      ``requirements.needs_newton``;
+    * the **linear algebra** decides how the assembled matrix is represented
+      and factored. Eligibility for a specialised factorization is a property
+      of the assembled matrix, never of the tableau. ``K = I - h A (x) F`` is
+      not symmetric for a general ``F``, so no tableau classification can
+      establish that a Cholesky factorization applies.
+
     Args:
         method: GLM tableau
         requirements: Deduced solver requirements
@@ -37,16 +50,19 @@ def create_stage_solver(
         return SDIRKStageSolver(
             reuse_across_steps=requirements.can_reuse_across_steps,
             y_scale=y_scale,
+            needs_newton=requirements.needs_newton,
         )
 
     if method.stage_type == StageType.DIRK:
         return DIRKStageSolver(
             y_scale=y_scale,
             reuse_across_steps=requirements.can_reuse_across_steps,
+            needs_newton=requirements.needs_newton,
         )
 
     # Fully implicit (dense A): one coupled (s*n) Newton solve per step.
     return ImplicitStageSolver(
         y_scale=y_scale,
         reuse_across_steps=requirements.can_reuse_across_steps,
+        needs_newton=requirements.needs_newton,
     )

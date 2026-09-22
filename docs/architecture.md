@@ -52,7 +52,12 @@ adjungo/
     problem.py         Problem protocol: f, F=df/dy, G=df/du, and the three
                        second-derivative actions F_yy[w], F_yu[w], F_uu[w].
                        ProblemStructure: the caller's declaration of linearity,
-                       Jacobian constancy and control dependence.
+                       Jacobian constancy, control dependence, and the two
+                       affineness axes state_affine and jointly_affine.
+    affine.py          AffineDynamics: y' = M y + C u + b as a representation
+                       rather than a claim. Affineness is established by
+                       construction, so it needs no verification the way a
+                       declaration does.
     objective.py       Objective protocol: terminal and running cost, their
                        first derivatives, and their second-derivative actions.
     method.py          GLMethod: tableaux A, U, B, V, abscissae c; StageType
@@ -73,7 +78,12 @@ adjungo/
     sdirk.py           A lower triangular with constant diagonal: one n-by-n
                        factorization per step, shared by all stages.
     implicit.py        A dense: one (s*n)-by-(s*n) coupled Newton solve.
-    newton.py          Newton iteration with explicit convergence criteria.
+    newton.py          Newton iteration with explicit convergence criteria,
+                       and StageDispatchMixin, which chooses between it and
+                       the affine route from requirements.needs_newton.
+    linear_stage.py    linear_stage_solve: one exact solve for a stage
+                       equation affine in its unknown, verified by testing
+                       the residual at the value it returns.
     factorization.py   FactorizationStore: declaration-gated LU reuse,
                        verified by exact comparison, with the counters
                        C-15 certifies.
@@ -217,7 +227,9 @@ Stated here so that this document cannot be read as advertising.
 | `r > 1` multistep | Tableaux retained; refused. Needs a certified starting procedure. |
 | Partitioned methods (PRK, Nystrom) | Not built. |
 | Sparse or matrix-free linear algebra | Not built. `algebra/protocols.py` is the seam it would enter through. |
-| Reuse for a *varying* Jacobian (modified Newton, lagged Jacobian) | Not built, and not planned without an application benchmark. It would trade exactness for cost, which C-2 does not permit by default. |
+| Reuse for a *varying* Jacobian (modified Newton, lagged Jacobian) | Not built. The refusal is narrower than it first appears and is stated precisely below. |
+| Sparse or specialised factorization of `K` | Not built. Eligibility is a property of the **assembled matrix**, never of the tableau: `K = I - h(A (x) I)blockdiag(F_j)` is not symmetric for a general `F`, so no tableau classification can establish that Cholesky applies. |
+| Time-varying or nonlinear-in-control affine coefficients | Not built. `AffineDynamics` holds constant `M`, `C`, `b`. `f = M(t)y + C(t)u + b(t)` is the natural next case and needs no new argument, only new code. |
 | Checkpointing | Not built. Storage is `O(N s n)`, everything retained. |
 | Generic scalar type | A C++ concern, not a Python one. See below. |
 
@@ -260,6 +272,54 @@ of what must carry forward; it currently has nine items. The short version:
     reuse is invisible to every accuracy test, working or broken, because
     refactoring the same matrix gives the same answer. See C-15.
 
-Ergonomics that need not carry forward: the Python `Problem` protocol currently
-requires a linear problem to supply three second-derivative callbacks that
-return zero. A C++ interface should default them.
+11. **Keep tableau structure, vector-field structure, and linear algebra as
+    three separate inputs.** The tableau fixes the *shape* of the solve and is
+    known statically. The vector field decides whether that solve is *linear*.
+    The linear algebra decides how the assembled matrix is represented and
+    factored. Merging any two of them produces a rule that is right for the
+    cases that motivated it and silently wrong elsewhere. Two concrete
+    instances: `Linearity.LINEAR` classifies the state Jacobian and says
+    nothing about `f_uu`, so it must never gate a curvature skip; and Cholesky
+    eligibility is a property of the assembled `K`, which is not symmetric for
+    a general `F`, so no tableau classification can establish it.
+
+12. **Establish structure by construction where verification is not
+    available.** Item 10 accepts a declaration because it can check one:
+    comparing two assembled matrices is `O(n^2)` against an `O(n^3)`
+    factorization. No comparably cheap check exists for "the dynamics have
+    zero curvature", and sampling `f` to infer it is the R-9 mistake. So the
+    zero-curvature route is opened only by an object that *owns* `M`, `C`, `b`
+    and computes `f`, `F`, `G` from them, never by a caller-set flag. A C++
+    reimplementation can enforce this far better than Python can, by making
+    the coefficient-owning type `final`.
+
+### Modified Newton: the refusal is narrower than it looks
+
+The "not built" table above refuses lagged and modified Jacobians. The reason
+is often misstated, including in earlier drafts of this document, so it is
+worth being exact.
+
+An approximate **iteration** matrix does not cost accuracy. Newton with a stale
+or preconditioned Jacobian converges to the *same* stage values, because the
+stage equation being solved is unchanged; only the convergence rate differs.
+Used that way, modified Newton and preconditioning are legitimate, and an
+implementation is free to add them.
+
+What is prohibited is letting the approximate iteration matrix silently
+*become* the derivative operator. Clause C-5.4 requires the adjoint to apply
+the transpose of the true Jacobian at the converged stage value. An
+implementation that lags the Newton matrix must therefore factor the true
+Jacobian once at the solution for the derivative sweeps to use, and pay for it.
+The defect recorded in item 4 above is exactly this confusion: dropping the
+off-diagonal blocks gives a quasi-Newton iteration that converges correctly and
+then hands its own approximate factorization to the adjoint.
+
+The same distinction sets the solve tolerance requirement. The stage values may
+be obtained to a tolerance; the derivative solves must use the true operator.
+
+Ergonomics that need not carry forward: the Python `Problem` protocol requires
+a general callback problem to supply three second-derivative callbacks even
+when they return zero. A problem expressed as `adjungo.core.affine`'s
+`AffineDynamics` no longer needs them, because the terms are known to vanish
+and are skipped; a C++ interface should make that the default for every
+structurally known zero.

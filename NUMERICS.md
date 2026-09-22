@@ -1013,6 +1013,222 @@ reached with something it should have rejected.
 
 ---
 
+<a id="c-16"></a>
+## C-16 Structure-aware dispatch is certified by route, not by accuracy — `APPROVED`
+
+### C-16.1 Three axes decide the route, and they may not be merged
+
+Solver selection reads three independent inputs:
+
+| Axis | Decides | Known from |
+|---|---|---|
+| Tableau structure | the shape of the solve: none, sequential, or one coupled `(s·n)` system | `GLMethod`, statically |
+| Vector-field structure | whether that solve is linear, and which curvature blocks vanish | the problem representation |
+| Linear algebra | how the assembled matrix is represented and factored | the assembled matrix |
+
+Merging two of them produces a rule that is correct for the cases that
+motivated it and silently wrong elsewhere. Two consequences are normative:
+
+- **`Linearity.LINEAR` may never gate a curvature skip.** That member is
+  documented as "F independent of y, u", which permits
+  `f(y,u,t) = M(t)y + b(u,t)` with `b` arbitrary in `u`, so `f_uu` need not
+  vanish. The in-tree counterexample is
+  `tests/problems.py::ConstantJacobianQuadraticControl`, which is `f = A y +
+  B(u∘u)`: constant `F`, and `F_uu_action` returning `2 diag(Bᵀv)`. A rule
+  reading `LINEAR` as permission to drop curvature would make
+  `assemble_hessian_vector_product` return a Gauss-Newton approximation while
+  its docstring promises an exact Hessian, violating [C-2](#c-2).
+- **Eligibility for a specialised factorization is a property of the assembled
+  matrix, never of the tableau.** `K = I − h(A ⊗ I)blockdiag(F_j)` is not
+  symmetric for a general `F`, so no tableau classification can establish that
+  a Cholesky factorization applies. A route that inferred it from the tableau
+  would be deciding positive-definiteness by looking at the wrong object.
+
+### C-16.2 Where a declaration cannot be verified, structure must be constructed
+
+[C-15.2](#c-15) accepts a caller's declaration of a constant Jacobian because
+it can *verify* it: comparing two assembled matrices costs `O(n²)` and guards
+an `O(n³)` factorization, so the check is asymptotically cheaper than the work
+it protects.
+
+No comparably cheap exact check exists for "the dynamics have identically zero
+curvature". Evaluating `f` at sample points and inferring affineness is a
+**probe**, and generalising a probe from visited points to unvisited ones is
+precedent [R-9](#r-9).
+
+Therefore the zero-curvature route is **not** opened by a boolean. It is opened
+only by a representation that owns `M`, `C`, `b` and computes `f`, `F`, `G`
+from them (`adjungo.core.affine.AffineDynamics`), checked by
+`affine_dynamics_verified`, which confirms by object identity that every method
+carrying the guarantee is still the one that class defines. A subclass that
+replaces any of them is refused.
+
+`ProblemStructure.jointly_affine` remains a public field, and a caller may set
+it. It is **not sufficient**: both the field and the construction check are
+required at the skip site. A declaration that fails the check causes more work,
+never a wrong answer — the terms are computed and the callbacks are required.
+
+The state-affine claim *is* separately verifiable and is separately verified;
+see C-16.4.
+
+### C-16.3 The dispatch is invisible to every accuracy test — `OBSERVED`
+
+Both optimisations in this clause are undetectable by any numerical assertion:
+
+| Optimisation | Why no accuracy test sees it |
+|---|---|
+| Direct affine stage solve instead of Newton | Both routes reach the same stage values — Newton to its C-5.1 threshold, the direct solve exactly — so gradients, Hessians and observed order rates agree either way |
+| Skipping identically zero curvature | The skipped terms are additions of exact zero, so the result is bit-identical |
+
+The certified quantities are therefore the **route** and the **count**, as in
+[C-15.3](#c-15). Measured on `AffineDynamics` with `n = 3`, `ν = 2`, `N = 6`,
+one gradient evaluation:
+
+| Method | `s` | Implicit stages | Newton entries before | after | Factorizations before | after |
+|---|---|---|---|---|---|---|
+| `implicit_midpoint` | 1 | 1 | 6 | **0** | 1 | 1 |
+| `implicit_trapezoid` | 2 | 1 | 6 | **0** | 1 | 1 |
+| `sdirk2` | 2 | 2 | 12 | **0** | 1 | 1 |
+| `sdirk3` | 3 | 3 | 18 | **0** | 1 | 1 |
+| `gauss2` | 2 | 1 coupled | 6 | **0** | 1 | 1 |
+
+Both "before" columns are measured with `ProblemStructure(SEMILINEAR,
+jacobian_constant=True, ...)`, which keeps C-15 reuse enabled and only forces
+the Newton route; otherwise the comparison would credit M7 with M6's work. The
+Newton counts are `N` times the number of implicit stage *solves* per step,
+which is one per implicit stage for the sequential families and one coupled
+solve for `gauss2`.
+
+The factorization columns are identical, and saying so matters: **M7 is not a
+factorization milestone.** C-15 already reduced these to 1. What M7 removes per
+stage is one Jacobian evaluation, one store lookup, and the iteration
+machinery, and with it the C-5.3 stage-failure mode, which cannot arise for a
+direct solve. The saving is real and modest for the `n × n` families; it is
+larger for a coupled tableau, where assembling `K` costs `s²` blocks.
+
+`needs_newton` was computed by `deduce_requirements` and consumed by nothing
+for the whole life of the project before this clause, so every implicit method
+entered Newton regardless of its value. That is [C-15.1](#c-15)'s lesson
+recurring: correctness of a gate that nothing reads is not evidence that the
+gate is correct.
+
+### C-16.4 The affine route must verify what it assumes — `APPROVED`
+
+`linear_stage_solve` factors `dR/dz` at its **starting point**, not at the
+value it returns. That is admissible under [C-5.4](#c-5) only because for an
+affine `f` the Jacobian is independent of the state, making the two matrices
+identical element for element rather than merely close.
+
+That argument depends on `f` actually being affine, so it is checked, not
+assumed. After computing `z`, the residual `R(z)` is evaluated and tested
+against the same scaled C-5.1 threshold Newton would have used. For an affine
+residual it is zero up to the backward error of the linear solve; otherwise
+`NonAffineStageEquation` is raised.
+
+This is a check rather than a probe: it evaluates the residual at the point the
+computation actually uses and generalises nothing. Its cost is one extra
+evaluation of `f`, `O(n²)` for a dense problem, guarding an `O(n³)` solve. Its
+error direction is toward refusal.
+
+### C-16.5 Completeness must be established at the boundary — `APPROVED`
+
+A count proves only that the counted route was not taken. Two facts in this
+clause are therefore asserted by **tripwire**:
+
+- `NewtonMixin.newton_solve` is replaced with a function that raises, and the
+  affine gradient must still compute. This reaches any path to Newton, not
+  only the one the counter instruments.
+- The three contracted-Hessian callbacks are replaced **on the instance** with
+  functions that raise. Affineness is verified from the class, so the problem
+  stays verified while any actual call fails.
+
+This requirement exists because [C-15.6](#c-15)'s injection round nearly missed
+a Newton call that bypassed the factorization store: the count was taken at the
+store, the bypassing call never reached it, and the answers were unchanged
+because it factored the same matrix.
+
+### C-16.6 Skipping zero curvature must reproduce the computed result exactly — `APPROVED`
+
+Enabling the skip must change **no** number, and the required agreement is
+bit-identity.
+
+As with [C-15.4](#c-15) this is not a pinned float and does not conflict with
+[C-11](#c-11): nothing is recorded, and the claim is about two computations
+performed in the same test. The skipped terms are `h·F_yu[Λ]ᵀδZ` and
+`h·F_uu[Λ]δu` with the contracted Hessians identically zero, so the skip
+removes `x + 0.0`, which is `x` in IEEE-754 for every `x` this code produces.
+The argument holds on any platform and under any BLAS.
+
+**Objective curvature is never skipped.** An affine plant under a quadratic
+cost has a perfectly nonzero Hessian; only the contribution of the *dynamics*
+second derivatives vanishes.
+
+### C-16.7 Modified Newton is not prohibited; misusing it is
+
+An approximate Newton **iteration** matrix — lagged, preconditioned, or with
+blocks dropped — converges to the *same* stage values and costs convergence
+rate, not accuracy. It is permitted.
+
+What is prohibited is allowing that approximate matrix to become the
+**derivative operator**. [C-5.4](#c-5) requires the adjoint to apply the
+transpose of the true Jacobian at the converged stage value, so an
+implementation that lags the Newton matrix must factor the true Jacobian once
+at the solution and pay for it. The defect in [C-13](#c-13) item 4 is exactly
+this confusion.
+
+This clause corrects a broader statement in `docs/architecture.md`, which
+refused modified Newton outright on the grounds that it trades exactness for
+cost. That is true only of the derivative solve.
+
+### C-16.8 Injection evidence — `OBSERVED`
+
+Baseline 442 passed, 0 failed. Each defect introduced alone, under the
+[R-11](#r-11) cache-clearing procedure:
+
+| Defect | Failures |
+|---|---|
+| the dispatch ignores `needs_newton` and always iterates | 10 |
+| the affine solve omits its residual verification | 1 |
+| the affine solve applies the Newton step with the wrong sign | 50 |
+| verification accepts any `AffineDynamics`, overridden or not | 6 |
+| the Hessian's curvature skip believes the declaration alone | 4 |
+| the second-order adjoint's skip believes the declaration alone | 3 |
+| the skip also drops the *objective* curvature term | 12 |
+| `LINEAR` is read as implying zero dynamics curvature | 1 |
+| the affine coefficients alias the caller's arrays | 1 |
+| `jointly_affine` no longer implies `state_affine` | 1 |
+| `needs_newton` ignores `state_affine` | 1 |
+| a stage-solver constructor default stops being conservative | 1 |
+| the dispatch class attribute stops being conservative | 1 |
+| the stage factorization is taken from a perturbed matrix | 50 |
+
+**Three of these initially went undetected, and two of the three share a
+cause: a population that cannot reach the defect.**
+
+1. *The second-order adjoint's skip.* `adjoint_sensitivity` reads `F_yy` and
+   `F_yu`; `assemble_hessian_vector_product` reads `F_yu` and `F_uu`. Every
+   affine fixture in the suite had zero `F_yu`, so wrongly skipping in the
+   first changed no number at all. The cure is
+   `tests/problems.py::BilinearStateAffine`, `f = (A + u_0 V)y + C u`, which
+   has nonzero `F_yu` and zero `F_uu` — the opposite pattern to
+   `ConstantJacobianQuadraticControl`. **Two skips that consume different
+   blocks need a fixture per block, not a fixture per route.**
+
+2. *`LINEAR` read as implying zero curvature.* C-16.1's counterexample was
+   pinned by a test, and the test still passed, because
+   `ConstantJacobianQuadraticControl` declares no `linearity` attribute and is
+   therefore deduced `NONLINEAR`. The counterexample never travelled the
+   `LINEAR` branch where the dangerous rule lives. **Pinning a counterexample
+   is not the same as routing it through the code that could misuse it.**
+
+3. *The conservative constructor default.* The factory always passes an
+   explicit `needs_newton`, so no end-to-end test reaches the default and no
+   behavioural test could. It is now asserted directly, which is
+   [C-15.1](#c-15) once more: a value that nothing reads is not evidenced by
+   being correct.
+
+---
+
 ## Open questions
 
 | ID | Question | Blocks |
