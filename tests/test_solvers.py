@@ -97,7 +97,11 @@ def test_sdirk_solver_basic():
     Z, cache = solver.solve_stages(y_history, u_stages, t_n, h, problem, method)
 
     assert Z.shape == (2, 2)
-    assert cache.factorization is not None  # Should have cached factorization
+    # sdirk2 has one explicit and one implicit stage, so exactly one
+    # factorization is cached and the explicit stage holds None.
+    assert cache.stage_factorizations is not None
+    assert len(cache.stage_factorizations) == 2
+    assert sum(lu is not None for lu in cache.stage_factorizations) >= 1
     assert len(cache.F) == 2
     assert len(cache.G) == 2
 
@@ -139,8 +143,12 @@ def test_solver_cache_structure():
     assert hasattr(cache, "Z")
     assert hasattr(cache, "F")
     assert hasattr(cache, "G")
-    assert hasattr(cache, "factorization")
+    assert hasattr(cache, "stage_factorizations")
     assert hasattr(cache, "stage_matrix")
+
+    # An explicit method solves no linear systems, so it caches no
+    # factorizations. Asserting only `hasattr` would pass for any value.
+    assert cache.stage_factorizations is None
 
     # Verify dimensions
     assert cache.Z.shape == (4, 2)

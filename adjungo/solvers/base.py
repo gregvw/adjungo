@@ -13,17 +13,38 @@ if TYPE_CHECKING:
 
 @dataclass
 class StepCache:
-    """Cached data from forward solve, reused in adjoint/sensitivity."""
+    """Cached data from forward solve, reused in adjoint/sensitivity.
+
+    ``stage_factorizations[i]`` holds the LU factorization of the stage
+    matrix ``I - h A[i,i] F_i`` evaluated at the **converged** stage value
+    ``Z[i]``, or ``None`` when stage ``i`` is explicit (``A[i,i] == 0``). The
+    adjoint and the tangent both reuse it, the adjoint via
+    ``lu_solve(..., trans=1)``.
+
+    Storing one factorization per stage rather than a single object per step
+    keeps the operator each stage used attributable. Entries are **never**
+    shared between stages: precedent R-9 records a defect in which one
+    stage's factorization was published for every stage of the step, giving
+    the adjoint the transpose of the wrong matrix.
+    """
 
     Z: NDArray                          # (s, n) stage values
     F: list[NDArray]                    # s Jacobians, each (n, n)
     G: list[NDArray]                    # s control Jacobians, each (n, ν)
-    factorization: Any | None = None # LU of stage matrix (reusable)
+    stage_factorizations: list[Any] | None = None
     stage_matrix: NDArray | None = None
 
 
 class StageSolver(ABC):
-    """Solves the stage equations for one time step."""
+    """Solves the stage equations for one time step.
+
+    ``y_scale`` is the characteristic state magnitude used by the C-5.1
+    stage-convergence test. It is **captured at construction** and never
+    re-read from mutable state, so the threshold a stage is certified against
+    is the same one the route was configured with.
+    """
+
+    y_scale: float = 1.0
 
     @abstractmethod
     def solve_stages(
@@ -34,6 +55,7 @@ class StageSolver(ABC):
         h: float,
         problem: "Problem",
         method: "GLMethod",
+        step: int | None = None,
     ) -> tuple[NDArray, StepCache]:
         """
         Solve stage equations for one time step.
@@ -45,6 +67,8 @@ class StageSolver(ABC):
             h: Step size
             problem: Problem specification
             method: GLM tableau
+            step: Index of this time step, used only to locate a stage
+                failure in the message required by NUMERICS.md C-5.3
 
         Returns:
             Z: Internal stage values (s, n)

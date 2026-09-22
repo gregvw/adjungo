@@ -8,7 +8,6 @@ This serves as a stepping stone to multistep methods:
 """
 
 import numpy as np
-import pytest
 from scipy.linalg import expm
 from scipy.optimize import minimize
 
@@ -206,18 +205,16 @@ def test_crank_nicolson_lti_observed_order():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="U-M2.1: the DIRK adjoint never applies (I - h*a_ii*F_i)^T, so it "
-           "adjoints an explicit method while the forward solve ran implicit. "
-           "Compounded by U-M1.1 (wrong stage Jacobian in the adjoint coupling "
-           "term). Central differences plateau at 1.97716e-4 independently of "
-           "eps, which per C-3.3 proves the adjoint is not the derivative of "
-           "the implemented discrete objective. Remove this marker when M2 "
-           "lands; xfail_strict will flag it as XPASS.",
-)
 def test_crank_nicolson_lti_gradient_validation():
-    """Test adjoint gradient against finite differences for LTIC."""
+    """Test adjoint gradient against finite differences for LTIC.
+
+    Cured by unit U-M2.1 together with U-M1.1. Two defects compounded here:
+    the DIRK adjoint never applied ``(I - h a_ii F_i)^T``, so it adjointed an
+    explicit method while the forward solve ran implicit; and the adjoint
+    coupling term used the wrong stage Jacobian. Central differences
+    plateaued at 1.97716e-4 independently of ε, which per C-3.3 proves the
+    adjoint was not the derivative of the implemented discrete objective.
+    """
     # Simple scalar system for easy debugging
     A = np.array([[-0.5]])
     B = np.array([[1.0]])

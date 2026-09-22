@@ -1,18 +1,26 @@
 """DIRK stage solver."""
 
+from typing import Any
+
 import numpy as np
+import scipy.linalg
 from numpy.typing import NDArray
 
 from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
 from adjungo.solvers.base import StageSolver, StepCache
+from adjungo.solvers.newton import NewtonMixin, stage_context
 
 
-class DIRKStageSolver(StageSolver):
-    """DIRK stage solver (each stage has different diagonal element)."""
+class DIRKStageSolver(NewtonMixin, StageSolver):
+    """DIRK stage solver (each stage has a different diagonal element).
 
-    def __init__(self) -> None:
-        self._f_cached: list[NDArray] = []
+    Stages are solved one at a time in order, because ``A`` is lower
+    triangular: stage ``i`` depends only on stages ``j < i``.
+    """
+
+    def __init__(self, y_scale: float = 1.0) -> None:
+        self.y_scale = y_scale
 
     def solve_stages(
         self,
@@ -22,48 +30,88 @@ class DIRKStageSolver(StageSolver):
         h: float,
         problem: Problem,
         method: GLMethod,
+        step: int | None = None,
     ) -> tuple[NDArray, StepCache]:
-        """Solve DIRK stages."""
+        """Solve the DIRK stage equations.
+
+        Stage ``i`` satisfies
+
+            Z_i - h A[i,i] f(Z_i, u_i, t_i) = U[i] y^[n] + h Σ_{j<i} A[i,j] f_j
+
+        which is solved by Newton for a general nonlinear ``f``.
+
+        This previously linearized: it assumed ``f(z, u, t) = F z + G u`` and
+        solved ``(I - h a_ii F) Z_i = rhs + h a_ii G u_i`` with ``F`` and
+        ``G`` frozen at ``rhs``. That is exact only for a linear time-
+        invariant problem, and for any other problem it silently integrated a
+        different equation. It is also the reason the nonlinear DIRK test was
+        skipped rather than failing.
+        """
         s, n = method.s, problem.state_dim
 
         Z = np.zeros((s, n))
         F_list: list[NDArray] = []
         G_list: list[NDArray] = []
-        self._f_cached = [np.zeros(n) for _ in range(s)]
+        factorizations: list[Any] = []
+        f_cached = [np.zeros(n) for _ in range(s)]
 
         for i in range(s):
             t_stage = t_n + method.c[i] * h
+            a_ii = method.A[i, i]
 
-            # Build RHS
             rhs = method.U[i] @ y_history
             for j in range(i):
-                rhs += h * method.A[i, j] * self._f_cached[j]
+                rhs = rhs + h * method.A[i, j] * f_cached[j]
 
-            if np.isclose(method.A[i, i], 0):
-                # Explicit stage
+            if np.isclose(a_ii, 0):
                 Z[i] = rhs
+                factorizations.append(None)
             else:
-                # Implicit stage: Z_i = rhs + h * a_ii * f(Z_i, u_i)
-                # For linear problems: Z_i = rhs + h * a_ii * (F * Z_i + G * u_i)
-                # Rearranging: (I - h * a_ii * F) * Z_i = rhs + h * a_ii * G * u_i
+                Z[i], lu = self._solve_implicit_stage(
+                    rhs, u_stages[i], t_stage, h, a_ii, n, problem, i, step
+                )
+                factorizations.append(lu)
 
-                # Get Jacobians (for LTI, these are constant)
-                F_matrix = problem.F(rhs, u_stages[i], t_stage)
-                G_matrix = problem.G(rhs, u_stages[i], t_stage)
-
-                # Build implicit system
-                gamma = method.A[i, i]
-                I_minus_gamma_hF = np.eye(n) - h * gamma * F_matrix
-                rhs_implicit = rhs + h * gamma * (G_matrix @ u_stages[i])
-
-                # Solve linear system
-                Z[i] = np.linalg.solve(I_minus_gamma_hF, rhs_implicit)
-
-            self._f_cached[i] = problem.f(Z[i], u_stages[i], t_stage)
+            f_cached[i] = problem.f(Z[i], u_stages[i], t_stage)
             F_list.append(problem.F(Z[i], u_stages[i], t_stage))
             G_list.append(problem.G(Z[i], u_stages[i], t_stage))
 
-        return Z, StepCache(Z=Z, F=F_list, G=G_list)
+        return Z, StepCache(
+            Z=Z, F=F_list, G=G_list, stage_factorizations=factorizations
+        )
+
+    def _solve_implicit_stage(
+        self,
+        rhs: NDArray,
+        u_i: NDArray,
+        t_stage: float,
+        h: float,
+        a_ii: float,
+        n: int,
+        problem: Problem,
+        stage: int,
+        step: int | None,
+    ) -> tuple[NDArray, Any]:
+        """Newton-solve ``z - h a_ii f(z, u_i, t) = rhs``."""
+        eye = np.eye(n)
+
+        def residual(z: NDArray) -> NDArray:
+            return np.asarray(
+                z - h * a_ii * problem.f(z, u_i, t_stage) - rhs, dtype=float
+            )
+
+        def jacobian(z: NDArray) -> NDArray:
+            return np.asarray(
+                eye - h * a_ii * problem.F(z, u_i, t_stage), dtype=float
+            )
+
+        return self.newton_solve(
+            residual,
+            jacobian,
+            rhs,
+            y_scale=self.y_scale,
+            context=stage_context("DIRK", stage, step, t_stage),
+        )
 
     def solve_adjoint_stages(
         self,
@@ -72,21 +120,24 @@ class DIRKStageSolver(StageSolver):
         method: GLMethod,
         h: float,
     ) -> NDArray:
-        """Solve adjoint stages for DIRK.
+        """Solve the adjoint stage equations for DIRK.
 
         Differentiating the stage equations gives
 
             (I - h A[i,i] F_i^T) μ_i = h F_i^T ( Σ_{j>i} A[j,i] μ_j
                                                  + Σ_l B[l,i] λ_l )
 
-        Note that ``F_i`` (not ``F_j``) multiplies the whole weighted sum:
-        ``Z_i`` enters every stage equation only through ``f(Z_i, ...)``.
+        Two points, each previously wrong:
 
-        KNOWN DEFECT (NUMERICS.md finding B2): the transposed stage solve
-        ``(I - h A[i,i] F_i^T)^{-1}`` is not applied here, so this routine
-        is correct only when every diagonal entry ``A[i,i]`` vanishes.  The
-        cure is tracked as unit U-M2.1; see ``sdirk.py`` for the
-        ``lu_solve(..., trans=1)`` pattern it needs.
+        * ``F_i`` (not ``F_j``) multiplies the whole weighted sum, because
+          ``Z_i`` enters every stage equation only through ``f(Z_i, ...)``.
+        * The transposed stage solve on the left must actually be applied.
+          Omitting it adjoints an explicit method while the forward solve ran
+          implicit, which is the defect recorded as B2.
+
+        ``lu_solve(..., trans=1)`` reuses the forward factorization of
+        ``I - h A[i,i] F_i``, which :class:`NewtonMixin` computed at the
+        converged stage value.
         """
         s = method.s
         n = cache.Z.shape[1]
@@ -98,6 +149,16 @@ class DIRKStageSolver(StageSolver):
             weighted = B[:, i] @ lambda_ext
             for j in range(i + 1, s):
                 weighted = weighted + A[j, i] * mu[j]
-            mu[i] = h * cache.F[i].T @ weighted
+            rhs = h * cache.F[i].T @ weighted
+
+            lu = (
+                cache.stage_factorizations[i]
+                if cache.stage_factorizations is not None
+                else None
+            )
+            if lu is None:
+                mu[i] = rhs
+            else:
+                mu[i] = scipy.linalg.lu_solve(lu, rhs, trans=1)
 
         return mu

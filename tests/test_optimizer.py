@@ -80,7 +80,7 @@ def test_optimizer_caches_forward_and_adjoint(monkeypatch):
     class FakeStageSolver:
         pass
 
-    def fake_solver_factory(method, requirements, structure):
+    def fake_solver_factory(method, requirements, structure, y_scale=1.0):
         return FakeStageSolver()
 
     monkeypatch.setattr("adjungo.optimization.interface.deduce_requirements", fake_requirements)

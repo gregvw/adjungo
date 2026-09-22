@@ -56,7 +56,7 @@ def forward_solve(
 
         # Solve stage equations
         Z[step], cache = stage_solver.solve_stages(
-            Y[step], u_stages, t_n, h, problem, method
+            Y[step], u_stages, t_n, h, problem, method, step=step
         )
         caches.append(cache)
 

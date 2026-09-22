@@ -101,6 +101,50 @@ A derivative check reports the ε-sweep table and the observed order, not a sing
 pass/fail at one ε. A single-ε check cannot distinguish a wrong adjoint from
 finite-difference noise; this repository has twice mistaken one for the other.
 
+### C-3.4 Certified tolerance, implicit methods — `DERIVED`
+
+Package-versus-reference comparison for an implicit method has a floor that
+explicit methods do not have, and it is **not** machine epsilon.
+
+Both sides solve the same stage equations, but each stops Newton at the
+**scaled** [C-5.1](#c-5-nonlinear-stage-solves) threshold
+`rtol·‖Z‖_∞ + atol` (`adjungo/solvers/newton.py::stage_solve_tolerance`).
+Neither lands on the exact root. `STAGE_NEWTON_TOL` is that threshold's value
+at unit scale, `NEWTON_RTOL + NEWTON_ATOL_FACTOR = 2e-13`. Writing `κ` for a
+bound on the stage-Jacobian inverse over a step,
+
+```
+‖Z*_pkg − Z*_ref‖  ≲  κ · STAGE_NEWTON_TOL
+```
+
+Each side's gradient is the *exact* derivative of the map realised at its own
+converged iterate — C-2 is not weakened — but the two iterates differ at the
+above order, and so do the two gradients.
+
+**Therefore:** the implicit certified tolerance is a stated multiple of the
+Newton stopping tolerance, not an independent number:
+
+```
+IMPLICIT_RTOL = CONDITIONING_ALLOWANCE × STAGE_NEWTON_TOL = 1e3 × 2e-13 = 2e-10
+```
+
+Tests **import** `STAGE_NEWTON_TOL` rather than hardcoding a value, so loosening
+Newton convergence cannot silently loosen a correctness claim.
+
+`OBSERVED`: over the C-14 implicit population (`implicit_midpoint`,
+Crank-Nicolson, `sdirk2`, `sdirk3` at `N = 3` and `N = 6` on `CoupledNonlinear`)
+the worst relative gradient error is `6.22e-15`, a ratio of **0.031** to
+`STAGE_NEWTON_TOL`. Agreement is *better* than the stopping test guarantees
+because Newton's quadratic convergence drives the final residual far below
+`tol`. That overshoot is a property of these problems, not a guarantee, which is
+why `CONDITIONING_ALLOWANCE` is set well above it.
+
+This observation is pinned by
+`tests/test_oracle_gradient.py::test_implicit_tolerance_basis_is_measured`,
+which fails if the ratio rises above `CONDITIONING_ALLOWANCE` (the bound stops
+holding) **or** above `1.0` (the derivation's overshoot assumption stops
+holding). A comment is a claim; that test is the evidence.
+
 ---
 
 ## C-4 Continuous accuracy — `APPROVED`
@@ -132,17 +176,53 @@ characteristic state magnitude (default: `max(‖y₀‖_∞, 1)`).
 An unscaled absolute test on raw magnitudes is prohibited: it is simultaneously
 too strict for large states and too loose for small ones.
 
+`OBSERVED` — implemented as `adjungo/solvers/newton.py::stage_solve_tolerance`;
+`y_scale` is captured by the stage solver **at construction** from `y₀` and is
+never re-read from mutable state, so the threshold a stage is certified against
+cannot drift as the trajectory evolves.
+
+The rationale is measured, not asserted, by
+`tests/test_implicit_solvers.py::test_stage_convergence_is_scaled_not_absolute`
+on `z − 0.05√|z| = Y` at two magnitudes nine orders apart:
+
+| `Y` | achieved residual | achieved relative accuracy | a fixed `1e-12` absolute test would |
+|---|---|---|---|
+| `1e6` | `1.57e-08` | `1.6e-14` | **reject** it — unreachable, since the double spacing at `1e6` is already `~1e-10` |
+| `1e-6` | `1.33e-19` | `5.3e-17` | **accept** anything down to `1e-6` relative |
+
+Both terms are load-bearing and neither may be dropped: without `atol` the
+threshold is zero at `Z = 0`; without `rtol·‖Z‖_∞` the prohibited absolute test
+returns. This is pinned by `test_stage_solve_tolerance_has_both_terms`.
+
 ### C-5.2 Tolerance ordering — `DERIVED`
 
-C-5.1's tolerance is set **well below** C-3.1's certified derivative tolerance,
-so that stage-solve error cannot masquerade as derivative error. If the two were
+C-5.1's tolerance is set **well below** the certified derivative tolerance, so
+that stage-solve error cannot masquerade as derivative error. If the two were
 comparable, a C-2 failure would be unattributable.
+
+The ordering is now explicit rather than coincidental: the implicit certified
+tolerance is *defined* as `1e3 ×` the C-5.1 threshold at unit scale
+([C-3.4](#c-34-certified-tolerance-implicit-methods--derived)), so three orders
+of separation hold by construction and cannot be lost by editing one number.
 
 ### C-5.3 Failure reporting
 
 Exhausting the iteration budget **raises**. The exception names the step index,
 the stage index, the final residual norm, and the iteration count. Silent
 non-convergence is prohibited; see [C-7](#c-7-no-silent-sentinels).
+
+`OBSERVED` — built by `adjungo/solvers/newton.py::stage_context`, which also
+includes the stage time because that is what a reader of a physical model
+recognises. Example:
+
+```
+SDIRK step 0, stage 0, t=0.0292893: Newton failed to converge in 50
+iterations; final ||r||_inf = 1.464575e+01, tolerance 1.464575e-12
+```
+
+All four required locators are asserted individually by
+`tests/test_implicit_solvers.py::test_newton_reports_the_stage_context_on_failure`,
+so a refactor that drops one fails rather than merely degrading a message.
 
 ### C-5.4 Converged-iterate derivatives — `APPROVED`
 
@@ -167,12 +247,27 @@ forward solve, gradient, **and** Hessian-vector product for it, against the
 
 | Family | Status |
 |---|---|
-| Explicit Runge–Kutta | pending milestone M1 |
-| DIRK | pending milestone M2 |
-| SDIRK | pending milestone M2 |
+| Explicit Runge–Kutta | **certified** — M1 (`explicit_euler`, `heun`, `rk4`) |
+| DIRK | **certified** — M2 (`implicit_trapezoid` / Crank–Nicolson) |
+| SDIRK | **certified** — M2 (`implicit_midpoint`, `sdirk2`, `sdirk3`) |
 | Fully implicit (dense `A`) | pending milestone M3 |
 | Linear multistep, `r > 1` | **not supported** |
 | IMEX / additive splitting | **not supported** |
+
+`OBSERVED` — each certified method above is exercised, on the
+[C-14](#c-14-the-certification-test-population) population, by:
+
+| Claim | Test |
+|---|---|
+| Forward solve realises the monolithic residual | `test_oracle_gradient.py::test_reference_forward_reproduces_package_forward` |
+| Gradient equals the independent reference | `test_oracle_gradient.py::test_explicit_gradient_matches_independent_reference` |
+| Gradient survives a fixed-mesh ε-sweep | `test_oracle_gradient.py::test_gradient_finite_difference_sweep` |
+| Hessian operator equals the independent reference | `test_oracle_hessian.py::test_hvp_matches_independent_reference` |
+| Hessian survives a fixed-mesh ε-sweep | `test_oracle_hessian.py::test_hvp_finite_difference_sweep` |
+
+The certified list and `adjungo/optimization/interface.py::CERTIFIED_STAGE_TYPES`
+must agree; adding an entry to either without the evidence above is a false
+certification.
 
 ### C-6.2 Hard refusals
 
@@ -431,6 +526,25 @@ under C-2 requires problems that **jointly** exhibit:
 | `t_span[0] ≠ 0` | Time arguments defaulting to zero |
 | Non-uniform controls across stages and steps | Index and broadcast errors |
 
+### C-14.0 The population is not a fixed list — `APPROVED`
+
+The table above states properties a certifying problem must have; it does not
+license the belief that one problem carrying all of them certifies everything.
+Precedent [R-9](#r-9) is the counterexample: `CoupledNonlinear` satisfies every
+row, yet its Jacobian depends on `u`, and that single incidental fact hid a
+`4.2e-05` gradient error from all 188 tests in the suite.
+
+**Therefore:** when a code path branches on a *property of the problem* rather
+than on the method, the population must contain a problem on each side of that
+branch. Current instances:
+
+| Problem | Distinguishing property | Path it certifies |
+|---|---|---|
+| `tests/problems.py::CoupledNonlinear` | `F` depends on `y`, `u`, and `t`; `n=3`, `ν=2` | The general path |
+| `tests/problems.py::LinearTimeVarying` | `F` depends on `t` only | Time-dependent, state-independent |
+| `tests/problems.py::ScalarAnchor` | Closed-form reducible | Sign and scale conventions |
+| `tests/test_implicit_solvers.py::StateOnlyJacobian` | `F` depends on `y` **only**; `G` constant | Reuse and control-independence (R-9) |
+
 ### C-14.1 Oracle hierarchy
 
 In decreasing order of authority:
@@ -584,3 +698,115 @@ silently shape-conformable and merely returns a wrong number.
 Consequent policy, now enforced: a missing second-derivative callback raises
 (C-7) rather than dropping the term. Dropping it returns a Gauss-Newton-like
 operator while the public method still promises the exact Hessian.
+
+---
+
+### R-7 A DIRK "solve" that linearises is not a solve — `APPROVED`
+
+**Finding.** `DIRKStageSolver.solve_stages` did not iterate. It assumed
+`f = F z + G u` with `F` and `G` frozen at the incoming right-hand side and
+solved the resulting linear system once. `SDIRKStageSolver` had a second,
+distinct version of the same error: it solved `(I − hγF) Z_i = rhs`, which
+drops the inhomogeneous term `h γ f(0, u, t)` and is correct only for a linear
+*homogeneous* `f = F y`. Its Jacobian was additionally evaluated at the previous
+stage value `Z[i−1]`, not at `Z_i`.
+
+Neither solver had a transposed stage solve in its adjoint: the factorisation of
+`I − h a_ii F_i` was never applied with `trans=1`, so the adjoint stage equation
+was solved with the wrong operator even when the forward value was right.
+
+**Why it survived.** Every historical implicit test used an LTI problem, for
+which freezing `F` and `G` *is* exact. The one nonlinear Crank-Nicolson test was
+marked `@pytest.mark.skip(reason="DIRK solver needs Newton iteration for
+nonlinear problems")` — the defect was known, recorded as a skip, and then
+functioned as permission to leave the public method advertising a capability it
+did not have.
+
+**Measured**, `CoupledNonlinear`, `N = 6`, relative to the monolithic reference:
+
+| method | s | forward, before | gradient, before | gradient, after |
+|---|---|---|---|---|
+| `implicit_midpoint` | 1 | 5.851e-03 | 2.857e-03 | 3.580e-15 |
+| `implicit_trapezoid` (CN) | 2 | 2.881e-03 | 1.873e-03 | 2.044e-15 |
+| `sdirk2` | 2 | 3.052e-03 | 1.310e-03 | 6.009e-15 |
+| `sdirk3` | 3 | 5.068e-03 | 3.546e-03 | 6.377e-14 |
+
+**Consequent policy.** A skip whose reason names a missing numerical capability
+is an envelope statement. Either the method family is refused at construction
+under [C-6](#c-6-envelope-enforcement), or the capability is implemented. It may
+not remain silently available to callers.
+
+---
+
+### R-8 A factorisation must be taken at the converged iterate — `APPROVED`
+
+**Finding.** `NewtonMixin` had zero inheritors, exited its `max_iter` loop
+silently, and returned the last iterate. It also factored the Jacobian
+**before** the final `z += dz`, so the LU it returned belonged to the
+second-to-last iterate.
+
+**Why it matters.** The adjoint reuses that factorisation as the operator whose
+transpose it solves. A factorisation at the wrong point is the wrong operator,
+and the resulting gradient is the exact derivative of *no* discrete map.
+
+**Consequent policy, now enforced.**
+
+1. Non-convergence raises `StageSolveError` naming the stage and time. An
+   unconverged stage value is a silent sentinel under
+   [C-7](#c-7-no-silent-sentinels).
+2. The returned factorisation is computed at the converged iterate.
+3. `STAGE_NEWTON_TOL` is a named module constant and is the published basis for
+   [C-3.4](#c-34-certified-tolerance-implicit-methods--derived).
+
+---
+
+### R-9 A reuse probe must vary every argument the matrix depends on — `APPROVED`
+
+**Finding.** The M2 SDIRK solver tried to exploit the constant diagonal `γ` by
+probing whether `F` was constant and, on agreement, publishing **one shared LU
+object** for every implicit stage of the step. The probe evaluated
+
+```
+problem.F(y_history[0], u_stages[i], t_n + c[i]*h)
+```
+
+varying `u` and `t` but **never the state**. A Jacobian depending on `y` alone
+passed it. The adjoint then solved every stage with `(I − hγF_0)^T` instead of
+`(I − hγF_i)^T`.
+
+**Measured.** On `f = y² + u` (`F = 2y` state-dependent, `G = 1` constant),
+`N = 4`, `y_0 = 0.5`, `u ≡ 0.3`, relative to the monolithic reference:
+
+| method | s | gradient error |
+|---|---|---|
+| `sdirk2` | 2 | 4.244e-05 |
+| `sdirk3` | 3 | 4.260e-05 |
+
+Seven orders above the C-3.4 certified tolerance of `1e-9`.
+
+**Why it survived.** `CoupledNonlinear`, the C-14 workhorse, has a Jacobian that
+depends on `u`, so the probe correctly refused reuse there. **The entire
+188-test suite — including every oracle test at every certified method — passed
+with this defect present.** Only a problem whose Jacobian depends on the state
+and nothing else exposes it. This is the same shape as
+[R-5](#r-5): a wrong matrix in the adjoint stage solve, invisible to a test
+population that does not vary the one argument that matters.
+
+**Cure.** The substitution was removed. Each stage publishes the factorisation
+taken at its own converged iterate. The substitution bought nothing in any case:
+Newton has already factored each stage by the time it converges, so sharing the
+object saved no work and only risked the adjoint operator.
+
+**Consequent policy.**
+
+1. A runtime probe may **never** be the authority for factorisation reuse. Reuse
+   requires a declared `ProblemStructure`, because constancy is a property of the
+   problem, not an observation at points the stages do not visit.
+2. A sufficient-condition probe must vary **every** argument its conclusion
+   quantifies over, and must err toward refusing. This one erred toward
+   accepting.
+3. Genuine factorisation reuse — skipping the LU *work* — is deferred to M6 and
+   must be gated on a declaration, not a measurement.
+4. The C-14 population is extended with a state-only-Jacobian problem
+   (`tests/test_implicit_solvers.py::StateOnlyJacobian`). A population in which
+   every Jacobian depends on `u` cannot certify a control-independent path.

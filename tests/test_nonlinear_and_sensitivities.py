@@ -8,12 +8,12 @@ Tests:
 """
 
 import numpy as np
-import pytest
 
 from adjungo.core.problem import Linearity, ProblemStructure
 from adjungo.methods.runge_kutta import explicit_euler, implicit_trapezoid
 from adjungo.optimization.interface import GLMOptimizer
 from adjungo.stepping.sensitivity import adjoint_sensitivity, forward_sensitivity
+from adjungo.validation import reference_gradient, reference_solve
 
 
 class MildlyNonlinearProblem:
@@ -108,20 +108,32 @@ class SimpleObjective:
         return np.ones((1, 1))
 
 
-@pytest.mark.skip(reason="DIRK solver needs Newton iteration for nonlinear problems")
 def test_mildly_nonlinear_crank_nicolson():
-    """Test Crank-Nicolson with mild nonlinearity (requires Newton)."""
+    """Crank-Nicolson on a nonlinear problem, forward and gradient.
+
+    Unskipped by unit U-M2.2: the DIRK/SDIRK solvers now Newton-solve the
+    true stage equation instead of linearizing it.
+
+    The original version of this test used ``u = 0`` from ``y0 = 0``, for
+    which the exact solution is identically zero, so ``abs(y_final) < 0.1``
+    held no matter what the solver did. It now uses a nonzero control and
+    checks the gradient against the independent monolithic reference
+    (NUMERICS.md C-14.1 item 1).
+    """
     problem = MildlyNonlinearProblem()
     objective = SimpleObjective(y_target=1.0, R=0.1)
     method = implicit_trapezoid()
+    t_span = (0.0, 2.0)
+    N = 20
+    y0 = np.array([0.0])
 
     optimizer = GLMOptimizer(
         problem=problem,
         objective=objective,
         method=method,
-        t_span=(0.0, 2.0),
-        N=20,
-        y0=np.array([0.0]),
+        t_span=t_span,
+        N=N,
+        y0=y0,
         problem_structure=ProblemStructure(
             linearity=Linearity.NONLINEAR,
             jacobian_constant=False,
@@ -130,19 +142,26 @@ def test_mildly_nonlinear_crank_nicolson():
         ),
     )
 
-    # Zero control
-    u = np.zeros((20, method.s, 1))
+    rng = np.random.default_rng(17)
+    u = 0.6 + 0.2 * rng.standard_normal((N, method.s, 1))
 
-    # Should be able to integrate forward (with Newton iteration)
     optimizer._ensure_forward(u)
-    y_final = optimizer._trajectory.Y[-1, 0, 0]
+    traj = optimizer._trajectory
+    ref = reference_solve(y0, u, t_span, N, problem, method)
 
-    # With zero control and starting from 0, should stay near 0
-    assert abs(y_final) < 0.1
+    assert np.all(np.isfinite(traj.Y))
+    assert np.max(np.abs(traj.Y[-1])) > 1e-3, "degenerate: trajectory stayed at 0"
+    assert np.max(np.abs(traj.Y - ref.Y)) < 1e-10, (
+        "Crank-Nicolson forward solve disagrees with the monolithic residual; "
+        "the stage equations are not being solved as written"
+    )
 
-    # Gradient should be computable
     grad = optimizer.gradient(u)
-    assert grad.shape == u.shape
+    grad_ref = reference_gradient(
+        y0, u, t_span, N, problem, method, objective
+    )
+    scale = max(float(np.max(np.abs(grad_ref))), 1.0)
+    assert float(np.max(np.abs(grad - grad_ref))) / scale < 1e-10
 
 
 def test_mildly_nonlinear_explicit_euler():

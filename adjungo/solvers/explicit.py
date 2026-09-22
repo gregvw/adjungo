@@ -22,6 +22,7 @@ class ExplicitStageSolver(StageSolver):
         h: float,
         problem: Problem,
         method: GLMethod,
+        step: int | None = None,
     ) -> tuple[NDArray, StepCache]:
         """Solve explicit stages via forward substitution."""
         s, n = method.s, problem.state_dim

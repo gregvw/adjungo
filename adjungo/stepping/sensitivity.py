@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import numpy as np
+import scipy.linalg
 from numpy.typing import NDArray
 
 from adjungo.core.method import GLMethod
@@ -95,17 +96,31 @@ def forward_sensitivity(
                 rhs += h * A[i, j] * (cache.F[j] @ delta_Z[step, j] +
                                        cache.G[j] @ delta_u[step, j])
 
-            # For explicit stages (a_{ii} = 0): δZ_i = rhs + h a_{ii} G_i δu_i
+            # For explicit stages (a_{ii} = 0): δZ_i = rhs
             if np.isclose(A[i, i], 0):
                 delta_Z[step, i] = rhs
             else:
-                # Implicit stage: (I - h a_{ii} F_i) δZ_i = rhs + h a_{ii} G_i δu_i
-                # For now, use explicit approximation (needs proper implicit solver)
-                # TODO: Reuse cached factorization for implicit methods
+                # Implicit stage. Differentiating
+                #   Z_i - h a_ii f(Z_i, u_i, t_i) = U[i] y + h Σ_{j<i} A[i,j] f_j
+                # gives
+                #   (I - h a_ii F_i) δZ_i = rhs + h a_ii G_i δu_i
+                # The operator is exactly the forward stage matrix, so the
+                # factorization taken at the converged stage value is reused
+                # rather than rebuilt. Rebuilding it here would be a second
+                # opportunity to evaluate F at the wrong point.
                 gamma = A[i, i]
-                I_minus_hgamma_F = np.eye(n) - h * gamma * cache.F[i]
                 rhs_implicit = rhs + h * gamma * (cache.G[i] @ delta_u[step, i])
-                delta_Z[step, i] = np.linalg.solve(I_minus_hgamma_F, rhs_implicit)
+                lu = (
+                    cache.stage_factorizations[i]
+                    if cache.stage_factorizations is not None
+                    else None
+                )
+                if lu is None:
+                    delta_Z[step, i] = np.linalg.solve(
+                        np.eye(n) - h * gamma * cache.F[i], rhs_implicit
+                    )
+                else:
+                    delta_Z[step, i] = scipy.linalg.lu_solve(lu, rhs_implicit)
 
         # Propagate sensitivity: δy^n = V δy^{n-1} + h B Σ_i [F_i δZ_i + G_i δu_i]
         delta_Y[step + 1] = method.V @ delta_Y[step]
@@ -267,18 +282,19 @@ def adjoint_sensitivity(
             weighted = B[:, i] @ delta_lambda_ext
             for j in range(i + 1, s):
                 weighted = weighted + A[j, i] * delta_Mu[step, j]
-            delta_Mu[step, i] = h * cache.F[i].T @ weighted
+            rhs = h * cache.F[i].T @ weighted + Gamma[i]
 
-            # Add second-derivative forcing
-            delta_Mu[step, i] += Gamma[i]
-
-            if not np.isclose(A[i, i], 0):
-                raise NotImplementedError(
-                    "second-order adjoint for implicit stages requires the "
-                    "transposed stage solve (I - h a_ii F_i^T)^-1, which is "
-                    "not implemented; tracked as unit U-M2.1. Refusing "
-                    "rather than returning the explicit-stage answer."
-                )
+            # Implicit stages carry the same transposed stage solve as the
+            # first-order adjoint: (I - h a_ii F_i^T) δμ_i = rhs.
+            lu = (
+                cache.stage_factorizations[i]
+                if cache.stage_factorizations is not None
+                else None
+            )
+            if lu is None:
+                delta_Mu[step, i] = rhs
+            else:
+                delta_Mu[step, i] = scipy.linalg.lu_solve(lu, rhs, trans=1)
 
         # Compute weighted adjoint sensitivities for Hessian assembly
         # δΛ_k = Σ_j a_{jk} δμ_j + Σ_j b_{jk} δλ_j

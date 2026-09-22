@@ -14,6 +14,7 @@ def create_stage_solver(
     method: GLMethod,
     requirements: SolverRequirements,
     problem_structure: ProblemStructure,
+    y_scale: float = 1.0,
 ) -> StageSolver:
     """
     Decision tree from linalg_requirements.tex Section 6.
@@ -22,6 +23,8 @@ def create_stage_solver(
         method: GLM tableau
         requirements: Deduced solver requirements
         problem_structure: Problem structure information
+        y_scale: Characteristic state magnitude for the C-5.1 stage
+            convergence test, captured by the solver at construction
 
     Returns:
         Appropriate stage solver
@@ -32,11 +35,12 @@ def create_stage_solver(
 
     if method.stage_type == StageType.SDIRK:
         return SDIRKStageSolver(
-            reuse_across_steps=requirements.can_reuse_across_steps
+            reuse_across_steps=requirements.can_reuse_across_steps,
+            y_scale=y_scale,
         )
 
     if method.stage_type == StageType.DIRK:
-        return DIRKStageSolver()
+        return DIRKStageSolver(y_scale=y_scale)
 
     # Fully implicit. ImplicitStageSolver.__init__ raises (NUMERICS.md C-6.2);
     # constructing it here rather than returning a placeholder keeps the refusal

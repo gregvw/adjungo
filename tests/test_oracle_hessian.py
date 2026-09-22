@@ -17,7 +17,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from adjungo.methods.runge_kutta import explicit_euler, heun, rk4
+from adjungo.methods.runge_kutta import (
+    explicit_euler,
+    heun,
+    implicit_midpoint,
+    implicit_trapezoid,
+    rk4,
+    sdirk2,
+    sdirk3,
+)
 from adjungo.optimization.interface import GLMOptimizer
 from adjungo.validation import reference_hessian
 from tests.problems import (
@@ -27,6 +35,7 @@ from tests.problems import (
     ScalarAnchor,
     make_controls,
 )
+from tests.test_oracle_gradient import certified_rtol
 
 CERTIFIED_RTOL = 1e-11
 
@@ -34,6 +43,10 @@ METHODS = [
     pytest.param(explicit_euler, id="explicit_euler_s1"),
     pytest.param(heun, id="heun_s2"),
     pytest.param(rk4, id="rk4_s4"),
+    pytest.param(implicit_midpoint, id="implicit_midpoint_sdirk_s1"),
+    pytest.param(implicit_trapezoid, id="crank_nicolson_dirk_s2"),
+    pytest.param(sdirk2, id="sdirk2_s2"),
+    pytest.param(sdirk3, id="sdirk3_s3"),
 ]
 
 
@@ -90,10 +103,11 @@ def test_hvp_matches_independent_reference(method_factory):
     assert np.max(np.abs(H_ref)) > 1e-3, "degenerate case: Hessian is ~0"
     scale = max(float(np.max(np.abs(H_ref))), 1.0)
     err = float(np.max(np.abs(H_pkg - H_ref))) / scale
-    assert err < CERTIFIED_RTOL, (
+    tol = certified_rtol(method)
+    assert err < tol, (
         f"Hessian operator differs from the independent reference by "
         f"{err:.6e} (relative, C-3 basis); certified tolerance "
-        f"{CERTIFIED_RTOL:.1e}."
+        f"{tol:.1e}."
     )
 
 
@@ -105,7 +119,7 @@ def test_hvp_is_symmetric(method_factory):
         GLMOptimizer(problem, objective, method, t_span, N, y0), u
     )
     scale = max(float(np.max(np.abs(H))), 1.0)
-    assert float(np.max(np.abs(H - H.T))) / scale < 1e-12
+    assert float(np.max(np.abs(H - H.T))) / scale < certified_rtol(method)
 
 
 @pytest.mark.parametrize("method_factory", METHODS)

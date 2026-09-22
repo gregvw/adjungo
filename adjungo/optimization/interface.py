@@ -109,7 +109,10 @@ class GLMOptimizer:
             method, problem_structure, problem.state_dim
         )
         self.stage_solver = create_stage_solver(
-            method, self.requirements, problem_structure
+            method,
+            self.requirements,
+            problem_structure,
+            y_scale=max(float(np.max(np.abs(self.y0))), 1.0),
         )
 
         # Cached trajectory (invalidated when u changes)

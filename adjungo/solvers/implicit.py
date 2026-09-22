@@ -39,6 +39,7 @@ class ImplicitStageSolver(StageSolver):
         h: float,
         problem: Problem,
         method: GLMethod,
+        step: int | None = None,
     ) -> tuple[NDArray, StepCache]:
         """Unreachable: construction raises."""
         raise NotImplementedError(_MESSAGE)
