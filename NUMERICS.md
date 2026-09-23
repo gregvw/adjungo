@@ -718,6 +718,33 @@ Recorded under C-1. A port that changes any of these produces different numbers:
    grows. Recorded because the cost argument is not visible from the code, which
    simply performs the cheap version.
 
+### What a port must *not* preserve
+
+The list above is semantics: changing any of it changes the numbers. The
+coefficient-immutability machinery of [C-15.7](#c-15) is the opposite, and is
+recorded here so that a port does not faithfully reproduce scaffolding.
+
+Freezing buffers, re-freezing them in `__setstate__`, recording that the root
+initialiser ran, and checking all of it at three call sites exist only because
+Python permits an array to be unfrozen and an attribute to be rebound at any
+moment. None of it is a statement about General Linear Methods. A C++ port
+should **delete it** and obtain the same property from the type system: the
+coefficients are `const` members of a problem type, so nothing can unfreeze
+them and no check is needed to discover that.
+
+The same applies to the *route decision* it guards. `affine_dynamics_verified`
+compares members at runtime and answers a question that in C++ is a property
+of the type — affineness is declared once, checked at compile time, cannot
+change afterwards, and selects the solve path by static polymorphism rather
+than by inspection. The runtime refusals of [C-16.2](#c-16) become overload
+resolution or a constraint failure, and the quiet-versus-loud distinction that
+C-15.7 spends so much care on largely disappears with them: what is quiet
+there is a type that does not match, and what is loud is a compile error.
+
+Preserve the *conclusions* — which problems are eligible for the affine route,
+and that a retained coefficient must not change during a solve. Do not
+preserve the mechanism that establishes them.
+
 ---
 
 <a id="c-14-the-certification-test-population"></a>
@@ -1241,14 +1268,10 @@ is not a more faithful one. Plain attribute access resolves slots, properties
 and descriptors exactly as `F` does; a subclass `__getattribute__` that lied
 would have to lie to `F` too, and then the lie *is* what gets retained.
 
-This is faithful for any descriptor that answers **consistently**, which is
-the assumption and the limit. One that returns a frozen array to the check and
-a writeable one to the next read defeats it, and is out of envelope for the
-same reason as the rest of this section: it is not a mistake anyone makes, it
-is a mechanism built to defeat the check, and `const` removes the question in
-the C++ port. Checking the retained `F` value inside the step cache instead
-would close it, at the price of refusing every ordinary subclass whose `F`
-returns a fresh writeable array — a real defect traded for a hypothetical one.
+This is faithful for any descriptor that answers **consistently**. One that
+returns a frozen array to the check and a writeable one to the next read
+defeats it, as would any number of other things Python permits at runtime; see
+the envelope below.
 
 ##### Where the check runs
 
@@ -1287,30 +1310,29 @@ is shadowed by a downstream one, assert it directly or it is decoration.
 
 ##### What the check is, and what it is not — `ENVELOPE`
 
-It is a check **at a moment**, not a lifetime guarantee, and the three call
-sites do not change that. Two shapes are outside it, both `OBSERVED`:
+It is a **lightweight sanity check at the points where retention happens**, not
+a lifetime guarantee, and the three call sites do not change that. In a
+language where any array can be unfrozen and any attribute rebound at any
+moment, no runtime check is a guarantee; the guard exists to catch the defect
+class that arises *without anyone intending it* — `copy.deepcopy` returning
+writeable buffers, a subclass copying in `__init__`, a property or slot
+displacing the frozen storage, a delegating override. That is what it is
+claimed to reach, and the injection table below is the evidence.
 
-- **Unfreezing after the check.** `flags.writeable` is settable by anyone at
-  any time. A caller who runs a solve, then executes `p.M.flags.writeable =
-  True` and mutates, rewrites a tape that is already built; on the fixture
-  below a cached `objective_value(U)` followed by that mutation and
-  `gradient(U)` returns `0.7552125`.
-- **A trajectory built by hand.** `adjoint_solve` takes a `Trajectory`, not a
-  problem — it has no `problem` parameter and so cannot perform this check at
-  all. A caller who constructs step caches directly, aliasing live arrays,
-  never passes the retention boundary.
+What it does not reach is anything a caller does deliberately after the check:
+unfreezing a buffer once the tape is built (`OBSERVED`: a cached
+`objective_value(U)`, then `p.M.flags.writeable = True` and a mutation, then
+`gradient(U)` returns `0.7552125`), handing `adjoint_solve` a trajectory built
+by hand — it takes a `Trajectory`, not a problem, so it has no `problem` to
+check — or a descriptor that answers the check and the solve differently.
+These are not separate defects to be closed one at a time. They are the same
+fact about Python, and chasing them costs more than it buys: the only
+construction that would close the first is copying `F` and `G`'s result at
+every step, which is precisely the aliasing this design exists to avoid.
 
-Neither is reached without the caller explicitly defeating a documented
-invariant, which is the line [C-1](#c-1) draws: this is a reference
-implementation in a language where no array can be made permanently read-only,
-and the only construction that would close these is copying `F` and `G`'s
-result at every step — which is exactly the aliasing the design exists to
-avoid. **In the C++ port both vanish**: the coefficients are `const` members,
-so the first is a compile error and the second cannot alias a mutable array.
-What the check does reach is the whole defect class that arises *without*
-anyone intending it — `copy.deepcopy` returning writeable buffers, a subclass
-copying in `__init__`, a property or slot displacing the frozen storage — and
-that is what it is claimed to reach.
+Per [C-1](#c-1) that is the correct place to stop. The invariant belongs to a
+type system, not to a runtime check, and [C-13](#c-13) records that the port
+should replace this machinery rather than reproduce it.
 
 The general rule this leaves: **a check that raises must not be placed behind
 checks that return, and must be gated on the precondition for its own

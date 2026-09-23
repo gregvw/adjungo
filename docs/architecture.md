@@ -364,11 +364,14 @@ of what must carry forward; it currently has nine items. The short version:
     explicit-structure and the deduced-structure paths; and `forward_solve`
     is the retention boundary — every step stores what `F` and `G` returned,
     so checking there covers every composition that *produces* a trajectory
-    rather than every caller that consumes one. It remains a check at a
-    moment: a caller who unfreezes after the solve, or who hands
-    `adjoint_solve` a trajectory built by hand, is outside it, and C-15.7
-    states that envelope. In C++ both vanish — the whole class of problem is a
-    `const` member with a correct copy constructor.
+    rather than every caller that consumes one. It remains a lightweight
+    sanity check rather than a guarantee — a caller who unfreezes after the
+    solve, or who hands `adjoint_solve` a trajectory built by hand, is outside
+    it, as anything is in a language with runtime mutability. C-15.7 states
+    that envelope and C-13 records that a C++ port should delete this
+    machinery rather than reproduce it: `const` coefficients cannot be
+    unfrozen, and affineness becomes a compile-time property of the type that
+    selects the solve path by static polymorphism instead of by inspection.
 
 ### Modified Newton: the refusal is narrower than it looks
 
