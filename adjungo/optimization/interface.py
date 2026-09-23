@@ -166,16 +166,26 @@ class GLMOptimizer:
         )
 
         # Affineness is established by construction, never by declaration: the
-        # problem must *be* an unmodified AffineDynamics, which computes f, F
-        # and G from coefficient arrays it owns. There is no cheap exact check
-        # that an opaque callback has zero curvature -- sampling f would be a
-        # probe, and generalising a probe from visited to unvisited points is
-        # precedent R-9 -- so no flag is offered for it. See
-        # adjungo.core.affine.
+        # problem must *be* an unmodified affine root class, which computes f,
+        # F and G from coefficients it owns or from callables it invokes with
+        # t alone. There is no cheap exact check that an opaque callback has
+        # zero curvature -- sampling f would be a probe, and generalising a
+        # probe from visited to unvisited points is precedent R-9 -- so no flag
+        # is offered for it. See adjungo.core.affine.
+        #
+        # Zero curvature and a constant Jacobian are separate facts (C-16.1),
+        # and the second does not follow from the first: AffineDynamics has
+        # both, TimeVaryingAffineDynamics has only the first, because
+        # F = M(t_i) differs between stages at distinct abscissae. Asserting
+        # jacobian_constant unconditionally here would hand a time-varying
+        # problem to the C-15 reuse path, where C-15.2's element-for-element
+        # comparison would refuse it -- correctly, but only after the route had
+        # already been chosen wrongly. The fact is read from the verified
+        # class, so it is no more a declaration than the affineness is.
         if affine_dynamics_verified(self.problem):
             return ProblemStructure(
                 linearity=Linearity.LINEAR,
-                jacobian_constant=True,
+                jacobian_constant=self.problem.coefficients_constant,
                 jacobian_control_dependent=False,
                 has_second_derivatives=True,
                 state_affine=True,

@@ -70,14 +70,44 @@ That is why this module distinguishes two facts that the single enum conflates:
 ``ConstantJacobianQuadraticControl`` is ``state_affine`` and not
 ``jointly_affine``, which is precisely the distinction that keeps it from
 losing its ``F_uu`` term.
+
+Constant and time-varying coefficients are different facts
+----------------------------------------------------------
+
+C-16.2 states ``jointly_affine`` as ``f = M(t) y + C(t) u + b(t)``, with the
+coefficients free to vary in time. :class:`AffineDynamics` implements the
+constant-coefficient case; :class:`TimeVaryingAffineDynamics` implements the
+general one. Both have identically zero curvature, so both open the C-16.6
+skip.
+
+They differ on one axis only, and it is an axis C-16.1 requires be kept
+separate from the others: ``jacobian_constant``. For ``M(t)`` the stage
+Jacobian ``F = M(t_i)`` differs between stages of a single step whenever the
+abscissae differ, so the C-15 factorization store must not reuse across them.
+That fact is carried by ``coefficients_constant``, which is part of each
+class's guarantee rather than a caller declaration, and which
+:meth:`~adjungo.optimization.interface.GLMOptimizer.deduce_structure` reads to
+set ``jacobian_constant``.
+
+The error direction if this were wrong is toward refusal, not toward a wrong
+number: C-15.2 compares the stored matrix with the requested one element for
+element, so a time-varying problem that reached the reuse path would raise
+``DeclaredStructureViolation`` at the second distinct stage matrix rather than
+solve with the wrong operator. The separation here keeps that guard from ever
+being needed, but does not replace it.
 """
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeGuard
 
 import numpy as np
 from numpy.typing import NDArray
 
-__all__ = ["AffineDynamics", "affine_dynamics_verified"]
+__all__ = [
+    "AffineDynamics",
+    "TimeVaryingAffineDynamics",
+    "affine_dynamics_verified",
+]
 
 
 class AffineDynamics:
@@ -148,6 +178,17 @@ class AffineDynamics:
         return self._b
 
     @property
+    def coefficients_constant(self) -> bool:
+        """``True``: ``M`` is the same matrix at every stage of every step.
+
+        This is what licenses C-15 factorization reuse, and it is a property of
+        this class rather than a caller declaration. The coefficient arrays are
+        copied at construction and are not writeable, so there is no way for
+        ``F`` to return two different matrices over the life of the object.
+        """
+        return True
+
+    @property
     def state_dim(self) -> int:
         return int(self._M.shape[0])
 
@@ -205,26 +246,278 @@ _GUARANTEED_METHODS = (
 )
 
 
-def affine_dynamics_verified(problem: Any) -> bool:
+class TimeVaryingAffineDynamics:
+    """``y' = M(t) y + C(t) u + b(t)``, coefficients supplied as functions of
+    time.
+
+    Args:
+        M: Callable ``t -> (n, n)`` state matrix.
+        C: Callable ``t -> (n, nu)`` control matrix.
+        b: Callable ``t -> (n,)`` forcing. ``None`` means identically zero.
+        state_dim: ``n``. Required explicitly rather than discovered by
+            calling ``M`` once, because calling a coefficient at one time and
+            asserting the shape of its value at every other time is a probe,
+            and generalising a probe is precedent R-9. Given ``n`` and ``nu``,
+            every coefficient value is checked at the time it is actually
+            used.
+        control_dim: ``nu``.
+
+    What is constructive here, and what is a caller obligation
+    ----------------------------------------------------------
+
+    :class:`AffineDynamics` can be read for affineness because it owns its
+    coefficients. This class does not own them — the caller supplies three
+    functions this module never sees the body of — so the guarantee has to be
+    stated more carefully than that one, and the two halves must not be run
+    together.
+
+    **Constructive.** The *form* of ``f`` is fixed by this class and the caller
+    cannot change it: ``f = M(·)y + C(·)u + b(·)``, with ``y`` and ``u``
+    entering linearly and exactly once, verified by the same class-identity
+    check that protects :class:`AffineDynamics`. The caller supplies coefficient
+    *values*, not the functional form. That is a far narrower freedom than the
+    one C-16.2 refuses, where ``jointly_affine`` is asserted of an opaque ``f``
+    about whose form nothing at all is known.
+
+    **A caller obligation.** Given that form, the curvature blocks vanish if and
+    only if ``M``, ``C`` and ``b`` depend on ``t`` alone. This class confines
+    the *interface* — no ``y`` and no ``u`` is ever passed to a coefficient —
+    but confining the interface does not confine a Python closure. A callable
+    may capture the control array the optimizer is differentiating and read it,
+    and then ``f`` is not affine in ``u`` while every check here still passes.
+
+    It would be wrong to write that a function never given ``y`` cannot depend
+    on ``y``. It cannot depend on ``y`` *through this interface*, which is a
+    weaker statement and is the one that holds.
+
+    C-1's caller-trust model is what makes the remainder admissible: inputs are
+    data-only, and a callable that reads the optimizer's own control array is
+    not a data-only input. The obligation is narrow, checkable by reading three
+    short functions, and it is the caller's. No cheap exact check for it exists
+    on this side — a coefficient that varies only when ``u`` varies is
+    *constant* throughout any single gradient evaluation, so no
+    consistency comparison within a solve can see it.
+
+    **The failure direction is silent**, which is why it is stated here rather
+    than left implicit. Measured: ``y' = m(u)y + u`` with
+    ``m = -0.2 + 0.7u`` smuggled in through a closure, ``y₀ = 0.8``,
+    ``t_span = (0, 0.5)``, ``N = 1``, explicit Euler, ``J = y₁²/2``, at
+    ``u = 0.3``. This class returns ``0.477``; a central difference of the
+    objective at ``ε = 1e-6`` gives ``0.744``. Nothing raises.
+
+    What this class does *not* license
+    ----------------------------------
+
+    ``F`` is **not** constant. ``coefficients_constant`` is ``False``, so
+    ``jacobian_constant`` is deduced ``False`` and the C-15 factorization store
+    reuses nothing. Each implicit stage assembles and factors its own matrix.
+    That is not a regression against :class:`AffineDynamics`; it is the
+    arithmetic the problem actually requires, since ``I - h a_ii M(t_i)``
+    genuinely differs between stages at distinct abscissae.
+
+    Determinism is a caller obligation
+    ----------------------------------
+
+    ``M``, ``C`` and ``b`` must be deterministic functions of ``t``: the same
+    ``t`` must yield the same value. A coefficient that drifted between calls
+    would make the adjoint apply the transpose of a matrix the forward solve
+    did not use, which is the C-5.4 failure mode.
+
+    This obligation is not checked exhaustively — that would require comparing
+    against every earlier call — but it is not unguarded either. On the affine
+    stage route, C-16.4 evaluates the residual after the solve using fresh
+    coefficient values and tests it against the C-5.1 threshold, so a
+    coefficient that changed between assembling ``K`` and evaluating ``R``
+    raises :class:`~adjungo.solvers.linear_stage.NonAffineStageEquation`
+    instead of returning an unconverged stage value. The error direction is
+    toward a loud refusal.
+
+    That guard is real but partial: ``F`` and ``G`` are evaluated once more
+    after the residual check, to be stored for the backward sweeps, and a
+    coefficient that changed on *that* call would not be caught. Determinism is
+    an obligation, not a verified fact.
+    """
+
+    def __init__(
+        self,
+        M: Callable[[float], NDArray],
+        C: Callable[[float], NDArray],
+        b: Callable[[float], NDArray] | None = None,
+        *,
+        state_dim: int,
+        control_dim: int,
+    ) -> None:
+        for name, fn in (("M", M), ("C", C), ("b", b)):
+            if fn is not None and not callable(fn):
+                raise TypeError(
+                    f"{name} must be a callable of t alone; got "
+                    f"{type(fn).__name__}. For coefficients that do not vary "
+                    f"in time, use AffineDynamics, which takes arrays and "
+                    f"reuses one factorization for the whole solve."
+                )
+
+        n = int(state_dim)
+        nu = int(control_dim)
+        if n <= 0 or nu <= 0:
+            raise ValueError(
+                f"state_dim and control_dim must be positive; got "
+                f"state_dim={n}, control_dim={nu}"
+            )
+
+        self._M_fn = M
+        self._C_fn = C
+        self._b_fn = b
+        self._n = n
+        self._nu = nu
+
+    def _coefficient(
+        self,
+        fn: Callable[[float], NDArray],
+        t: float,
+        shape: tuple[int, ...],
+        name: str,
+    ) -> NDArray:
+        """Evaluate one coefficient at ``t`` and check its shape there.
+
+        The value is copied and made non-writeable. Copying costs ``O(n^2)``
+        and guards the ``O(n^3)`` solve that consumes it, the same ratio C-15.2
+        uses to justify its element-for-element comparison. It matters because
+        a caller callable is free to return the same scratch buffer on every
+        call and then write into it; the returned array would then change
+        underneath a factorization already taken from it.
+        """
+        value = np.array(fn(float(t)), dtype=float, copy=True)
+        if value.shape != shape:
+            raise ValueError(
+                f"{name}({t!r}) must have shape {shape}; got {value.shape}"
+            )
+        value.flags.writeable = False
+        return value
+
+    @property
+    def coefficients_constant(self) -> bool:
+        """``False``: ``M(t)`` may differ at every stage abscissa.
+
+        Read by ``deduce_structure`` to set ``jacobian_constant``, which gates
+        C-15 factorization reuse. Returning ``True`` here for a genuinely
+        time-varying ``M`` would not produce a wrong answer: C-15.2 compares
+        the stored matrix with the requested one element for element and
+        raises ``DeclaredStructureViolation`` on the first disagreement.
+        """
+        return False
+
+    @property
+    def state_dim(self) -> int:
+        return self._n
+
+    @property
+    def control_dim(self) -> int:
+        return self._nu
+
+    def M(self, t: float) -> NDArray:
+        """State matrix at ``t``, shape ``(n, n)``, read-only."""
+        return self._coefficient(self._M_fn, t, (self._n, self._n), "M")
+
+    def C(self, t: float) -> NDArray:
+        """Control matrix at ``t``, shape ``(n, nu)``, read-only."""
+        return self._coefficient(self._C_fn, t, (self._n, self._nu), "C")
+
+    def b(self, t: float) -> NDArray:
+        """Forcing at ``t``, shape ``(n,)``, read-only."""
+        if self._b_fn is None:
+            return np.zeros(self._n)
+        return self._coefficient(self._b_fn, t, (self._n,), "b")
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.asarray(self.M(t) @ y + self.C(t) @ u + self.b(t))
+
+    def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.M(t)
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.C(t)
+
+    def F_yy_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        """Identically zero, shape ``(n, n)``.
+
+        Defined rather than omitted for the same reason as on
+        :class:`AffineDynamics`: the route that skips this term must be
+        comparable against the route that calls it, and C-16.6 requires the two
+        to agree bit for bit.
+        """
+        return np.zeros((self._n, self._n))
+
+    def F_yu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        """Identically zero, shape ``(n, nu)``."""
+        return np.zeros((self._n, self._nu))
+
+    def F_uu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        """Identically zero, shape ``(nu, nu)``."""
+        return np.zeros((self._nu, self._nu))
+
+
+#: The members whose bodies carry each root class's guarantee, keyed by the
+#: class that defines them. A module-level mapping rather than a class
+#: attribute, because a class attribute naming the members to check could
+#: itself be replaced by the subclass being checked.
+#:
+#: ``coefficients_constant`` is guarded alongside the computational methods
+#: because it decides whether C-15 reuse is enabled. The coefficient accessors
+#: of the time-varying class are guarded because they are where the shape check
+#: and the defensive copy live, and because they are the only places the
+#: caller's callables are invoked — which is what confines those callables to
+#: ``t`` and so establishes zero curvature.
+_GUARANTEED_MEMBERS: dict[type, tuple[str, ...]] = {
+    AffineDynamics: _GUARANTEED_METHODS + ("coefficients_constant",),
+    TimeVaryingAffineDynamics: _GUARANTEED_METHODS
+    + ("coefficients_constant", "M", "C", "b", "_coefficient"),
+}
+
+
+def affine_dynamics_verified(
+    problem: Any,
+) -> TypeGuard[AffineDynamics | TimeVaryingAffineDynamics]:
     """Whether ``problem`` is affine *by construction*, checked exactly.
 
-    Being an instance of :class:`AffineDynamics` is not by itself sufficient. A
-    subclass can override ``f`` with anything at all, and then the coefficient
-    arrays describe nothing. This checks that every method carrying the
-    guarantee is still the one :class:`AffineDynamics` defines, by object
-    identity on the function found through the MRO.
+    Being an instance of an affine root class is not by itself sufficient. A
+    subclass can override ``f`` with anything at all, and then the coefficients
+    describe nothing. This checks that every member carrying the guarantee is
+    still the one that root class defines, by object identity on the attribute
+    found through the MRO.
 
     The check is exact and has no failure mode toward acceptance: an overridden
-    method is a different function object, so the answer is ``False`` and the
-    general route is taken. Error direction is toward doing more work, never
-    toward claiming a structure the problem does not have. This mirrors the M6
-    rule that the declaration selects the route and an exact comparison
-    establishes the fact (``NUMERICS.md`` C-15.2, C-16.2).
+    member is a different object, so the answer is ``False`` and the general
+    route is taken. Error direction is toward doing more work, never toward
+    claiming a structure the problem does not have. This mirrors the M6 rule
+    that the declaration selects the route and an exact comparison establishes
+    the fact (``NUMERICS.md`` C-15.2, C-16.2).
+
+    A class deriving from **more than one** root is refused outright rather
+    than verified against whichever one the MRO happens to resolve first. Such
+    a class mixes two initialisers and two notions of ``coefficients_constant``,
+    and the cost of refusing it is that a caller who wrote one gets the general
+    route.
+
+    The return type narrows to the root classes rather than being a plain
+    ``bool``. That is the point of the check: a caller that has passed it may
+    read ``coefficients_constant`` directly, instead of reaching for it with a
+    ``getattr`` default that would silently choose a route for a problem that
+    did not supply the fact. C-7 forbids that kind of default.
     """
-    if not isinstance(problem, AffineDynamics):
+    roots = [
+        root for root in _GUARANTEED_MEMBERS if isinstance(problem, root)
+    ]
+    if len(roots) != 1:
         return False
+    root = roots[0]
     cls = type(problem)
     return all(
-        getattr(cls, name, None) is getattr(AffineDynamics, name)
-        for name in _GUARANTEED_METHODS
+        getattr(cls, name, None) is getattr(root, name)
+        for name in _GUARANTEED_MEMBERS[root]
     )

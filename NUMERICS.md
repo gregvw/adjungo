@@ -1063,6 +1063,12 @@ from them (`adjungo.core.affine.AffineDynamics`), checked by
 carrying the guarantee is still the one that class defines. A subclass that
 replaces any of them is refused.
 
+[C-17](#c-17) extends this to `TimeVaryingAffineDynamics`, whose coefficients
+are caller-supplied callables. The guarantee is still constructive there, by a
+different argument: the callables are invoked with `t` alone, so they cannot
+depend on `y` or `u` at any point. That class does **not** carry a constant
+Jacobian, and C-17.2 records why the two facts had to be separated.
+
 `ProblemStructure.jointly_affine` remains a public field, and a caller may set
 it. It is **not sufficient**: both the field and the construction check are
 required at the skip site. A declaration that fails the check causes more work,
@@ -1229,6 +1235,224 @@ cause: a population that cannot reach the defect.**
 
 ---
 
+<a id="c-17"></a>
+## C-17 Time-varying affine coefficients keep the skip and lose the reuse — `APPROVED`
+
+[C-16.2](#c-16) states `jointly_affine` as `f = M(t)y + C(t)u + b(t)`, with the
+coefficients free to vary in time, and then opens the zero-curvature route only
+to `adjungo.core.affine.AffineDynamics`, whose coefficients are constant. This
+clause governs the general case, implemented as
+`adjungo.core.affine.TimeVaryingAffineDynamics`.
+
+### C-17.1 The form is constructed; the coefficients' purity is a C-1 obligation
+
+`AffineDynamics` can be read for affineness because it owns `M`, `C` and `b`.
+The time-varying class does not own them: the caller supplies three functions
+whose bodies this package never sees. [C-16.2](#c-16) refuses exactly that for
+the general problem protocol, on the grounds that sampling an opaque `f` and
+generalising is precedent [R-9](#r-9). The guarantee here is therefore in two
+parts, and they must not be run together.
+
+**Constructed.** The *form* of `f` is owned by the class and the caller cannot
+change it: `f = M(·)y + C(·)u + b(·)`, with `y` and `u` entering linearly and
+exactly once, protected by the same class-identity check as the constant case.
+What the caller supplies is coefficient *values*. That is a much narrower
+freedom than the one C-16.2 refuses, where `jointly_affine` is asserted of an
+`f` about whose form nothing whatever is known. The coefficient accessors are
+part of the verified guarantee because they are the only sites that invoke the
+caller's callables; a subclass intercepting one could pass `y` and the form
+would no longer be owned.
+
+**Obliged.** Given that form, the curvature blocks vanish **iff** `M`, `C` and
+`b` depend on `t` alone. The class confines the *interface* — no `y` and no `u`
+is ever passed to a coefficient — but confining an interface does not confine a
+Python closure. A callable may capture the very control array being
+differentiated and read it, and then `f` is not affine in `u` while every check
+in this package still passes.
+
+It would be false to write that a function never given `y` cannot depend on
+`y`. The true statement is that it cannot depend on `y` *through this
+interface*, and that is weaker.
+
+The damage is not confined to the skipped curvature, which is why this is
+stated as an obligation on the representation rather than a caveat on C-16.6:
+`G` returns `C(t)`, which omits `(∂M/∂u)y` outright, so the **first**
+derivative is already wrong.
+
+[C-1](#c-1) is what makes the remainder admissible: inputs are data-only, and a
+callable that reads the optimizer's own control array is not a data-only input.
+But the residue is not zero and is recorded here rather than elided, because
+**the failure direction is silent.** Both numbers below are exact, and
+`tests/test_time_varying_affine.py::test_a_coefficient_closing_over_the_control_defeats_the_skip`
+recomputes them so this clause cannot rot: `y' = m(u)y + u` with
+`m = −0.2 + 0.7u` smuggled through a closure, `y₀ = 0.8`,
+`t_span = (0, 0.5)`, `N = 1`, explicit Euler, `J = y₁²/2`, at `u = 0.3`. The
+package differentiates the form it was handed and returns `y₁h = 0.477`; the
+objective it actually computes moves at `y₁h(0.7y₀ + 1) = 0.74412`, confirmed
+by a central difference at `ε = 1e-6`. Nothing raises.
+
+No cheap exact check exists on this side, and the reason is worth stating: a
+coefficient that varies only when `u` varies is **constant throughout any
+single gradient evaluation**, so no consistency comparison within a solve can
+observe it. That is what separates this from [C-15.2](#c-15), where the two
+matrices being compared both exist inside one solve.
+
+Whether this residue should be closed by having the representation own
+coefficient *samples* on the solve mesh, rather than invoke callables, is
+[C-Q6](#open-questions).
+
+### C-17.2 Zero curvature does not imply a constant Jacobian
+
+[C-16.1](#c-16) requires the three dispatch axes be kept separate, and this is
+the case that separates two of them. `F = M(t_i)` differs between stages at
+distinct abscissae, so [C-15](#c-15) reuse must be **off** while the curvature
+skip stays **on**.
+
+The fact is carried by `coefficients_constant`, a member of each root class's
+guarantee rather than a caller declaration, and is read by `deduce_structure` to
+set `jacobian_constant`. Before this clause that field was asserted `True` for
+anything verified affine, which was correct only because the constant case was
+the only one that existed — [C-15.1](#c-15)'s lesson in its other direction: a
+value can be correct for the whole population that can reach it and still state
+something false.
+
+Nothing here replaces [C-15.2](#c-15). A caller may still pass an explicit
+`ProblemStructure(jacobian_constant=True)`, and the store then compares the
+stored matrix with the requested one element for element and raises
+`DeclaredStructureViolation` at the first disagreement. That refusal is asserted
+for every implicit method in the certification population, because the deduction
+being right is not evidence that the backstop behind it works.
+
+### C-17.3 Caller obligations, and what guards them
+
+`M`, `C` and `b` must be **deterministic functions of `t`**. A coefficient that
+drifted between calls would make the adjoint apply the transpose of a matrix the
+forward solve did not use, which is the [C-5.4](#c-5) failure mode.
+
+This is not checked exhaustively — that would require retaining every earlier
+call — but it is not unguarded. On the affine stage route, [C-16.4](#c-16)
+evaluates the residual after the solve from freshly read coefficients and tests
+it against the C-5.1 threshold, so a coefficient that changed between assembling
+`K` and evaluating `R` raises `NonAffineStageEquation` rather than returning an
+unconverged stage value.
+
+That guard is real but partial, and the boundary is worth naming. The `F` and
+`G` stored for the backward sweeps are read on a *further* call after the
+residual check (`adjungo/solvers/dirk.py:98`, `adjungo/solvers/sdirk.py:159`),
+so a coefficient that drifted on that call would seed the adjoint with a matrix
+the forward solve never used, undetected. Determinism is an obligation, not a
+verified fact.
+
+Two further obligations are enforced rather than documented:
+
+- **Shape.** Every coefficient value is checked against `(n, n)`, `(n, ν)` or
+  `(n,)` *at the time it is used*. Validating one sample at construction and
+  generalising to every other time would be a probe.
+- **Ownership.** Every coefficient value is copied and made non-writeable. A
+  callable is free to return one scratch buffer on every call and then write
+  into it, which would change a matrix a factorization had already been taken
+  from — [C-15.6](#c-15)'s aliasing defect arriving through the problem instead
+  of through the store. The copy costs `O(n²)` and guards an `O(n³)` solve, the
+  ratio [C-15.2](#c-15) uses to justify its own comparison.
+
+### C-17.4 The certified quantities — `OBSERVED`
+
+Per [C-16.3](#c-16) the route is invisible to every accuracy assertion, so route
+and count are certified separately from the numbers. A fourth quantity is
+certified here that has no analogue in the constant case: the **times** at which
+the coefficients are read.
+
+Measured on the fixture in `tests/test_time_varying_affine.py`: `n = 3`,
+`ν = 2`, `N = 6`, `t_span = (0.2, 0.95)`, `y₀ = (0.6, −0.3, 0.2)`, controls
+`make_controls(N, s, 2, seed=5, scale=0.4)`, one gradient evaluation.
+`M(t) = M₀ + sin(1.7t)M₁`, `C(t) = C₀ + tC₁`, `b(t) = b₀cos(0.9t)`.
+
+| Method | `s` | Implicit stage solves per step | Newton entries | Factorizations, `M(t)` | Factorizations, constant `M` |
+|---|---|---|---|---|---|
+| `rk4` | 4 | 0 | *n/a* | 0 | 0 |
+| `implicit_midpoint` | 1 | 1 | **0** | 6 | 1 |
+| `implicit_trapezoid` | 2 | 1 | **0** | 6 | 1 |
+| `sdirk2` | 2 | 2 | **0** | 12 | 1 |
+| `sdirk3` | 3 | 3 | **0** | 18 | 1 |
+| `gauss2` | 2 | 1 coupled, size `s·n` | **0** | 6 | 1 |
+
+The two factorization columns are asserted **together**, so that neither can be
+vacuous: a store that wrongly reused would collapse the fifth column to 1, and
+one that stopped reusing would raise the sixth to the fifth.
+
+The count is `steps × (implicit stage solves per step)` with no Newton
+multiplier. [C-15.3](#c-15) declines to predict a count without reuse precisely
+because Newton iteration counts are a property of Newton and the initial guess;
+on this route there is no Newton, so the count is a property of the tableau
+alone and is predictable after all. `factorizations_for_solve` still returns
+`None` here, and the test states the rule from the tableau rather than
+tabulating the numbers.
+
+**Times.** The coefficients are read at `t_n + c_i h` and nowhere else, asserted
+as a set over a whole gradient evaluation against the abscissae the method
+supplies, at 1e-12 absolute. The basis: stage times are O(1) and formed in a few
+flops, so a few ULPs of O(1) is the budget, and [C-11.3](#c-11) forbids pinning
+the bit pattern. The tolerance is eight orders below the spacing being resolved,
+`h·minᵢ≠ⱼ|cᵢ−cⱼ| ≈ 1.8e-2` for `sdirk2` on this mesh.
+
+This assertion exists because **every constant-coefficient fixture in the suite
+is blind to it.** A defect reading `M` at the step time instead of the stage
+time produces a derivative wrong by an amount that shrinks with `h`, which
+[C-3](#c-3) forbids reading as discretization error and which precedents
+[R-1](#r-1) and [R-2](#r-2) record being misread that way twice. This is
+[C-16.8](#c-16)'s "population that cannot reach the defect" anticipated rather
+than discovered.
+
+**Numbers.** Against the independent monolithic reference
+([C-14.1](#c-14) level 1) over the six methods above, relative max-norm: worst
+gradient error **1.11e-16**, worst Hessian-vector error **5.55e-17**. Neither
+side stops at a convergence threshold — the package solves each stage equation
+directly and the reference's Newton iteration is exact in one step on an affine
+residual — so the floor is the backward error of the dense LU solves and the
+implicit population needs no `CONDITIONING_ALLOWANCE`. The certified tolerance
+is 1e-11, set five orders above the observation to absorb stage-matrix
+conditioning rather than to certify these coefficients.
+
+A closed-form anchor ([C-14.2](#c-14)) covers the stage-time claim at the level
+no implementation participates in: two explicit Euler steps on the scalar
+`y' = m(t)y + c(t)u` with `J = y₂²/2`, for which
+`dJ/du₀ = y₂(1 + h·m₁)h·c₀` and `dJ/du₁ = y₂h·c₁`. Two steps rather than one,
+and distinct coefficient values at the two step times, so that the anchor
+distinguishes `m₀` from `m₁`; a single step would be satisfied by any code that
+read the coefficients at one consistent time.
+
+### C-17.5 Injection evidence — `OBSERVED`
+
+Baseline 564 passed, 0 failed. Each defect introduced alone, under the
+[R-11](#r-11) cache-clearing procedure:
+
+| Defect | Failures |
+|---|---|
+| `deduce_structure` claims a constant Jacobian for varying coefficients | 52 |
+| `coefficients_constant` claims `True` for time-varying coefficients | 53 |
+| `F` reads `M` at a fixed time instead of the stage abscissa | 56 |
+| the coefficient value aliases the caller's buffer | 1 |
+| the coefficient shape is not checked where it is used | 2 |
+| verification stops guarding the constancy claim and the accessors | 5 |
+| verification resolves a multi-root class by MRO instead of refusing | 1 |
+| `f` drops the time-varying forcing `b(t)` | 4 |
+
+The first three are large because a false `jacobian_constant` is caught by
+[C-15.2](#c-15) as a refusal across the whole implicit population, and a
+wrong-time `M` moves every oracle comparison at once. None went undetected,
+which is the first injection round in this repository for which that is true;
+the reason is that the population was built from the defect list rather than the
+other way round, following [C-16.8](#c-16).
+
+The list is nonetheless not a proof of coverage, and the C-17.1 obligation is
+the demonstration: it is a defect no injection into this package can produce,
+because the defect lives in the caller's closure. It is held by a pair of
+closed-form tests instead.
+
+Evidence: `tests/test_time_varying_affine.py`.
+
+---
+
 ## Open questions
 
 | ID | Question | Blocks |
@@ -1236,10 +1460,13 @@ cause: a population that cannot reach the defect.**
 | C-Q3 | Is `ν = 0` (uncontrolled trajectory) a supported configuration? | Nothing currently |
 | C-Q4 | Do multistep external vectors hold `y` history or `h·f` history under C-8.1? | Any future `r > 1` work |
 | C-Q5 | Characteristic state scale `y_scale` for C-5.1 — is `max(‖y₀‖_∞, 1)` adequate for problems with large transients? | Tightening C-5 |
+| C-Q6 | Should `TimeVaryingAffineDynamics` own coefficient *samples* on the solve mesh instead of invoking caller callables, closing the [C-17.1](#c-17) closure-capture residue by construction? Needs a mesh-aware constructor and an index rather than a float-`t` lookup, so it changes the `Problem` protocol. | Nothing currently; removes a silent-failure obligation |
 
 ---
 
 ## Precedents
+
+<a id="r-1"></a>
 
 **R-1 — A single-ε finite-difference check cannot certify an adjoint.**
 Two defects in this repository (a DIRK adjoint that never applied the transposed
@@ -1618,3 +1845,21 @@ index. They were compiled for CPython 3.12 while the pinned environment runs
 3.14, so they were inert for current work, but a contributor on 3.12 could have
 received cached bytecode for a source file they then edited — R-11's hazard made
 durable and distributable. They have been removed from the index.
+
+**Second addendum — the harness must not silence the result it reads.**
+`pyproject.toml` already sets `addopts = "-q --strict-markers"`. Passing `-q`
+again on the command line therefore yields `-q -q`, and at that verbosity pytest
+prints the progress line and **no summary line at all**: no `N passed`, no
+`N failed`. An injection harness that scrapes the output for `failed` then reads
+zero for every injection and reports that the suite is insensitive to all of
+them.
+
+This was observed here while certifying [C-17](#c-17): eight injections, all
+genuinely detected, all reported as `0 failing`, with a baseline that looked
+clean because it was equally unparseable. The failure direction is the dangerous
+one this clause is about — quiet, plausible, and arguing for weaker tests.
+
+Two requirements follow. Use the command in `AGENTS.md` **as written**, without
+adding `-q`. And have the harness cross-check the parsed count against the
+process exit status, refusing to report a number when a nonzero exit yields no
+parsed failures or a zero exit yields some; the discrepancy is what caught this.

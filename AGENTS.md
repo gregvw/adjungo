@@ -49,6 +49,15 @@ find . -name __pycache__ -type d -not -path './.venv/*' -exec rm -rf {} + 2>/dev
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider
 ```
 
+Run that command **as written**. Do not add `-q`: `pyproject.toml` already sets
+`addopts = "-q --strict-markers"`, so a second `-q` raises the quiet level far
+enough that pytest prints no summary line at all — no `N passed`, no `N failed`.
+A harness scraping for `failed` then reports `0` for every injection and
+concludes the suite is insensitive to all of them. That happened here while
+certifying C-17: eight injections, every one genuinely detected, all reported as
+undetected. Cross-check any parsed count against the process exit status. See
+NUMERICS.md R-11, second addendum.
+
 Clear the cache **before the injected run and again before the restored run**.
 CPython validates a `.pyc` against the source's size and its modification time
 *truncated to whole seconds*. A one-character swap such as `F[i]` to `F[j]`

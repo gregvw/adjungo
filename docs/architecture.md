@@ -54,10 +54,13 @@ adjungo/
                        ProblemStructure: the caller's declaration of linearity,
                        Jacobian constancy, control dependence, and the two
                        affineness axes state_affine and jointly_affine.
-    affine.py          AffineDynamics: y' = M y + C u + b as a representation
-                       rather than a claim. Affineness is established by
-                       construction, so it needs no verification the way a
-                       declaration does.
+    affine.py          AffineDynamics: y' = M y + C u + b, and
+                       TimeVaryingAffineDynamics: y' = M(t)y + C(t)u + b(t),
+                       as representations rather than claims. Affineness is
+                       established by construction, so it needs no verification
+                       the way a declaration does. The two differ on
+                       coefficients_constant, which decides C-15 reuse and is
+                       part of the guarantee rather than a declaration.
     objective.py       Objective protocol: terminal and running cost, their
                        first derivatives, and their second-derivative actions.
     method.py          GLMethod: tableaux A, U, B, V, abscissae c; StageType
@@ -229,7 +232,7 @@ Stated here so that this document cannot be read as advertising.
 | Sparse or matrix-free linear algebra | Not built. `algebra/protocols.py` is the seam it would enter through. |
 | Reuse for a *varying* Jacobian (modified Newton, lagged Jacobian) | Not built. The refusal is narrower than it first appears and is stated precisely below. |
 | Sparse or specialised factorization of `K` | Not built. Eligibility is a property of the **assembled matrix**, never of the tableau: `K = I - h(A (x) I)blockdiag(F_j)` is not symmetric for a general `F`, so no tableau classification can establish that Cholesky applies. |
-| Time-varying or nonlinear-in-control affine coefficients | Not built. `AffineDynamics` holds constant `M`, `C`, `b`. `f = M(t)y + C(t)u + b(t)` is the natural next case and needs no new argument, only new code. |
+| Nonlinear-in-control affine coefficients | Not built. `f = M(t, u)y + b(t, u)` is `state_affine` but not `jointly_affine`, so it keeps the direct stage solve and loses the curvature skip. `tests/problems.py::ConstantJacobianQuadraticControl` is the in-tree instance; no representation class owns the case. |
 | Checkpointing | Not built. Storage is `O(N s n)`, everything retained. |
 | Generic scalar type | A C++ concern, not a Python one. See below. |
 
@@ -320,6 +323,22 @@ be obtained to a tolerance; the derivative solves must use the true operator.
 Ergonomics that need not carry forward: the Python `Problem` protocol requires
 a general callback problem to supply three second-derivative callbacks even
 when they return zero. A problem expressed as `adjungo.core.affine`'s
-`AffineDynamics` no longer needs them, because the terms are known to vanish
-and are skipped; a C++ interface should make that the default for every
-structurally known zero.
+`AffineDynamics` or `TimeVaryingAffineDynamics` no longer needs them, because
+the terms are known to vanish and are skipped; a C++ interface should make that
+the default for every structurally known zero.
+
+`TimeVaryingAffineDynamics` is also where the two structural facts come apart,
+and a reimplementation must keep them apart. Zero curvature opens the skip;
+a constant Jacobian opens factorization reuse. The time-varying case has the
+first and not the second, and NUMERICS.md C-17.2 records that the deduction
+originally asserted the second for anything verified affine -- correct only
+because the constant case was then the only one that existed.
+
+It is also the first place in this package where part of a guarantee is a
+caller obligation rather than a constructed fact. The class owns the *form*
+`M(.)y + C(.)u + b(.)`, but the coefficients are caller-supplied callables,
+and invoking them with `t` alone confines the interface and not a closure over
+the control. NUMERICS.md C-17.1 carries the argument and the failure numbers.
+A C++ port has a real option Python does not: take coefficient callables as
+stateless function pointers, or take sampled arrays on the solve mesh, either
+of which closes the residue by construction (C-Q6).
