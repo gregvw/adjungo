@@ -105,9 +105,55 @@ from numpy.typing import NDArray
 
 __all__ = [
     "AffineDynamics",
+    "MutableCoefficients",
     "TimeVaryingAffineDynamics",
     "affine_dynamics_verified",
 ]
+
+
+class MutableCoefficients(RuntimeError):
+    """An affine problem's coefficient buffers are not immutable — C-15.7.
+
+    ``AffineDynamics`` freezes its coefficients at construction so that ``F``
+    may return ``self._M`` itself rather than a copy. The backward sweeps then
+    read a tape of references to that one buffer, and the object's whole claim
+    to be affine by construction rests on the buffer not changing under them.
+
+    Unlike every other refusal in this module, this one **raises rather than
+    returning** ``False``. The others are safe to answer quietly because the
+    general route computes the same derivative, only more slowly. This one is
+    not: the general route reads ``F`` and retains what it returns exactly as
+    the affine route does, so a problem whose coefficients can be rewritten
+    mid-solve is wrong by the same amount on both. Declining to certify it
+    would pick a route already known to give no better an answer, which is
+    the silent-sentinel shape C-7 forbids.
+
+    Reached in practice by a subclass that replaces a buffer after
+    ``super().__init__`` — ``self._M = self._M.copy()`` looks defensive and
+    produces a writeable array.
+    """
+
+    def __init__(self, cls: type, name: str, reason: str) -> None:
+        super().__init__(
+            f"{cls.__name__} instance has a {reason} coefficient buffer "
+            f"{name!r}. AffineDynamics freezes its coefficients at "
+            f"construction because F returns the buffer itself and the "
+            f"backward sweeps hold references to it; a buffer that can be "
+            f"rewritten between the forward solve and the adjoint seeds the "
+            f"adjoint with a matrix the forward solve never used "
+            f"(NUMERICS.md C-15.7). This cannot be answered by taking the "
+            f"general route, which reads F the same way. Build the problem "
+            f"with AffineDynamics(M, C, b) and do not rebind or replace "
+            f"{name!r} afterwards."
+        )
+        self.name = name
+
+
+#: The instance attributes holding frozen coefficient data. Named once because
+#: ``__setstate__`` has to re-freeze exactly what ``__init__`` froze, and a
+#: fourth buffer added to one and not the other would be silently writeable
+#: after a deep copy.
+_COEFFICIENT_BUFFERS = ("_M", "_C", "_b")
 
 
 class AffineDynamics:
@@ -125,6 +171,9 @@ class AffineDynamics:
     matrix at every stage of every step; a coefficient that could change between
     steps would make the M6 factorization store reuse a factorization of a
     matrix that no longer exists.
+
+    The immutability survives copying and pickling; see ``__setstate__`` and
+    C-15.7 for why that needs saying at all.
     """
 
     def __init__(
@@ -147,7 +196,7 @@ class AffineDynamics:
         b_arr = (
             np.zeros(n)
             if b is None
-            else np.array(b, dtype=float, copy=True).reshape(-1)
+            else np.array(np.reshape(b, -1), dtype=float, copy=True)
         )
         if b_arr.shape != (n,):
             raise ValueError(
@@ -161,6 +210,54 @@ class AffineDynamics:
         self._C = C_arr
         self._b = b_arr
         self._nu = int(C_arr.shape[1])
+
+    def __setstate__(self, state: Any) -> None:
+        """Restore state and re-freeze the coefficient buffers — C-15.7.
+
+        ``copy.deepcopy`` does not preserve ``writeable=False``: NumPy defines
+        ``ndarray.__deepcopy__``, and it returns a writeable array. Pickle,
+        which goes through ``__reduce__``, does preserve the flag, and
+        ``copy.copy`` shares the original buffers and so cannot lose it. Only
+        the deep copy unfreezes.
+
+        This hook is the one both the copy and pickle protocols run, so
+        re-freezing here covers every route at once. Reconstructing through
+        ``__deepcopy__`` instead would have discarded state a subclass added,
+        which is a worse failure for a smaller gain.
+
+        The two-element form of ``state`` has to be handled for that reason to
+        hold: ``object.__reduce_ex__`` reports a subclass carrying ``__slots__``
+        as ``(instance_dict, slot_values)``, and such a subclass is verified,
+        since adding a slot overrides no guaranteed member. Assuming a plain
+        dict here would raise on every copy of one — discarding its state in a
+        different and louder way.
+
+        A state missing a coefficient raises ``KeyError``, which is the C-7
+        direction: there is no correct value to substitute.
+
+        A buffer that does not own its storage is replaced by one that does,
+        rather than merely frozen. Pickle reconstructs an ``ndarray`` as a view
+        over the pickled ``bytes``, and while those particular bytes are
+        immutable, "frozen view over something else" is a weaker property than
+        the constructor establishes and a more expensive one to check. The copy
+        is ``O(n²)`` and restores exactly the constructor's postcondition, which
+        is what :func:`_refuse_mutable_coefficients` is then able to assert
+        cheaply.
+        """
+        slots: dict[str, Any] | None = None
+        if isinstance(state, tuple) and len(state) == 2:
+            state, slots = state
+        if state:
+            self.__dict__.update(state)
+        if slots:
+            for name, value in slots.items():
+                object.__setattr__(self, name, value)
+        for name in _COEFFICIENT_BUFFERS:
+            buffer = self.__dict__[name]
+            if not buffer.flags.owndata:
+                buffer = buffer.copy()
+                self.__dict__[name] = buffer
+            buffer.flags.writeable = False
 
     @property
     def M(self) -> NDArray:
@@ -516,6 +613,36 @@ _SKIPPED_ON_THE_AFFINE_ROUTE = ("F_yy_action", "F_yu_action", "F_uu_action")
 #: route for it. That is the correct direction under C-16.2.
 _LOOKUP_HOOKS = ("__getattribute__", "__getattr__", "__dict__")
 
+#: Copying is part of the guarantee for the same reason attribute lookup is.
+#: ``__setstate__`` re-establishes the coefficient immutability that
+#: ``copy.deepcopy`` would otherwise drop (C-15.7), and every entry here can
+#: stop it running or hand back an object the constructor would never have
+#: produced: ``__deepcopy__``, ``__copy__`` and ``__replace__`` pre-empt the
+#: copy protocol outright, ``__reduce__`` and ``__reduce_ex__`` choose the
+#: reconstructor and what is passed to it, and ``__getstate__`` chooses what
+#: there is to restore. A subclass overriding ``__setstate__`` alone leaves
+#: every other comparison in this module passing, so without this tuple the
+#: cure is one method away from being undone.
+#:
+#: ``__replace__`` is the ``copy.replace`` hook added in Python 3.13. Neither
+#: root defines it, so ``copy.replace`` on one raises; it is listed because a
+#: subclass that defines it acquires a duplication route that runs none of the
+#: others, and the policy here refuses the mechanism rather than judging each
+#: implementation.
+#:
+#: Checked on both roots although only :class:`AffineDynamics` currently holds
+#: frozen buffers. The question is whether copying can yield an instance
+#: differing from a constructed one, and that is a question about both.
+_COPY_PROTOCOL_HOOKS = (
+    "__setstate__",
+    "__getstate__",
+    "__deepcopy__",
+    "__copy__",
+    "__replace__",
+    "__reduce__",
+    "__reduce_ex__",
+)
+
 #: Distinguishes "defined on neither" from "defined on one". The lookup hooks
 #: are defined on neither root, so the comparison needs a default on both
 #: sides. An object sentinel rather than ``None`` so that "not defined" and
@@ -544,6 +671,28 @@ def _defined_as(cls: type, name: str) -> Any:
     return _MISSING
 
 
+def _refuse_mutable_coefficients(problem: AffineDynamics) -> None:
+    """Raise unless every coefficient buffer is frozen and owns its storage.
+
+    Both conditions are needed, and the second is the one that is easy to
+    miss. ``np.array(b, copy=True).reshape(-1)`` returns a *view*: freezing it
+    leaves ``arr.base`` writeable, so the values behind a buffer reported as
+    read-only could still be rewritten. Requiring ``owndata`` removes the
+    question rather than walking a base chain to answer it.
+
+    ``O(1)`` per buffer, once per route decision, against the ``O(n³)`` solve
+    it guards.
+    """
+    for name in _COEFFICIENT_BUFFERS:
+        buffer = problem.__dict__[name]
+        if buffer.flags.writeable:
+            raise MutableCoefficients(type(problem), name, "writeable")
+        if not buffer.flags.owndata:
+            raise MutableCoefficients(
+                type(problem), name, "non-owning (its base is writeable)"
+            )
+
+
 def affine_dynamics_verified(
     problem: Any,
 ) -> TypeGuard[AffineDynamics | TimeVaryingAffineDynamics]:
@@ -568,7 +717,8 @@ def affine_dynamics_verified(
     and the cost of refusing it is that a caller who wrote one gets the general
     route.
 
-    Three things are checked, and the second is the one that is easy to omit:
+    Four things are checked. The second is the one that is easy to omit, and
+    the fourth is the only one that raises:
 
     1. **The class.** Every guaranteed member bound in the MRO is the object
        the root class binds, read by :func:`_defined_as` rather than by
@@ -589,7 +739,19 @@ def affine_dynamics_verified(
     3. **Attribute lookup.** ``__getattribute__``, ``__getattr__`` and
        ``__dict__`` are the root's, so the members compared above are the
        members the solver will later receive, and the instance storage read in
-       step 2 is the real one.
+       step 2 is the real one. The copy and pickle hooks are compared here too,
+       so that a copy of a verified problem is one the constructor could have
+       produced — in particular one whose coefficients are still immutable
+       (C-15.7).
+    4. **The coefficients themselves.** Every buffer is frozen and owns its
+       storage. This one **raises** :class:`MutableCoefficients` instead of
+       returning ``False``, and the asymmetry is the point: the three checks
+       above are safe to answer quietly because the general route computes the
+       same derivative more slowly, whereas the general route reads ``F`` and
+       retains what it returns exactly as the affine route does. There is no
+       route that repairs a rewritable coefficient, so declining to certify it
+       would choose a route already known to be no better — the silent
+       sentinel C-7 forbids.
 
     Per C-1 this is not a claim of robustness against a hostile caller, and it
     is not one. What it does not reach: patching the **root class itself**
@@ -615,7 +777,7 @@ def affine_dynamics_verified(
     root = roots[0]
     cls = type(problem)
 
-    for name in _LOOKUP_HOOKS:
+    for name in _LOOKUP_HOOKS + _COPY_PROTOCOL_HOOKS:
         if _defined_as(cls, name) is not _defined_as(root, name):
             return False
 
@@ -632,8 +794,13 @@ def affine_dynamics_verified(
     # __slots__ has no instance dict, and a slot shadowing a guaranteed member
     # is a class-level descriptor already refused above.
     shadowed = getattr(problem, "__dict__", {})
-    return not any(
+    if any(
         name in shadowed
         for name in guaranteed
         if name not in _SKIPPED_ON_THE_AFFINE_ROUTE
-    )
+    ):
+        return False
+
+    if root is AffineDynamics:
+        _refuse_mutable_coefficients(problem)
+    return True

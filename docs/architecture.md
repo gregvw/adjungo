@@ -306,6 +306,20 @@ of what must carry forward; it currently has nine items. The short version:
     outright; the instance half has no C++ analogue, since a member function
     cannot be rebound per object.
 
+    Ownership also has to survive *copying*, and has to be true of the
+    instance rather than assumed from the constructor. The coefficient buffers
+    are frozen at construction so that `F` can hand back `self._M` itself and
+    the tape may alias it; `copy.deepcopy` returned them writeable, because
+    NumPy's own `ndarray.__deepcopy__` does, and a subclass calling
+    `self._M = self._M.copy()` after `super().__init__` unfroze them too.
+    NUMERICS.md C-15.7 records the cure — re-freeze in `__setstate__`, and
+    check the buffers at the verification boundary — together with the reason
+    that check *raises* where every other refusal in that function returns
+    `False`: refusing merely selects the general route, which retains what `F`
+    returns in the same way, so for this one defect there is no route that
+    gives a better answer. In C++ the whole class of problem is a `const`
+    member and a correct copy constructor.
+
 ### Modified Newton: the refusal is narrower than it looks
 
 The "not built" table above refuses lagged and modified Jacobians. The reason

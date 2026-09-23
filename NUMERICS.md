@@ -1011,6 +1011,148 @@ If this agreement ever fails by a small amount, the correct reading is **not**
 roundoff. It is that some input was not identical and C-15.2's guard was
 reached with something it should have rejected.
 
+### C-15.7 Coefficient immutability must survive copying — `APPROVED`
+
+`AffineDynamics.__init__` copies its coefficient arrays and sets
+`writeable=False`. That is what makes it safe for `F` to return `self._M`
+itself rather than a copy: the tape the backward sweeps read holds references
+to that one buffer, so a buffer that could change between the forward solve
+and the adjoint would seed the adjoint with a matrix the forward solve never
+used.
+
+**The invariant is that the coefficient data cannot be written, and it must
+hold for every instance the caller can obtain.** Two things were assumed to
+establish it and did not.
+
+#### The deep copy
+
+`copy.deepcopy` did not preserve the flag. NumPy defines
+`ndarray.__deepcopy__`, and it returns a writeable array, so the copy arrived
+with the ownership guarantee already gone. `pickle` goes through `__reduce__`,
+which records the flag, and `copy.copy` shares the original buffers, so the
+deep copy was alone in this — which is why it survived M6 and M7 unnoticed.
+
+The cure is `__setstate__`, the one hook that both the default copy and the
+default pickle protocol run, re-establishing the constructor's postcondition
+for every name in `adjungo/core/affine.py::_COEFFICIENT_BUFFERS`.
+Reconstructing through `__deepcopy__` instead would have discarded state a
+subclass had added, which is a worse failure for a smaller gain — and that
+choice obliges `__setstate__` to accept the `(instance_dict, slot_values)`
+form, since a subclass carrying `__slots__` overrides no guaranteed member and
+so is verified.
+
+The postcondition is *owning* as well as frozen. A frozen view over a
+writeable base is not immutable data, and there were two: `pickle`
+reconstructs an `ndarray` as a view over the pickled `bytes`, and
+`np.array(b, copy=True).reshape(-1)` returned a view whose `base` stayed
+writeable, so an explicitly supplied `b` could be changed through `p.b.base`
+while every flag on `p.b` read read-only.
+
+The copy protocol is therefore part of the guarantee, and
+[C-16.9](#c-16)'s comparison is extended to `__setstate__`, `__getstate__`,
+`__deepcopy__`, `__copy__`, `__replace__`, `__reduce__` and `__reduce_ex__`. A
+subclass overriding `__setstate__` alone leaves every other comparison in
+`affine_dynamics_verified` passing, so without that the cure is one method
+away from being undone. This covers the *default* protocols: a `copyreg`
+reducer registered externally for the class runs ahead of them, and is C-1
+territory.
+
+#### Construction
+
+The second assumption was that anything reaching `__init__` is safe. It is
+not. A subclass writing
+
+```python
+super().__init__(M, C, b)
+self._M = self._M.copy()
+```
+
+looks defensive and is the reverse: NumPy returns a **writeable** copy. Such a
+subclass overrides no guaranteed member and no copy hook, so every structural
+comparison passes and it is certified affine with mutable coefficients.
+
+`affine_dynamics_verified` therefore also checks the buffers themselves, and
+**raises `MutableCoefficients` rather than returning `False`**. That asymmetry
+is the substance of this clause. Every other refusal in that function is safe
+to answer quietly, because the general route then computes the same derivative
+more slowly. This one is not.
+
+#### Refusing is a guard; only immutability is a cure
+
+C-Q7 posed re-freezing and a writeability check as alternatives. They are not:
+one is the cure and the other is a guard against the invariant being false for
+some reason the cure does not cover, and both are needed. A refusal alone would
+not repair anything, because the general route retains what `F` returns in the
+same way the affine route does.
+
+This is not an argument, it is a measurement. Fixture: `n = ν = 1`, `M = 0.4`,
+`b = 0`, `y₀ = 0.8`, `t_span = (0, 0.5)`, `N = 2` so `h = 0.25`,
+`u = (0.3, 0.2)`, `explicit_euler`, `J = ½y₂²`. A coefficient is overwritten
+with `M' = 0.9` on the first callback of the backward sweep, the earliest
+moment at which the two sweeps can disagree. With `a = 1 + hM`, the gradient is
+`∂J/∂u₀ = hCy₂a` and `∂J/∂u₁ = hCy₂`, so replacing `a` by `a'` in the adjoint
+alone displaces the first component by `hCy₂(a' − a) = h²Cy₂(M' − M)` —
+**one** factor of `C`, not two:
+
+| Quantity | `C = 1` | `C = 2` |
+|---|---|---|
+| `y₁`, `y₂` | `0.955`, `1.1005` | `1.03`, `1.233` |
+| `∂J/∂u` exact | `(0.3026375, 0.275125)` | `(0.678150, 0.61650)` |
+| `∂J/∂u` with the overwrite | `(0.337028125, 0.275125)` | `(0.7552125, 0.61650)` |
+| Displacement `h²Cy₂(M' − M)` | `0.034390625` | `0.0770625` |
+
+The displacement is derived in closed form rather than read off a broken run,
+per [C-14.1](#c-14). The `C = 2` column is carried because at `C = 1` a
+spurious square is invisible, and an earlier draft of this clause had one.
+`∂J/∂u₁` never multiplies by the state Jacobian and is untouched, which
+localises the defect to the one propagation step that reads the overwritten
+matrix.
+
+After the cure the overwrite raises `ValueError` at the write itself, which is
+the [C-7](#c-7) direction.
+
+**"Every route" would be too strong and is not claimed.** The monolithic
+reference path in `adjungo/validation/reference.py` assembles its own arrays
+and copies values out of `F`, and is *not* displaced by this mutation. What
+decides the matter is not whether a route reads `F` but whether it retains the
+object `F` returned, which the `GLMOptimizer` stage-solver paths do.
+
+#### Injection evidence — `OBSERVED`
+
+Under [R-11](#r-11) against a 640-test baseline with 0 failures:
+
+| Injected defect | Failing tests |
+|---|---|
+| `__setstate__` removed entirely (the state this clause corrects) | 9 |
+| `__setstate__` restores state but does not re-freeze | 9 |
+| `__setstate__` leaves the buffers writeable outright | 12 |
+| Only `_M` is re-frozen; `_C` and `_b` are missed | 1 |
+| `__setstate__` assumes a plain dict, breaking `__slots__` subclasses | 1 |
+| `__setstate__` freezes without restoring ownership | 4 |
+| Verification stops checking the copy-protocol hooks | 8 |
+| `__setstate__` dropped from the guarded copy hooks | 2 |
+| `__deepcopy__` dropped from the guarded copy hooks | 1 |
+| The mutable-coefficient refusal is removed | 5 |
+| The refusal returns `False` instead of raising | 4 |
+| The refusal checks `writeable` but not `owndata` | 1 |
+| `b` is reshaped into a view rather than an owning copy | 57 |
+| The freeze is dropped from the constructor as well | 69 |
+
+The ownership half of the refusal was initially **undetected**, and is
+recorded for the reason [C-15.5](#c-15) already gives: once `__init__` and
+`__setstate__` both establish ownership, no construction route reaches a
+frozen non-owning buffer, so no behavioural test can exercise that branch. It
+is now asserted directly, by building the state by hand, exactly as the
+control-independence gate was.
+
+Evidence: `tests/test_coefficient_immutability.py`.
+
+What this does not reach, per [C-1](#c-1): a caller who builds an instance
+through `object.__new__` and populates `__dict__` directly runs neither
+`__init__` nor `__setstate__`, and a caller who holds a reference taken before
+the buffer was frozen. The refusal above narrows the gap to those, rather than
+closing it.
+
 ---
 
 <a id="c-16"></a>
@@ -1469,7 +1611,9 @@ Two further obligations are enforced rather than documented:
   into it, which would change a matrix a factorization had already been taken
   from — [C-15.6](#c-15)'s aliasing defect arriving through the problem instead
   of through the store. The copy costs `O(n²)` and guards an `O(n³)` solve, the
-  ratio [C-15.2](#c-15) uses to justify its own comparison.
+  ratio [C-15.2](#c-15) uses to justify its own comparison. The constant-
+  coefficient class establishes the same ownership once, at construction, and
+  [C-15.7](#c-15) is what keeps it through a copy.
 
 ### C-17.4 The certified quantities — `OBSERVED`
 
@@ -1577,7 +1721,6 @@ Evidence: `tests/test_time_varying_affine.py`.
 | C-Q4 | Do multistep external vectors hold `y` history or `h·f` history under C-8.1? | Any future `r > 1` work |
 | C-Q5 | Characteristic state scale `y_scale` for C-5.1 — is `max(‖y₀‖_∞, 1)` adequate for problems with large transients? | Tightening C-5 |
 | C-Q6 | Should `TimeVaryingAffineDynamics` own coefficient *samples* on the solve mesh instead of invoking caller callables, closing the [C-17.1](#c-17) closure-capture residue by construction? Needs a mesh-aware constructor and an index rather than a float-`t` lookup, so it changes the `Problem` protocol. | Nothing currently; removes a silent-failure obligation |
-| C-Q7 | `copy.deepcopy` of an `AffineDynamics` returns coefficient buffers with `writeable=True`, losing the C-15.6 immutability the constructor established; `copy.copy` and `pickle` both preserve it. Verified under NumPy 2.5.3. Should the class define `__deepcopy__` to re-freeze, or should writeability be checked at verification? | Nothing currently; pre-existing, [C-1](#c-1) territory |
 
 ---
 
