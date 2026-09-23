@@ -55,10 +55,13 @@ from __future__ import annotations
 
 import copy
 import pickle
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import pytest
 from numpy.typing import NDArray
+from scipy.sparse import csr_array
 
 from adjungo import GLMOptimizer, ProblemStructure
 from adjungo.core.affine import (
@@ -69,6 +72,7 @@ from adjungo.core.affine import (
     MissingCoefficients,
     MutableCoefficients,
     TimeVaryingAffineDynamics,
+    _defined_as,
     affine_dynamics_verified,
     require_immutable_coefficients,
 )
@@ -83,6 +87,11 @@ from adjungo.validation.reference import reference_gradient
 M_CONST = np.array([[0.4]])
 C_CONST = np.array([[1.0]])
 M_OVERWRITTEN = 0.9
+
+#: The ``C = 2`` fixture of C-15.7, where the displacement is largest and the
+#: exact and mutated gradients are furthest apart (0.6781500 against
+#: 0.7552125). ``_closed_form(2.0)`` gives both.
+C_DOUBLED = np.array([[2.0]])
 
 Y0 = np.array([0.8])
 T_SPAN = (0.0, 0.5)
@@ -765,17 +774,28 @@ def test_mutable_coefficients_raise_however_the_problem_is_ineligible(
 
 
 def test_the_coefficients_are_read_through_the_roots_own_dict_descriptor() -> None:
-    """The read cannot be answered by the machinery it runs ahead of.
+    """The marker cannot be answered by the machinery it runs ahead of.
 
     ``__dict__`` is a lookup hook, and the coefficient check now runs before
-    the lookup hooks are compared. Reading ``problem.__dict__`` would therefore
-    consult a subclass property whose honesty is exactly what has not been
-    established yet — and that subclass is quietly refused a few lines later,
-    so it is precisely a case that must not be allowed to answer for itself.
+    the lookup hooks are compared. Reading the root-initialised marker through
+    ``problem.__dict__`` would therefore consult a subclass property whose
+    honesty is exactly what has not been established yet — and that subclass
+    is quietly refused a few lines later, so it is precisely a case that must
+    not be allowed to answer for itself.
 
     The buffer is unfrozen before the hiding class is installed, so the test
     builds its state through ordinary storage and shares no mechanism with the
-    code under test.
+    code under test. The subclass below, constructed normally, covers what
+    that sequencing cannot.
+
+    Neither shape here can be reached by either widening, which is not
+    incidental. Both override ``f``, ``F`` and ``G``, so reader identity sees
+    nothing of the root's; and the buffer is *deleted* rather than replaced,
+    so presence has no name to resolve. That leaves the marker as the only
+    thing able to speak, which is the point: it is the only one of the three
+    that *remembers* that three frozen arrays were established here, and so
+    the only one that can tell an instance taken apart from one that was
+    never assembled.
     """
 
     class HidesItsDict(AffineDynamics):
@@ -783,31 +803,101 @@ def test_the_coefficients_are_read_through_the_roots_own_dict_descriptor() -> No
         def __dict__(self):  # type: ignore[override]
             return {}
 
+        def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return np.asarray(super().f(y, u, t))
+
+        def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().F(y, u, t).copy()
+
+        def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().G(y, u, t).copy()
+
     problem = _fresh()
-    problem.__dict__["_M"] = problem.M.copy()
+    del AffineDynamics.__dict__["__dict__"].__get__(problem)["_M"]
     problem.__class__ = HidesItsDict
 
     assert problem.__dict__ == {}
-    with pytest.raises(MutableCoefficients, match="_M"):
+    assert not hasattr(problem, "_M")
+    with pytest.raises(MissingCoefficients, match="_M"):
         affine_dynamics_verified(problem)
 
 
-def test_a_subclass_that_never_ran_the_root_initialiser_is_left_to_fail_loudly(
+def test_the_marker_is_written_where_it_is_read() -> None:
+    """Reading defensively and writing trustingly protects nothing — C-15.7.
+
+    The root-initialised marker is read through ``AffineDynamics``'s own
+    ``__dict__`` descriptor precisely so that no subclass can answer for it,
+    but it was *written* through ``self.__dict__``. A subclass exposing a
+    different mapping under that name therefore took delivery of the marker
+    while the read went to the real instance dictionary and found nothing, so
+    the precondition concluded the root initialiser had never run and every
+    one of the three call sites fell silent.
+
+    Reached by ordinary construction, which is what the test above cannot
+    reach: it installs the hiding class *after* ``__init__``, by which time the
+    marker has already been written to the real dictionary. Measured on the
+    committed fixture at ``C = 2`` when the buffer was a writeable array:
+    ``0.7552125`` against an exact ``0.6781500``, the usual ``0.0770625``.
+
+    As above, the overridden readers and the deleted buffer are what leave the
+    marker alone able to speak -- either widening would refuse this instance
+    wherever the marker had been delivered, and so could not witness the
+    write.
+    """
+
+    class KeepsItsOwnMapping(AffineDynamics):
+        def __init__(self, M: NDArray, C: NDArray) -> None:
+            object.__setattr__(self, "_side", {})
+            super().__init__(M, C)
+            del self._M
+
+        @property
+        def __dict__(self):  # type: ignore[override]
+            return object.__getattribute__(self, "_side")
+
+        def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return np.asarray(super().f(y, u, t))
+
+        def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().F(y, u, t).copy()
+
+        def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().G(y, u, t).copy()
+
+    problem = KeepsItsOwnMapping(M_CONST, np.array([[2.0]]))
+    storage = AffineDynamics.__dict__["__dict__"].__get__(problem)
+    assert problem.__dict__ is not storage
+    assert "_M" not in storage
+
+    objective = OverwritesCoefficientMidSolve(problem)
+    with pytest.raises(MissingCoefficients, match="_M"):
+        GLMOptimizer(
+            problem, objective, explicit_euler(), T_SPAN, N_STEPS, Y0
+        )
+    assert not objective.fired
+
+
+def test_a_subclass_that_never_ran_the_root_initialiser_is_refused_by_name(
 ) -> None:
-    """No buffers means nothing to alias, so this is *not* the guard's business.
+    """Inheriting a buffer reader is the obligation; running ``__init__`` is not.
 
     ``__init__`` carries no guarantee and is not compared, so a subclass can
-    inherit the buffer-reading methods while holding no buffers at all. An
-    earlier version raised ``MissingCoefficients`` here, inferring from the MRO
-    that the inherited ``f``/``F``/``G`` would read them. That inference is
-    unsound in the other direction -- an override may delegate to ``super()``
-    and read them anyway -- so it was dropped, and with it the ability to
-    recognise this shape at the route decision.
+    inherit ``f``, ``F`` and ``G`` while holding no buffers at all. This shape
+    is diagnosed at the route decision, naming the attribute.
 
-    Nothing is lost that C-7 cares about. An absent buffer cannot be aliased
-    and so cannot displace a gradient; the first read raises ``AttributeError``
-    naming the attribute. A wrong answer was never available here, which is why
-    the quiet path is the correct one and the diagnosis may be deferred.
+    An earlier version let it pass quietly, on the reasoning that an inference
+    from the MRO is unsound in the other direction -- an override may delegate
+    to ``super()`` and read the buffers anyway -- and so could not be trusted.
+    That reasoning confused a *replacement* for the recorded flag with a
+    *widening* of it. As a replacement it is indeed unsound, because it would
+    have to conclude "reads nothing" from an override it cannot see into. Set
+    beside the flag it only ever adds instances to the checked set, and it has
+    to: the sibling shape that assigns writeable ``_M``, ``_C`` and ``_b`` and
+    inherits all three readers ran the root's ``return self._M`` over storage
+    no guard had looked at, verified as affine, and displaced the gradient of
+    the C-15.7 fixture by the full ``0.0770625``. The absent-buffer case here
+    is the same rule reaching a harmless instance, and it is refused for the
+    same reason rather than by a second judgement about which absences matter.
     """
 
     class SkipsTheInitialiser(AffineDynamics):
@@ -815,11 +905,498 @@ def test_a_subclass_that_never_ran_the_root_initialiser_is_left_to_fail_loudly(
             pass
 
     problem = SkipsTheInitialiser()
-    require_immutable_coefficients(problem)
-    assert affine_dynamics_verified(problem)
 
-    with pytest.raises(AttributeError, match="_M"):
+    with pytest.raises(MissingCoefficients, match="_M") as raised:
+        affine_dynamics_verified(problem)
+    assert isinstance(raised.value, InvalidCoefficients)
+    assert not isinstance(raised.value, MutableCoefficients)
+    # The remedy differs from the post-construction case, so the message must
+    # not claim an initialiser that never ran.
+    assert "did not run AffineDynamics.__init__" in str(raised.value)
+
+
+class InheritsTheReadersWithoutTheInitialiser(AffineDynamics):
+    """Assigns the root's buffer names itself and inherits every reader.
+
+    Nothing about this is exotic. It is what a subclass looks like when its
+    author builds the coefficients some other way -- from a file, a mesh, a
+    parent object -- and sees no reason to route them through
+    ``super().__init__``. The arrays are plain and writeable, and the
+    inherited ``f``, ``F`` and ``G`` hand them to the tape by identity.
+
+    With the recorded flag as the *sole* precondition this instance was
+    invisible: no flag, so no check, so no refusal, while every member that
+    reads a buffer was the root's own.
+    """
+
+    def __init__(self, c: float) -> None:
+        self._M = np.array(M_CONST, dtype=float)
+        self._C = np.array([[c]], dtype=float)
+        self._b = np.zeros(1)
+        self._nu = 1
+
+
+def test_inheriting_a_reader_obliges_the_buffer_it_reads() -> None:
+    """The flag is not the only way to acquire the obligation.
+
+    Measured on the C-15.7 fixture at ``C = 2``: without this the default
+    optimizer returned ``0.7552125`` where the closed form gives ``0.6781500``
+    -- the ``0.0770625`` displacement of an adjoint seeded with a matrix the
+    forward solve never used. The setup is the module docstring's, with ``C``
+    doubled; ``_closed_form`` derives both numbers so neither is pinned as a
+    literal.
+    """
+    problem = InheritsTheReadersWithoutTheInitialiser(2.0)
+    assert problem.F(Y0, U[:1], 0.0) is problem._M
+    assert problem._M.flags.writeable
+
+    with pytest.raises(MutableCoefficients, match="_M"):
+        require_immutable_coefficients(problem)
+    with pytest.raises(MutableCoefficients, match="_M"):
+        affine_dynamics_verified(problem)
+    with pytest.raises(MutableCoefficients, match="_M"):
+        GLMOptimizer(
+            problem,
+            OverwritesCoefficientMidSolve(None),
+            explicit_euler(),
+            T_SPAN,
+            N_STEPS,
+            Y0,
+        )
+    with pytest.raises(MutableCoefficients, match="_M"):
         forward_solve(Y0, U, T_SPAN, N_STEPS, problem, explicit_euler(), None)
+
+
+class ForgesItsMRO(type):
+    """Answers ``__mro__`` with one that does not contain ``AffineDynamics``."""
+
+    @property
+    def __mro__(cls) -> tuple[type, ...]:
+        return (object,)
+
+
+class ForgesItsClassDict(type):
+    """Answers ``__dict__`` with an empty mapping on every class in the MRO."""
+
+    @property
+    def __dict__(cls) -> dict[str, Any]:  # type: ignore[override]
+        return {}
+
+
+def test_a_metaclass_cannot_forge_the_mro_the_precondition_reads() -> None:
+    """``cls.__mro__`` is attribute access on a class, so the metaclass answers.
+
+    The reader widening is a question about the MRO, and a metaclass reporting
+    one without ``AffineDynamics`` in it left ``_live_buffer_names`` empty
+    while Python's own method lookup went on resolving ``f``, ``F`` and ``G``
+    to the root's definitions. The gradient was displaced by the usual
+    ``0.0770625`` with all three guards quiet.
+
+    Reading the MRO through ``type``'s own getset descriptor gets the real
+    one. ``type`` is not a class any problem under test can shadow, which is
+    the same move that made the *instance* ``__dict__`` unforgeable.
+
+    This is not the dismissed case of patching ``AffineDynamics`` itself.
+    There, both sides of every comparison change together and the class really
+    does bind what the check is told; here the class binds one thing and
+    reports another.
+    """
+
+    class ForgesItsMRO(type):
+        @property
+        def __mro__(cls) -> tuple[type, ...]:
+            return (object,)
+
+    forging = ForgesItsMRO(
+        "ForgingSubclass", (AffineDynamics,), {"__module__": __name__}
+    )
+    problem = object.__new__(forging)
+    problem._M = np.array(M_CONST, dtype=float)
+    problem._C = np.array([[2.0]], dtype=float)
+    problem._b = np.zeros(1)
+    problem._nu = 1
+
+    # The forgery works, and method dispatch is unaffected by it: a walk of
+    # the reported MRO finds no root, while ``F`` hands back the writeable
+    # buffer exactly as before.
+    assert AffineDynamics not in forging.__mro__
+    assert problem.F(Y0, U[:1], 0.0) is problem._M
+
+    with pytest.raises(MutableCoefficients, match="_M"):
+        affine_dynamics_verified(problem)
+
+
+def test_a_metaclass_cannot_forge_the_class_dict_the_comparison_reads() -> None:
+    """The same hole, one level down, and it certifies rather than skips.
+
+    ``klass.__dict__`` inside the MRO walk is also attribute access on a
+    class. A metaclass answering it with ``{}`` hides the subclass's *own*
+    bindings, so the walk falls through to ``AffineDynamics`` and reports the
+    root's ``f`` for a class that really binds a nonlinear one — verification
+    certifies a problem that is not affine, and C-16.6 then drops the
+    curvature terms of a system that has them.
+
+    The existing metaclass regression in ``tests/test_instance_shadowing.py``
+    covers the ``__getattribute__`` route into the same place. This is the
+    property route, which that one does not reach.
+    """
+
+    class ForgesItsClassDict(type):
+        @property
+        def __dict__(cls) -> dict[str, Any]:  # type: ignore[override]
+            return {}
+
+    def nonlinear(self: Any, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.asarray(self._M @ y + self._C @ u + 5.0 * y**2)
+
+    forging = ForgesItsClassDict(
+        "ForgingSubclass",
+        (AffineDynamics,),
+        {"__module__": __name__, "f": nonlinear},
+    )
+    problem = forging(M_CONST, C_CONST)
+
+    # The forgery works: the class reports none of its own bindings.
+    assert dict(forging.__dict__) == {}
+    assert _defined_as(forging, "f") is nonlinear
+    assert not affine_dynamics_verified(problem)
+
+
+def test_an_object_dtype_coefficient_is_refused() -> None:
+    """``writeable=False`` on an ``object`` array covers the references only.
+
+    The elements behind them stay mutable, so a frozen, owning buffer held
+    every guarantee this clause asserts while its single element could still
+    be rewritten between the forward solve and the adjoint — the full
+    ``0.0770625`` displacement, both flags intact throughout. There is no
+    depth at which following the references ends, so the dtype is refused.
+
+    Unreachable through ``AffineDynamics(M, C, b)``, which casts to ``float``.
+    It arrives on the path that skips the initialiser and assigns the buffers
+    directly, which is the path the reader widening newly obliges.
+    """
+
+    class HoldsObjects(AffineDynamics):
+        def __init__(self) -> None:
+            payload = np.empty((1, 1), dtype=object)
+            payload[0, 0] = np.array(M_CONST[0, 0])
+            payload.flags.writeable = False
+            self._M = payload
+            self._C = np.array([[2.0]], dtype=float)
+            self._C.flags.writeable = False
+            self._b = np.zeros(1)
+            self._b.flags.writeable = False
+            self._nu = 1
+
+    problem = HoldsObjects()
+    assert not problem._M.flags.writeable
+    assert problem._M.flags.owndata
+
+    with pytest.raises(MutableCoefficients, match="_M") as raised:
+        affine_dynamics_verified(problem)
+    assert "object" in str(raised.value)
+
+
+class MasksPartOfItsCoefficient(AffineDynamics):
+    """Holds ``_M`` as a ``MaskedArray``, assigned rather than constructed.
+
+    The class inherits ``F``, which hands ``_M`` to the tape by identity, so
+    the buffer is live. Nothing here is a numpy trick — a masked coefficient
+    is an ordinary way to say which entries of a state matrix are
+    structurally absent — and that is the difficulty: the freeze seals the
+    data and leaves the mask writeable, so the entry the coefficient claims
+    is absent can become present after the check.
+    """
+
+    def __init__(self) -> None:
+        self._M = np.ma.masked_array(M_CONST, mask=[[True]], dtype=float)
+
+    @property
+    def state_dim(self) -> int:
+        return 1
+
+    @property
+    def control_dim(self) -> int:
+        return 1
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.asarray(np.ma.filled(np.ma.asarray(self._M), 0.0) @ y)
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.zeros((1, 1))
+
+
+def test_an_ndarray_subclass_coefficient_is_refused() -> None:
+    """``writeable = False`` seals the array, not everything it carries.
+
+    A ``MaskedArray``'s mask is a separate, ordinary, writeable array. Freeze
+    the buffer and the mask still turns entries on and off, which changes what
+    the coefficient means between the forward solve and the adjoint — the
+    C-15.7 defect exactly, reached without any flag being touched.
+
+    Measured before the cure on the module fixture at ``C = 2``, with ``_M``
+    a masked ``0.4`` deep-copied so that it verified as affine with its data
+    frozen and owning: flipping ``_M.mask[0, 0]`` inside the objective gave a
+    gradient of ``0.7706250`` against the exact ``0.6781500``. The size of the
+    displacement depends on how masked arithmetic degrades and is not the
+    claim; that nothing said anything is.
+
+    There is no general way to enumerate what an arbitrary subclass keeps, so
+    the type must be ``ndarray`` exactly.
+    """
+    problem = MasksPartOfItsCoefficient()
+    assert isinstance(problem._M, np.ma.MaskedArray)
+    problem._M.flags.writeable = False
+    assert problem._M.mask.flags.writeable
+
+    for raises in (
+        lambda: require_immutable_coefficients(problem),
+        lambda: affine_dynamics_verified(problem),
+        lambda: GLMOptimizer(
+            problem,
+            OverwritesCoefficientMidSolve(None),
+            explicit_euler(),
+            T_SPAN,
+            N_STEPS,
+            Y0,
+        ),
+    ):
+        with pytest.raises(MutableCoefficients, match="_M") as raised:
+            raises()
+        assert "MaskedArray" in str(raised.value)
+
+
+def test_the_root_initialiser_refuses_an_ndarray_subclass_argument() -> None:
+    """The constructor names it rather than converting it.
+
+    ``np.array(M, dtype=float)`` would discard the mask, so the coefficient
+    the caller passed becomes a different matrix with nobody told. That is the
+    same silent normalisation restoration was fixed not to do; refusing is one
+    rule with the check, which cannot certify such a buffer in any case.
+
+    Ordinary sequences lose nothing by conversion and still are converted.
+    """
+    masked = np.ma.masked_array(M_CONST, mask=[[True]], dtype=float)
+    with pytest.raises(ValueError, match="ndarray subclass"):
+        AffineDynamics(masked, C_CONST)
+    with pytest.raises(ValueError, match="ndarray subclass"):
+        AffineDynamics(M_CONST, masked)
+    with pytest.raises(ValueError, match="ndarray subclass"):
+        AffineDynamics(M_CONST, C_CONST, np.ma.masked_array([0.0]))
+
+    from_lists = AffineDynamics([[0.4]], [[1.0]], [0.0])
+    assert type(from_lists._M) is np.ndarray
+    assert not from_lists._M.flags.writeable
+
+
+def test_the_defensive_copy_preserves_the_subclass_it_copies() -> None:
+    """Restoration preserves faithfully so the check can refuse loudly.
+
+    The copy must not run the buffer's own ``copy`` — a subclass may define it
+    and one returning ``self`` froze the shared source. Achieving that with
+    ``subok=False`` went too far the other way: it silently turned a
+    ``MaskedArray`` into a base array, which is to say it turned a buffer the
+    check is required to refuse into one that passes, and the restored object
+    then computed different dynamics from its original with every guard quiet.
+    With ``M = 0.4`` masked and ``y = 0.8`` the original's ``f`` returns
+    ``0.0`` and a mask-stripped duplicate's returns ``0.32``.
+
+    ``np.array(..., copy=True, subok=True)`` dispatches to no user-defined
+    ``copy``. It does run ``__array_finalize__``, which no subclass-preserving
+    construction avoids; that is not part of the safety argument, because the
+    buffer it produces is refused by name.
+    """
+    original = MasksPartOfItsCoefficient()
+    restored = copy.deepcopy(original)
+
+    assert isinstance(restored._M, np.ma.MaskedArray)
+    assert np.array_equal(restored._M.mask, original._M.mask)
+    assert np.array_equal(
+        restored.f(Y0, U[0], 0.0), original.f(Y0, U[0], 0.0)
+    )
+    assert not restored._M.flags.writeable
+    assert not np.shares_memory(restored._M, original._M)
+
+    with pytest.raises(MutableCoefficients, match="_M"):
+        require_immutable_coefficients(restored)
+
+
+def test_the_obligation_is_only_the_buffers_the_inherited_readers_read() -> None:
+    """``F`` owes ``_M``. It does not owe ``_C`` or ``_b``.
+
+    A flat "any reader inherited means all three are live" rule would refuse
+    this subclass for buffers no member of it can reach, which is the
+    over-refusal C-16.2 asks to be paid for only where a wrong answer is
+    otherwise available.
+    """
+
+    class InheritsOnlyF(AffineDynamics):
+        def __init__(self) -> None:
+            self._M = np.array(M_CONST, dtype=float)
+            self._own_c = np.array(C_CONST, dtype=float)
+
+        @property
+        def state_dim(self) -> int:
+            return 1
+
+        @property
+        def control_dim(self) -> int:
+            return 1
+
+        def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return np.asarray(self._M @ y + self._own_c @ u)
+
+        def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return self._own_c.copy()
+
+    problem = InheritsOnlyF()
+    with pytest.raises(MutableCoefficients, match="_M") as raised:
+        affine_dynamics_verified(problem)
+    assert "_C" not in str(raised.value)
+
+    problem._M.flags.writeable = False
+    require_immutable_coefficients(problem)
+
+
+class MaterialisesLate(AffineDynamics):
+    """Ships ``_M`` under another name and rebuilds it on first access.
+
+    Nothing in the restored state is called ``_M``. A rule reading the state
+    would find nothing to freeze; asking the *object* runs ``__getattr__`` and
+    the buffer exists as a consequence of being asked for.
+
+    Module level because pickle cannot reach a class defined in a function.
+    """
+
+    def __init__(self, c: float) -> None:
+        super().__init__(M_CONST, [[c]])
+        self._payload = np.array(M_CONST, dtype=float)
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            "_payload": self._payload,
+            "_C": self._C,
+            "_b": self._b,
+            "_nu": self._nu,
+        }
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "_M":
+            buffer = np.array(self._payload, dtype=float)
+            object.__setattr__(self, "_M", buffer)
+            return buffer
+        raise AttributeError(name)
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(lambda p: pickle.loads(pickle.dumps(p)), id="pickle"),
+    ],
+)
+def test_a_lazily_built_coefficient_is_materialised_and_frozen(
+    duplicate: Callable[[Any], Any],
+) -> None:
+    """Asking the object is not a passive read, and that is the point.
+
+    ``getattr`` runs whatever the object does to answer, lazy construction
+    included, so a coefficient that exists in no restored key is built,
+    copied and frozen here rather than appearing writeable later. A rule that
+    read the restored *state* would have found nothing named ``_M`` and left
+    the inherited ``F`` handing out a writeable array.
+
+    The cost of asking is that the buffer is built during restoration instead
+    of on first use. Paying it is the trade: this clause exists because what
+    the solve will read is the only thing worth checking.
+    """
+    source = MaterialisesLate(2.0)
+    exact, _ = _closed_form(2.0)
+
+    restored = duplicate(source)
+    storage = AffineDynamics.__dict__["__dict__"].__get__(restored)
+    assert "_M" not in source.__getstate__()
+    assert "_M" in storage
+    assert not storage["_M"].flags.writeable
+    assert storage["_M"].flags.owndata
+    assert restored.F(Y0, U[:1], 0.0) is storage["_M"]
+
+    gradient = GLMOptimizer(
+        restored,
+        OverwritesCoefficientMidSolve(None),
+        explicit_euler(),
+        T_SPAN,
+        N_STEPS,
+        Y0,
+    ).gradient(U)
+    assert np.asarray(gradient) == pytest.approx(exact, abs=EXACT_TOL)
+
+    # And the freeze is the real one: the mutation this module measures is
+    # refused aloud on the restored object.
+    with pytest.raises(ValueError, match="read-only"):
+        restored._M[0, 0] = M_OVERWRITTEN
+
+
+def test_a_coefficient_that_is_never_materialised_is_refused_by_name() -> None:
+    """Lazily *absent* is still absent, and is named rather than deferred.
+
+    The inherited ``f`` reads all three buffers. A restoration leaving one
+    unreachable is refused at the route decision naming it, instead of raising
+    ``AttributeError`` from inside the first step.
+    """
+
+    class KeepsOnlyM(MaterialisesLate):
+        def __getstate__(self) -> dict[str, Any]:
+            return {"_payload": self._payload, "_nu": self._nu}
+
+    restored = copy.copy(KeepsOnlyM(2.0))
+    with pytest.raises(MissingCoefficients, match="_C") as raised:
+        affine_dynamics_verified(restored)
+    assert "did not run AffineDynamics.__init__" in str(raised.value)
+
+
+def test_the_defensive_copy_does_not_dispatch_to_the_buffer() -> None:
+    """Restoration copies through ``np.array``, not ``buffer.copy()``.
+
+    ``isinstance(..., np.ndarray)`` admits subclasses, and ``.copy()`` is
+    theirs to define. One returning ``self`` put the freeze back onto the
+    shared source that the copy-before-freeze branch exists to protect; one
+    perturbing the data changed a coefficient by ``0.5`` in silence, which is
+    the C-7 direction that must not be available.
+    """
+
+    class ReturnsItself(np.ndarray):
+        def copy(self, order: str = "C") -> ReturnsItself:
+            return self
+
+    class PerturbsOnCopy(np.ndarray):
+        def copy(self, order: str = "C") -> NDArray:
+            return np.asarray(np.asarray(self) + 0.5)
+
+    for subclass in (ReturnsItself, PerturbsOnCopy):
+
+        class KeepsItsOwn(AffineDynamics):
+            storage = subclass
+
+            def __init__(self) -> None:
+                self._M = np.array(M_CONST, dtype=float).view(self.storage)
+
+            def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+                return np.asarray(np.asarray(self._M) @ y)
+
+            def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+                return np.asarray(self._M).copy()
+
+            def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+                return np.zeros((1, 1))
+
+        source = KeepsItsOwn()
+        restored = copy.copy(source)
+
+        assert source._M.flags.writeable, "the source must not be frozen"
+        assert not np.shares_memory(source._M, restored._M)
+        assert np.asarray(restored._M) == pytest.approx(np.asarray(M_CONST))
 
 
 def test_partial_coefficient_storage_is_refused_by_name() -> None:
@@ -877,6 +1454,264 @@ class ReadsNoneOfTheRootBuffers(AffineDynamics):
 
     def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
         return self._c.copy()
+
+
+#: Module level so the duplication tests below can pickle them. Each answers
+#: for ``_M`` through a property, which is the shape that separated the two
+#: liveness questions: a descriptor can refuse, and it can decline assignment.
+_FROZEN_ANSWER = np.array(M_CONST, dtype=float)
+_FROZEN_ANSWER.flags.writeable = False
+_WRITEABLE_ANSWER = np.array(M_CONST, dtype=float)
+
+
+class RefusesToAnswer(ReadsNoneOfTheRootBuffers):
+    probes = 0
+
+    @property
+    def _M(self) -> NDArray:
+        type(self).probes += 1
+        raise RuntimeError("this class keeps no root _M")
+
+
+class AnswersWithAFrozenBuffer(ReadsNoneOfTheRootBuffers):
+    @property
+    def _M(self) -> NDArray:
+        return _FROZEN_ANSWER
+
+
+class AnswersWithAWriteableBuffer(ReadsNoneOfTheRootBuffers):
+    @property
+    def _M(self) -> NDArray:
+        return _WRITEABLE_ANSWER
+
+
+class SparseBuildsAndDelegates(AffineDynamics):
+    """Builds three coefficients itself and wraps all three readers, so it is
+    invisible to the marker and to reader identity alike: only presence sees
+    it, and only because a name resolving to anything at all is enough.
+    """
+
+    def __init__(self) -> None:
+        self._M = csr_array(np.array(M_CONST, dtype=float))
+        self._C = csr_array(np.array(C_DOUBLED, dtype=float))
+        self._b = np.zeros(1)
+        self._b.flags.writeable = False
+        self._nu = 1
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return super().f(y, u, t)
+
+    def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return super().F(y, u, t)
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return super().G(y, u, t)
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(lambda p: pickle.loads(pickle.dumps(p)), id="pickle"),
+    ],
+)
+def test_restoration_and_the_guard_ask_a_refusing_descriptor_the_same_way(
+    duplicate: Callable[[Any], Any],
+) -> None:
+    """One question asked twice must be asked the same way, C-15.7.
+
+    Both the guard and restoration ask what each coefficient name hands out,
+    and they asked it differently: the guard absorbed any exception, while
+    restoration used ``getattr`` with a default, which absorbs only
+    ``AttributeError``. A general-route subclass whose ``_M`` property raises
+    anything else was therefore accepted by the optimizer -- it computes the
+    closed-form gradient below -- and could not be copied, deep-copied or
+    pickled at all.
+
+    That is the asymmetry's harmless direction. The other one is not: a name
+    live to the guard and invisible to restoration leaves a copy unfrozen,
+    which is why the two now share :func:`_resolve_buffer`.
+    """
+    RefusesToAnswer.probes = 0
+
+    exact, _ = _closed_form(1.0)
+    assert _gradient(
+        RefusesToAnswer(), OverwritesCoefficientMidSolve(None)
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+    assert RefusesToAnswer.probes, "the guard must have asked, or this proves nothing"
+
+    RefusesToAnswer.probes = 0
+    restored = duplicate(RefusesToAnswer())
+    assert RefusesToAnswer.probes, (
+        "restoration must have asked, or this proves nothing"
+    )
+    assert _gradient(
+        restored, OverwritesCoefficientMidSolve(None)
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(lambda p: pickle.loads(pickle.dumps(p)), id="pickle"),
+    ],
+)
+def test_a_buffer_already_at_the_postcondition_is_left_where_it_is(
+    duplicate: Callable[[Any], Any],
+) -> None:
+    """Restoration replaces a buffer to gain something, or not at all.
+
+    An unmarked buffer is copied before it is frozen because freezing it
+    where it lies would reach back through the sharing a copy leaves. When it
+    is already frozen and already owns its storage there is nothing to reach
+    back to -- the freeze is a no-op -- and replacing it cost the one thing
+    this branch can lose: a read-only property answering for a coefficient
+    cannot be assigned to, so an ordinary round trip of a subclass the
+    optimizer accepts raised ``property '_M' of ... has no setter``.
+    """
+    exact, _ = _closed_form(1.0)
+    restored = duplicate(AnswersWithAFrozenBuffer())
+    assert restored._M is _FROZEN_ANSWER
+    assert not restored._M.flags.writeable
+    assert _gradient(
+        restored, OverwritesCoefficientMidSolve(None)
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def test_a_writeable_buffer_that_cannot_be_replaced_is_refused_aloud() -> None:
+    """And the source is left as the caller had it.
+
+    The same read-only property over a *writeable* array has no safe outcome:
+    the copy cannot be stored, and freezing the original would change an
+    object the caller did not ask to change. Restoration refuses, names the
+    buffer, and says why -- rather than letting a bare ``AttributeError`` out
+    of ``copy.deepcopy``, and rather than freezing the source.
+    """
+    with pytest.raises(MutableCoefficients, match="_M") as raised:
+        copy.deepcopy(AnswersWithAWriteableBuffer())
+    assert "cannot be replaced with a frozen copy" in str(raised.value)
+    assert _WRITEABLE_ANSWER.flags.writeable, "the caller's array is untouched"
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(lambda p: pickle.loads(pickle.dumps(p)), id="pickle"),
+    ],
+)
+def test_restoration_refuses_the_storage_the_guard_refuses(
+    duplicate: Callable[[Any], Any],
+) -> None:
+    """The converse of the rule above, and the direction that is not harmless.
+
+    Restoration obliged only names resolving to an ``ndarray``, so the
+    delegating subclass holding ``csr_array`` coefficients round-tripped
+    quietly and handed back an object whose ``_M.data`` was writeable. The
+    guard refuses that instance; a duplication route that does not is the
+    same rule binding in one place and not the other.
+    """
+
+    with pytest.raises(MissingCoefficients, match="_M") as raised:
+        duplicate(SparseBuildsAndDelegates())
+    assert "csr_array" in str(raised.value)
+
+
+class InheritsFOverARefusingDescriptor(AffineDynamics):
+    """Inherits ``F``, so reader identity obliges ``_M``; the descriptor then
+    refuses to answer, so presence cannot see it. Module level so the
+    duplication routes can pickle it.
+    """
+
+    probes = 0
+
+    def __init__(self) -> None:
+        self._own_c = np.array(C_CONST, dtype=float)
+
+    @property
+    def _M(self) -> NDArray:
+        type(self).probes += 1
+        raise RuntimeError("this class keeps no root _M")
+
+    @property
+    def state_dim(self) -> int:
+        return 1
+
+    @property
+    def control_dim(self) -> int:
+        return 1
+
+    @property
+    def coefficients_constant(self) -> bool:
+        return True
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.asarray(self._own_c @ u)
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return self._own_c.copy()
+
+
+def test_an_obliged_name_that_refuses_to_answer_is_refused_by_name() -> None:
+    """The guard's last read went round the shared rule, C-15.7.
+
+    ``_root_buffers`` restated it as a bare ``getattr``, which absorbs only
+    ``AttributeError``. Reader identity obliges ``_M`` here because ``F`` is
+    inherited, and presence cannot see it because the descriptor refuses; so
+    the name is live and unresolved, exactly the case the reader map exists
+    for. The route decision let the descriptor's ``RuntimeError`` out instead
+    of naming the buffer -- loud, but not the contract, and it made "literally
+    the same function" false at the one call site that decides.
+
+    Restating a shared rule is how it stops being shared. Every read of a
+    coefficient now goes through ``_resolve_buffer``.
+    """
+    problem = InheritsFOverARefusingDescriptor()
+    InheritsFOverARefusingDescriptor.probes = 0
+
+    for refuse in (
+        lambda: require_immutable_coefficients(problem),
+        lambda: affine_dynamics_verified(problem),
+        lambda: _gradient(problem, OverwritesCoefficientMidSolve(None)),
+    ):
+        with pytest.raises(MissingCoefficients, match="_M") as raised:
+            refuse()
+        assert "is absent" in str(raised.value)
+    assert InheritsFOverARefusingDescriptor.probes, "the descriptor was asked"
+
+
+def test_the_refusal_to_replace_names_the_reason_it_read() -> None:
+    """A failed replacement reports the buffer it found, not the common case.
+
+    The copy-before-freeze branch takes two kinds of buffer: one still
+    writeable, and one frozen that does not own its storage. The message
+    named the first for both, sending a caller holding a frozen view after a
+    remedy that does not apply to it. Each is asserted against the other's
+    wording so neither can drift back.
+    """
+    base = np.array([[0.4, 0.0], [0.0, 0.0]], dtype=float)
+    view = base[:1, :1]
+    view.flags.writeable = False
+    assert not view.flags.owndata and not view.flags.writeable
+
+    class AnswersWithAFrozenView(ReadsNoneOfTheRootBuffers):
+        @property
+        def _M(self) -> NDArray:
+            return view
+
+    with pytest.raises(MutableCoefficients, match="_M") as frozen_view:
+        copy.deepcopy(AnswersWithAFrozenView())
+    assert "does not own its storage" in str(frozen_view.value)
+    assert "writeable, and freezing it" not in str(frozen_view.value)
+
+    with pytest.raises(MutableCoefficients, match="_M") as writeable:
+        copy.deepcopy(AnswersWithAWriteableBuffer())
+    assert "writeable, and freezing it" in str(writeable.value)
+    assert "does not own its storage" not in str(writeable.value)
 
 
 def test_a_subclass_reading_none_of_the_root_buffers_is_left_alone() -> None:
@@ -969,6 +1804,282 @@ def test_a_delegating_override_is_still_checked() -> None:
     assert not objective.fired
 
 
+class RedirectsIntoASlot(AffineDynamics):
+    """A subclass whose state populates ``_M`` under a *different* name.
+
+    ``payload`` is an ordinary property whose setter writes the ``_M`` slot,
+    and ``__getstate__`` ships the buffer under that name. ``_M`` is therefore
+    live on the restored instance and aliased by the inherited ``F``, while
+    appearing nowhere among the restored keys. Deciding what to freeze from
+    those keys missed it on every duplication route.
+    """
+
+    __slots__ = ("_M",)
+
+    @property
+    def payload(self) -> NDArray:
+        return self._M
+
+    @payload.setter
+    def payload(self, value: NDArray) -> None:
+        object.__setattr__(self, "_M", value)
+
+    def __getstate__(self) -> tuple[dict[str, Any], dict[str, NDArray]]:
+        return (
+            {"_C": self._C, "_b": self._b, "_nu": self._nu},
+            {"payload": self._M.copy()},
+        )
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(lambda p: pickle.loads(pickle.dumps(p)), id="pickle"),
+    ],
+)
+def test_restoration_reads_the_object_not_the_state_it_arrived_in(
+    duplicate: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """Restoration asks the restored object, because state is not provenance.
+
+    Three rules were tried that decided what to freeze from the state, and a
+    subclass defeated each by shaping it: the marker can be dropped from
+    ``__getstate__``, a buffer can be omitted alongside it, and — here — a
+    coefficient can be delivered under another name entirely, by a property
+    setter that writes the slot. The buffer is live and inherited ``F``
+    aliases it; it is simply not among the keys.
+
+    The state is written by the subclass and the object is what the solve will
+    read, so the object is what restoration reads: every coefficient name that
+    resolves to an array on the finished instance is frozen. That is the same
+    rule the check uses, and it asks nobody anything.
+    """
+    duplicated = duplicate(RedirectsIntoASlot(M_CONST, C_DOUBLED))
+
+    assert duplicated.F(Y0, U[:1], 0.0) is duplicated._M
+    assert not duplicated._M.flags.writeable
+    with pytest.raises(ValueError, match="read-only"):
+        duplicated._M[0, 0] = M_OVERWRITTEN
+
+
+class SerialisesOnlyItsCoefficients(AffineDynamics):
+    """A root instance whose ``__getstate__`` drops the root-initialised flag.
+
+    Overriding a copy hook is grounds for a *quiet* refusal of the affine
+    route, but this instance still holds the root's buffers and still inherits
+    ``F``, so the tape aliases ``self._M`` whichever route runs. Its
+    restoration obligation is therefore unchanged by its ineligibility.
+    """
+
+    def __getstate__(self) -> dict[str, NDArray]:
+        return {"_M": self._M, "_C": self._C, "_b": self._b}
+
+
+class SerialisesTwoOfThree(AffineDynamics):
+    """The same, omitting ``_b`` as well as the flag.
+
+    ``f`` is overridden so that the missing ``_b`` is never read and the
+    problem still solves; ``F`` is the root's, so ``_M`` is still retained by
+    identity. A rule requiring all three names to arrive before re-freezing
+    skipped this and restored ``_M`` writeable.
+    """
+
+    def __getstate__(self) -> dict[str, NDArray]:
+        return {"_M": self._M, "_C": self._C}
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.asarray(self._M @ y + self._C @ u)
+
+
+class SerialisesOneOfThree(AffineDynamics):
+    """The same again, down to a single name.
+
+    This is the shape that settles the question. By the restored names alone
+    it is indistinguishable from ``ReusesTheName`` below, which keeps its own
+    writeable ``_M`` and is entitled to. One retains the root's buffer and one
+    does not, and no rule counting names can tell them apart — so restoration
+    stops counting and freezes the name either way.
+    """
+
+    def __getstate__(self) -> dict[str, NDArray]:
+        return {"_M": self._M}
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.asarray(self._M @ y + C_DOUBLED @ u)
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return C_DOUBLED
+
+
+@pytest.mark.parametrize(
+    ("factory", "serialised"),
+    [
+        pytest.param(SerialisesOnlyItsCoefficients, ("_M", "_C", "_b"), id="three"),
+        pytest.param(SerialisesTwoOfThree, ("_M", "_C"), id="two"),
+        pytest.param(SerialisesOneOfThree, ("_M",), id="one"),
+    ],
+)
+def test_restoration_does_not_trust_a_flag_a_subclass_can_drop(
+    factory: type[AffineDynamics], serialised: tuple[str, ...]
+) -> None:
+    """What arrives decides; nothing the subclass answers does.
+
+    ``__setstate__`` gated re-freezing on the restored marker, but the marker
+    comes in through ``__getstate__``, which a subclass may replace. One
+    returning only its coefficients dropped it, so a genuine root instance was
+    restored writeable, the precondition concluded the root initialiser had
+    never run, and all three call sites fell silent — the fixture's
+    ``0.7552125`` against an exact ``0.6781500``.
+
+    Requiring all three names instead was no better, which is why all three
+    arities are exercised here: the same override omits a buffer as easily as
+    it omits the marker, and the two-name form reproduced the identical
+    displacement.
+
+    Asserting that the retained buffer refuses the write, rather than only
+    that it is marked read-only, because refusing the write is the property
+    the tape depends on.
+    """
+    duplicated = copy.deepcopy(factory(M_CONST, C_DOUBLED))
+
+    assert duplicated.F(Y0, U[:1], 0.0) is duplicated._M
+    for name in serialised:
+        buffer = getattr(duplicated, name)
+        assert not buffer.flags.writeable
+        assert buffer.flags.owndata
+    with pytest.raises(ValueError, match="read-only"):
+        duplicated._M[0, 0] = M_OVERWRITTEN
+
+
+def test_a_full_restoration_records_the_flag_itself() -> None:
+    """Where all three arrived the root established them, so the copy says so.
+
+    Passing on the marker it was handed would leave a later check reading what
+    a subclass chose to serialise; recording it leaves the check reading what
+    restoration established. The duplicate is then indistinguishable from a
+    freshly constructed instance, which is what a copy should be.
+    """
+    duplicated = copy.deepcopy(SerialisesOnlyItsCoefficients(M_CONST, C_CONST))
+
+    storage = AffineDynamics.__dict__["__dict__"].__get__(duplicated)
+    assert storage["_affine_root_initialised"] is True
+
+    exact, _ = _closed_form(1.0)
+    gradient = GLMOptimizer(
+        duplicated,
+        OverwritesCoefficientMidSolve(None),
+        explicit_euler(),
+        T_SPAN,
+        N_STEPS,
+        Y0,
+    ).gradient(U)
+    assert np.asarray(gradient) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+class CopiesIntoItsOwnStorage(AffineDynamics):
+    """A verified subclass whose ``_M`` setter stores a *copy* of its argument.
+
+    Writing ``self._M = value`` therefore leaves ``self._M`` bound to an object
+    that is equal to ``value`` but is not ``value``. Preserving the argument's
+    ``writeable`` flag is what makes it verify after ordinary construction.
+    """
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        return self.__dict__["_store"]
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        stored = np.array(value, dtype=float)
+        stored.flags.writeable = value.flags.writeable
+        self.__dict__["_store"] = stored
+
+
+class RebuildsAnotherCoefficient(AffineDynamics):
+    """A verified subclass whose ``_C`` setter also rebuilds ``_M``.
+
+    Nothing forbids one coefficient's setter from touching another, and this
+    one preserves each array's ``writeable`` flag, so ordinary construction
+    leaves all three frozen and the instance verifies.
+    """
+
+    @property
+    def _C(self) -> NDArray:  # type: ignore[override]
+        return self.__dict__["_cstore"]
+
+    @_C.setter
+    def _C(self, value: NDArray) -> None:
+        stored = np.array(value, dtype=float)
+        stored.flags.writeable = value.flags.writeable
+        self.__dict__["_cstore"] = stored
+        if "_M" in self.__dict__:
+            rebuilt = np.array(self.__dict__["_M"], dtype=float)
+            rebuilt.flags.writeable = value.flags.writeable
+            self.__dict__["_M"] = rebuilt
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(lambda p: pickle.loads(pickle.dumps(p)), id="pickle"),
+    ],
+)
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(CopiesIntoItsOwnStorage, id="stores-a-copy"),
+        pytest.param(RebuildsAnotherCoefficient, id="rebuilds-another"),
+    ],
+)
+def test_the_replacement_buffer_is_frozen_as_the_object_resolves_it(
+    factory: type[AffineDynamics],
+    duplicate: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """Freezing the value handed to ``setattr`` is not freezing the buffer.
+
+    Restoration replaces a non-owning buffer, and ``setattr`` may run a
+    property setter that stores something else — a copy, in the first case
+    here. The local name stayed bound to the object that was discarded, so the
+    freeze landed on it and the array ``F`` returns came back owning and
+    *writeable*: a subclass that verified before the round trip failed the
+    check after it.
+
+    The second case is why re-reading in place is not enough either. That
+    setter rewrites ``_M`` as a side effect, so ``_M`` — frozen earlier in the
+    same loop — was replaced while the loop was still running. Freezing had to
+    become a second pass over all three, after no coefficient setter can still
+    run.
+    """
+    original = factory(M_CONST, C_CONST)
+    assert affine_dynamics_verified(original)
+
+    duplicated = duplicate(original)
+
+    for name in ("_M", "_C", "_b"):
+        buffer = getattr(duplicated, name)
+        assert not buffer.flags.writeable
+        assert buffer.flags.owndata
+    assert duplicated.F(Y0, U[:1], 0.0) is duplicated._M
+    assert affine_dynamics_verified(duplicated)
+    assert duplicated.M == pytest.approx(M_CONST, abs=EXACT_TOL)
+
+
+class SlottedM(AffineDynamics):
+    """A verified subclass that keeps ``_M`` in a slot rather than the dict.
+
+    Declaring ``__slots__`` overrides no guaranteed member, so this shape is
+    eligible for the affine route; ``F`` resolves ``self._M`` through the slot
+    exactly as it would through the instance dictionary. Defined at module
+    scope because the pickle round trip below cannot serialise a local class.
+    """
+
+    __slots__ = ("_M",)
+
+
 def test_a_slotted_coefficient_is_read_through_its_descriptor() -> None:
     """``__slots__`` storage is present and frozen, and must not be refused.
 
@@ -979,10 +2090,6 @@ def test_a_slotted_coefficient_is_read_through_its_descriptor() -> None:
     plain attribute access is what it resolves, and that is what the check
     reads: the same object, obtained the same way.
     """
-
-    class SlottedM(AffineDynamics):
-        __slots__ = ("_M",)
-
     problem = SlottedM(M_CONST, C_CONST)
     assert "_M" not in object.__getattribute__(problem, "__dict__")
     assert problem.F(Y0, U[:1], 0.0) is problem._M
@@ -993,6 +2100,64 @@ def test_a_slotted_coefficient_is_read_through_its_descriptor() -> None:
     problem._M.flags.writeable = True
     with pytest.raises(MutableCoefficients, match="_M"):
         affine_dynamics_verified(problem)
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(lambda p: pickle.loads(pickle.dumps(p)), id="pickle"),
+    ],
+)
+def test_a_slotted_coefficient_survives_duplication(
+    duplicate: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """Verified for one obligation of C-15.7 means verified for both.
+
+    ``__setstate__`` read the coefficients out of the instance dictionary,
+    where a subclass declaring ``__slots__ = ("_M",)`` keeps none of them, so
+    a shape that verified and solved correctly raised ``KeyError('_M')`` on
+    every copy and every pickle round trip. Restoration now resolves storage
+    by the same rule verification does.
+
+    Asserting the constructor's full postcondition on the duplicate — frozen
+    *and* owning — rather than only that the operation completed, because
+    completing is what it would also do if re-freezing were skipped entirely.
+    """
+    original = SlottedM(M_CONST, C_CONST)
+    duplicated = duplicate(original)
+
+    assert isinstance(duplicated, SlottedM)
+    assert "_M" not in object.__getattribute__(duplicated, "__dict__")
+    assert not duplicated._M.flags.writeable
+    assert duplicated._M.flags.owndata
+    assert affine_dynamics_verified(duplicated)
+    assert duplicated.M == pytest.approx(M_CONST, abs=EXACT_TOL)
+
+
+def test_a_subclass_without_root_storage_can_still_be_duplicated() -> None:
+    """``__setstate__`` is inherited, so it runs on subclasses that owe it
+    nothing.
+
+    Re-freezing unconditionally demanded ``_M``, ``_C`` and ``_b`` on every
+    copy of every subclass, including one that never called
+    ``super().__init__`` and keeps its coefficients elsewhere — a valid
+    general-route problem that could not be deep-copied. Re-freezing is now
+    conditional on the same recorded marker the check is.
+    """
+    duplicated = copy.deepcopy(ReadsNoneOfTheRootBuffers())
+
+    exact, _ = _closed_form(1.0)
+    gradient = GLMOptimizer(
+        duplicated,
+        OverwritesCoefficientMidSolve(None),
+        explicit_euler(),
+        T_SPAN,
+        N_STEPS,
+        Y0,
+    ).gradient(U)
+    assert np.asarray(gradient) == pytest.approx(exact, abs=EXACT_TOL)
 
 
 def test_a_coefficient_property_is_read_through_the_property() -> None:
@@ -1121,23 +2286,109 @@ def test_storage_replaced_by_something_unreadable_is_refused_loudly() -> None:
     assert not isinstance(raised.value, MutableCoefficients)
 
 
-def test_a_subclass_that_never_ran_the_root_initialiser_is_not_touched() -> None:
-    """The precondition is recorded, so no coefficient descriptor is evaluated.
+def test_the_marker_obliges_a_buffer_no_widening_can_see() -> None:
+    """What the recorded flag still does that neither widening can.
 
-    Asking whether ``_M`` is *present* means evaluating whatever ``_M``
-    resolves to on a class that may never have had one. This subclass is a
-    valid general-route problem: it supplies its own ``f``, ``F`` and ``G``,
-    keeps its coefficients under different names, and leaves ``_M`` as a
-    descriptor that must never run. Probing it would raise here, out of a
-    check that is supposed to be silent about this shape. (The dimension
-    properties are overridden for the same reason: the root's read ``_M.shape``
-    too, and this class owes them nothing either.)
+    Both widenings look at something the instance currently *is*: which
+    readers are the root's, and which names resolve. Neither survives a
+    coefficient *removed* from a subclass that also wraps its readers --
+    identity sees three overrides, presence has no name to resolve, and the
+    buffer the delegating ``super().F`` will reach for is live to nobody.
+
+    The flag is the only one of the three that remembers, so it is the only
+    one that can say "this instance had three frozen arrays and now has two".
+    Without it this shape is refused quietly for its overrides and fails
+    later from inside the first step instead.
+    """
+
+    class DelegatesAndDropsStorage(AffineDynamics):
+        def __init__(self) -> None:
+            super().__init__(M_CONST, C_CONST)
+            del self._M
+
+        def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().f(y, u, t)
+
+        def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().F(y, u, t)
+
+        def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().G(y, u, t)
+
+    problem = DelegatesAndDropsStorage()
+    assert not hasattr(problem, "_M")
+    for raises in (
+        lambda: require_immutable_coefficients(problem),
+        lambda: affine_dynamics_verified(problem),
+    ):
+        with pytest.raises(MissingCoefficients, match="_M"):
+            raises()
+
+
+def test_the_reader_map_obliges_a_buffer_presence_cannot_see() -> None:
+    """And what the reader map does that presence cannot.
+
+    Presence can only add a name that resolves. This subclass never ran the
+    root initialiser, so there is no flag, and it holds no ``_M`` at all --
+    so presence has nothing to say about the one buffer that matters. The
+    inherited ``F`` will reach for it regardless, and knowing that is exactly
+    what the reader map is for: the refusal names ``_M`` at the route
+    decision instead of raising ``AttributeError`` inside the first step.
+    """
+
+    class InheritsOnlyFWithoutStorage(AffineDynamics):
+        def __init__(self) -> None:
+            self._own_c = np.array(C_CONST, dtype=float)
+
+        @property
+        def state_dim(self) -> int:
+            return 1
+
+        @property
+        def control_dim(self) -> int:
+            return 1
+
+        def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return np.asarray(self._own_c @ u)
+
+        def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return self._own_c.copy()
+
+    problem = InheritsOnlyFWithoutStorage()
+    assert not hasattr(problem, "_M")
+    with pytest.raises(MissingCoefficients, match="_M") as raised:
+        affine_dynamics_verified(problem)
+    assert "did not run AffineDynamics.__init__" in str(raised.value)
+
+
+def test_a_subclass_that_never_ran_the_root_initialiser_is_not_refused() -> None:
+    """A descriptor that refuses to answer is probed, and hands out nothing.
+
+    The presence widening asks whether ``_M`` resolves, and asking is not a
+    passive read: a coefficient descriptor *is* executed, and one that raises
+    has its exception absorbed. This subclass is a valid general-route
+    problem -- it supplies its own ``f``, ``F`` and ``G``, keeps its
+    coefficients under different names, and leaves ``_M`` as a descriptor
+    that raises -- so the measured probe count is asserted rather than the
+    claim, made earlier and untrue, that nothing is touched. (The dimension
+    properties are overridden because the root's read ``_M.shape`` too, and
+    this class owes them nothing either.)
+
+    Absorbing is the safe direction here and is not a second silent skip. A
+    name that cannot be read hands nothing to the tape, so there is nothing
+    to alias and nothing to freeze; and if it *were* load-bearing, the reader
+    reaching for it during the solve raises from the same descriptor, loudly,
+    rather than returning a displaced gradient. What the check must never do
+    is turn a buffer it could not read into one it decided was absent, which
+    is why unreadable *storage* -- as distinct from an unreadable name --
+    raises at C-15.7 instead.
 
     ``AffineDynamics.__init__`` never ran, so nothing it froze is at stake and
     the flag is absent. The gradient is asserted rather than only the absence
     of a raise, because "it did not raise" would also pass if the problem were
     quietly broken.
     """
+    probes = 0
 
     class NeverInitialisedTheRoot(AffineDynamics):
         def __init__(self) -> None:
@@ -1146,7 +2397,9 @@ def test_a_subclass_that_never_ran_the_root_initialiser_is_not_touched() -> None
 
         @property
         def _M(self) -> NDArray:
-            raise AssertionError("a dead coefficient descriptor was evaluated")
+            nonlocal probes
+            probes += 1
+            raise AttributeError("this class keeps no _M")
 
         @property
         def state_dim(self) -> int:
@@ -1171,6 +2424,7 @@ def test_a_subclass_that_never_ran_the_root_initialiser_is_not_touched() -> None
 
     problem = NeverInitialisedTheRoot()
     require_immutable_coefficients(problem)
+    assert probes == 1
     assert not affine_dynamics_verified(problem)
 
     exact, _ = _closed_form(1.0)
@@ -1185,14 +2439,23 @@ def test_a_subclass_that_never_ran_the_root_initialiser_is_not_touched() -> None
     assert np.asarray(gradient) == pytest.approx(exact, abs=EXACT_TOL)
 
 
-def test_a_subclass_may_reuse_a_coefficient_name_for_its_own_storage() -> None:
-    """A partial set is damage only if the root established the whole set.
+def test_a_subclass_reusing_a_coefficient_name_is_refused_by_name() -> None:
+    """The one working shape this clause refuses, and what it costs.
 
-    This subclass never calls ``super().__init__`` and keeps its own writeable
-    ``_M`` under that name, which it hands out by copy. Reading presence
-    instead of the recorded flag saw one buffer of three and diagnosed an
-    instance taken apart after construction, refusing a problem that is not
-    the root's to refuse.
+    This subclass never calls ``super().__init__``, replaces all three
+    readers, and keeps its own writeable ``_M`` under that name, which it
+    hands out by copy. Nothing it does is unsafe. It is refused anyway,
+    because the alternative is worse: the only rule that distinguishes it
+    from ``BuildsAndDelegates`` -- same absent marker, same overridden
+    readers, storage the root's inherited ``F`` hands straight to the tape --
+    is one that asks whether an override delegates, and an override cannot be
+    asked what it reads.
+
+    So the refusal is deliberate, it names the attribute that collided, and
+    renaming it lifts the refusal. Restoration already charged this shape the
+    same price by freezing ``_M`` on every copy; a rule that binds on copying
+    but not on checking is not one rule. Pinned here so that narrowing it
+    later is a decision rather than an accident.
     """
 
     class ReusesTheName(AffineDynamics):
@@ -1211,18 +2474,216 @@ def test_a_subclass_may_reuse_a_coefficient_name_for_its_own_storage() -> None:
 
     problem = ReusesTheName()
     assert problem._M.flags.writeable
-    require_immutable_coefficients(problem)
+
+    for raises in (
+        lambda: require_immutable_coefficients(problem),
+        lambda: affine_dynamics_verified(problem),
+        lambda: GLMOptimizer(
+            problem,
+            OverwritesCoefficientMidSolve(None),
+            explicit_euler(),
+            T_SPAN,
+            N_STEPS,
+            Y0,
+        ),
+    ):
+        with pytest.raises(MutableCoefficients, match="_M") as raised:
+            raises()
+        assert "_C" not in str(raised.value)
+
+    # Renaming the collision is the whole remedy, and the problem then runs on
+    # the general route to the exact gradient. Nothing about its dynamics
+    # changed; only the attribute it keeps them in.
+    class KeepsItsStorageUnderItsOwnName(ReusesTheName):
+        def __init__(self) -> None:
+            super().__init__()
+            self._own_m = self._M
+            del self._M
+
+        @property
+        def state_dim(self) -> int:
+            return int(self._own_m.shape[0])
+
+        @property
+        def control_dim(self) -> int:
+            return int(self._c.shape[1])
+
+        def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return np.asarray(self._own_m @ y + self._c @ u)
+
+        def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return self._own_m.copy()
+
+    renamed = KeepsItsStorageUnderItsOwnName()
+    require_immutable_coefficients(renamed)
+    assert affine_dynamics_verified(renamed) is False
 
     exact, _ = _closed_form(1.0)
-    gradient = GLMOptimizer(
-        problem,
-        OverwritesCoefficientMidSolve(None),
-        explicit_euler(),
-        T_SPAN,
-        N_STEPS,
-        Y0,
-    ).gradient(U)
-    assert np.asarray(gradient) == pytest.approx(exact, abs=EXACT_TOL)
+    assert np.asarray(
+        GLMOptimizer(
+            renamed,
+            OverwritesCoefficientMidSolve(None),
+            explicit_euler(),
+            T_SPAN,
+            N_STEPS,
+            Y0,
+        ).gradient(U)
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    # Copying is a separate obligation and does not raise, so this shape still
+    # witnesses the restoration rule. On the restored object it is
+    # indistinguishable from `SerialisesOneOfThree`, which retains the root's
+    # buffer, so the name is frozen in both. The *source* must survive
+    # untouched, which is why a buffer frozen without the marker is copied
+    # first: `copy.copy` shares it, and freezing in place reached back through
+    # that sharing and froze the original.
+    for duplicate in (copy.copy, copy.deepcopy):
+        source = ReusesTheName()
+        duplicated = duplicate(source)
+        assert not duplicated._M.flags.writeable
+        assert source._M.flags.writeable
+        assert not np.shares_memory(source._M, duplicated._M)
+        with pytest.raises(ValueError, match="read-only"):
+            duplicated._M[0, 0] = M_OVERWRITTEN
+
+
+def test_a_subclass_that_builds_its_own_buffers_and_delegates_is_refused(
+) -> None:
+    """Two ordinary habits, and between them a silent wrong answer.
+
+    Building the coefficients from a file or a mesh instead of through
+    ``super().__init__`` is one; wrapping a reader for instrumentation, unit
+    conversion or logging is the other. Neither is adversarial and each was
+    already accounted for alone -- the marker catches a delegating subclass
+    that ran the root initialiser, and reader identity catches one that
+    inherits the readers. Together they defeated both: no marker, no reader
+    of the root's own, an empty live set, and ``super().F(...)`` handing the
+    writeable ``_M`` to the tape.
+
+    Measured on the C-15.7 fixture at ``C = 2`` before the cure: the default
+    optimizer returned ``0.7552125`` where the closed form gives
+    ``0.6781500``, the full ``0.0770625`` displacement, with every guard
+    quiet. ``_closed_form`` derives both so neither is pinned as a literal.
+    """
+
+    class BuildsAndDelegates(AffineDynamics):
+        def __init__(self) -> None:
+            self._M = np.array(M_CONST, dtype=float)
+            self._C = np.array(C_DOUBLED, dtype=float)
+            self._b = np.zeros(1)
+            self._nu = 1
+
+        def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().f(y, u, t)
+
+        def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().F(y, u, t)
+
+        def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+            return super().G(y, u, t)
+
+    problem = BuildsAndDelegates()
+    assert problem.F(Y0, U[0], 0.0) is problem._M
+    assert problem._M.flags.writeable
+
+    with pytest.raises(MutableCoefficients, match="_M"):
+        require_immutable_coefficients(problem)
+    with pytest.raises(MutableCoefficients, match="_M"):
+        affine_dynamics_verified(problem)
+    with pytest.raises(MutableCoefficients, match="_M"):
+        GLMOptimizer(
+            problem,
+            OverwritesCoefficientMidSolve(problem),
+            explicit_euler(),
+            T_SPAN,
+            N_STEPS,
+            Y0,
+        )
+
+    # And once frozen it computes the exact gradient, so the refusal was about
+    # the buffer and not about the shape of the subclass.
+    for name in ("_M", "_C", "_b"):
+        getattr(problem, name).flags.writeable = False
+    require_immutable_coefficients(problem)
+
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        GLMOptimizer(
+            problem,
+            OverwritesCoefficientMidSolve(None),
+            explicit_euler(),
+            T_SPAN,
+            N_STEPS,
+            Y0,
+        ).gradient(U)
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def test_a_delegating_subclass_holding_sparse_coefficients_is_refused() -> None:
+    """The same shape again, with storage neither widening could type.
+
+    ``BuildsAndDelegates`` above is caught because its three names resolve.
+    When presence obliged only names holding an ``ndarray``, swapping those
+    for ``csr_array`` -- an ordinary choice for a large linear system -- put
+    the instance back outside both widenings: no marker, no reader of the
+    root's, no array, an empty live set. Measured before the cure on the
+    C-15.7 fixture at ``C = 2``, the default optimizer returned the displaced
+    first component against the closed form's, the full displacement, quiet.
+
+    So presence obliges a name that *resolves*, and what it resolves to is
+    decided afterwards by the refusal, not by the widening. The distinction
+    matters because the two directions are not symmetric: obliging a name
+    that turns out fine costs a refusal the caller can read and lift,
+    while declining to oblige one costs a wrong gradient nobody sees.
+    """
+
+    problem = SparseBuildsAndDelegates()
+    # Live to neither widening before the cure: every reader is the
+    # subclass's, and no coefficient name holds an ndarray.
+    assert all(
+        getattr(type(problem), name) is not getattr(AffineDynamics, name)
+        for name in ("f", "F", "G")
+    )
+    assert not any(
+        isinstance(getattr(problem, name), np.ndarray) for name in ("_M", "_C")
+    )
+
+    for refuse in (
+        lambda: require_immutable_coefficients(problem),
+        lambda: affine_dynamics_verified(problem),
+        lambda: GLMOptimizer(
+            problem,
+            OverwritesCoefficientMidSolve(None),
+            explicit_euler(),
+            T_SPAN,
+            N_STEPS,
+            Y0,
+        ),
+    ):
+        with pytest.raises(MissingCoefficients, match="_M") as raised:
+            refuse()
+        assert "csr_array" in str(raised.value)
+
+    # The remedy the message names: dense, frozen, owning buffers. The same
+    # subclass then computes the exact gradient, so the refusal was about the
+    # storage and not about delegating.
+    for name, value in (("_M", M_CONST), ("_C", C_DOUBLED)):
+        frozen = np.array(value, dtype=float)
+        frozen.flags.writeable = False
+        setattr(problem, name, frozen)
+    require_immutable_coefficients(problem)
+
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        GLMOptimizer(
+            problem,
+            OverwritesCoefficientMidSolve(None),
+            explicit_euler(),
+            T_SPAN,
+            N_STEPS,
+            Y0,
+        ).gradient(U)
+    ) == pytest.approx(exact, abs=EXACT_TOL)
 
 
 def test_the_reverse_multi_root_order_is_refused_quietly() -> None:

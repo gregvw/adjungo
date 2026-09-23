@@ -186,30 +186,45 @@ class MissingCoefficients(InvalidCoefficients):
     that were not there, so the problem verified as affine and the tape
     aliased them unchecked.
 
-    Not an error when the record itself is absent. The root initialiser never
-    ran, there is no retained buffer to protect, and
+    Not an error when the name is live to none of the three mechanisms.
+    Nothing then retains a buffer of this class's, and
     :func:`require_immutable_coefficients` says nothing -- C-16.2 requires
-    that refusal to be quiet.
+    that refusal to be quiet. An instance that inherits ``f``, ``F`` or ``G``
+    while holding nothing for them to read *is* an error, and is named here
+    rather than left to raise ``AttributeError`` several frames later; so is
+    one holding unusable storage under a name the root would have owned.
 
     A separate class from :class:`MutableCoefficients` because the remedy is
     different and the word would otherwise be false: nothing here is mutable.
     """
 
-    def __init__(self, cls: type, name: str, found: object = None) -> None:
+    def __init__(
+        self, cls: type, name: str, found: object = None, rooted: bool = True
+    ) -> None:
         found_desc = (
             "is absent"
             if found is None
             else f"resolves to {type(found).__name__}, not ndarray"
         )
+        buffers = ", ".join(map(repr, _COEFFICIENT_BUFFERS))
+        origin = (
+            f"{cls.__name__} has AffineDynamics coefficient storage "
+            f"established -- {buffers} as frozen, owning arrays -- but "
+            f"{name!r} now {found_desc}. Something has replaced it since, and "
+            f"its aliasing cannot be checked"
+            if rooted
+            else f"{cls.__name__} did not run AffineDynamics.__init__, but "
+            f"{name!r} is one of the root's coefficient names and "
+            f"{name!r} {found_desc}. It is live either because the class "
+            f"inherits a member that reads it or because the instance holds "
+            f"it"
+        )
         super().__init__(
             name,
-            f"{cls.__name__} ran AffineDynamics.__init__, which freezes "
-            f"{', '.join(map(repr, _COEFFICIENT_BUFFERS))} as owning arrays, "
-            f"but {name!r} now {found_desc}. Something has replaced it after "
-            f"construction, and its aliasing cannot be checked, so the first "
-            f"solve would retain it unguarded (NUMERICS.md C-15.7). Leave the "
-            f"root's buffers as constructed, or do not call super().__init__ "
-            f"at all and supply f, F and G yourself.",
+            f"{origin}, so the first solve would retain it unguarded "
+            f"(NUMERICS.md C-15.7). Leave the root's buffers as constructed, "
+            f"or do not call super().__init__ at all and supply f, F and G "
+            f"yourself.",
         )
 
 
@@ -220,21 +235,95 @@ class MissingCoefficients(InvalidCoefficients):
 _COEFFICIENT_BUFFERS = ("_M", "_C", "_b")
 
 
-#: Records that ``AffineDynamics.__init__`` ran to completion on *this*
-#: instance, and therefore that it established all of
-#: :data:`_COEFFICIENT_BUFFERS` as frozen, owning ``ndarray``\ s. Written into
-#: ``__dict__`` directly so that no subclass property or slot can intercept
-#: it, and carried through ``__setstate__`` with the rest of the state.
+#: The root members that hand a coefficient buffer to a caller, and which
+#: buffers each one reads. These three and no others: ``M``, ``C`` and ``b``
+#: return by identity too, but nothing on the solve path reads them, and
+#: counting them would refuse a subclass that replaces all of ``f``, ``F`` and
+#: ``G`` while leaving the public accessors inherited -- which is exactly the
+#: certified shape that keeps its own writeable storage under one of these
+#: names.
 #:
-#: This is the precondition for the immutability invariant, and it is recorded
-#: rather than inferred because both available inferences are wrong. Asking
-#: which of ``f``, ``F``, ``G`` are still the root's own definitions is
-#: defeated by an override that delegates to ``super()``. Asking whether the
+#: The mapping is per-member rather than a flat set so that inheriting one
+#: reader does not demand the buffers the other two would have read. ``F``
+#: owes ``_M`` alone.
+_ROOT_BUFFER_READERS: dict[str, tuple[str, ...]] = {
+    "f": _COEFFICIENT_BUFFERS,
+    "F": ("_M",),
+    "G": ("_C",),
+}
+
+
+#: Records that all of :data:`_COEFFICIENT_BUFFERS` have been established on
+#: *this* instance as frozen, owning ``ndarray``\ s. ``AffineDynamics.__init__``
+#: writes it, and so does ``__setstate__`` when restoration has put all three
+#: into that state -- which it may do for an instance whose initialiser never
+#: ran. So it records the postcondition, not the provenance: read it as "root
+#: coefficient storage is established here", never as "the constructor ran".
+#: Written into ``__dict__`` directly so that no subclass property or slot can
+#: intercept it.
+#:
+#: This is the primary precondition for the immutability invariant, and it is
+#: recorded rather than inferred because neither available inference answers
+#: it alone. Asking which of ``f``, ``F``, ``G`` are still the root's own
+#: definitions is defeated by an override that delegates to ``super()``, so it
+#: cannot *replace* the flag -- though it is sound as a widening beside it,
+#: which is what :func:`_live_buffer_names` does with it. Asking whether the
 #: buffers are *present* means evaluating ``_M``, ``_C`` and ``_b`` on a
 #: subclass that may never have had them -- running descriptors that are not
 #: ours to run, and reading a partial set as damage when it is simply a
 #: subclass using one of the same private names.
 _ROOT_INITIALISED = "_affine_root_initialised"
+
+
+#: Returned by :func:`_resolve_buffer` for a coefficient name that hands out
+#: nothing, and the default on both sides of :func:`_defined_as`'s comparison.
+#: An object sentinel rather than ``None`` so that "not there" and "there, and
+#: it is ``None``" stay distinct, which costs nothing and removes a question.
+_MISSING: Any = object()
+
+
+def _resolve_buffer(problem: object, name: str) -> Any:
+    """What ``name`` hands out on *problem*, or :data:`_MISSING` if nothing.
+
+    Every part of this clause asks this one question, so it is asked in one
+    place. Verification uses it to decide which buffers are live and
+    ``__setstate__`` to decide which to re-freeze, and those two must not
+    differ: a name that is live to the check and invisible to restoration
+    leaves a copy unfrozen, and a name that is invisible to the check and
+    live to restoration makes an ordinary ``copy.deepcopy`` fail on a problem
+    the optimizer accepts. Both were observed before this was shared.
+
+    Reading is not passive -- a coefficient descriptor is executed here -- and
+    one that refuses to answer hands out nothing rather than propagating.
+    ``getattr`` with a default absorbs only ``AttributeError``, and a property
+    raising anything else made duplication raise out of a valid general-route
+    problem while the check stayed quiet about the same instance.
+
+    The direction is safe: a name that cannot be read aliases nothing, and if
+    it were load-bearing the reader reaching for it during the solve raises
+    from the same descriptor, loudly. What is never absorbed is storage that
+    *is* readable and is not a frozen owning ``ndarray``; that raises.
+    """
+    try:
+        return getattr(problem, name, _MISSING)
+    except Exception:  # noqa: BLE001 - a reader refusing to answer hands out nothing
+        return _MISSING
+
+
+def _resolving_buffer_names(problem: object) -> tuple[str, ...]:
+    """The root coefficient names that hand something out on *problem*.
+
+    The shared half of the two liveness questions. ``__setstate__`` freezes
+    exactly these, because they are what exists to be frozen, and
+    :func:`_live_buffer_names` adds to them the names an inherited reader
+    obliges but that resolve to nothing -- which restoration cannot conjure
+    and the guard at the route decision refuses by name instead.
+    """
+    return tuple(
+        name
+        for name in _COEFFICIENT_BUFFERS
+        if _resolve_buffer(problem, name) is not _MISSING
+    )
 
 
 class AffineDynamics:
@@ -260,6 +349,24 @@ class AffineDynamics:
     def __init__(
         self, M: NDArray, C: NDArray, b: NDArray | None = None
     ) -> None:
+        # An ``ndarray`` subclass is refused rather than converted. Converting
+        # is what ``np.array(..., dtype=float)`` does, and for a MaskedArray it
+        # discards the mask: the caller's coefficient would silently become a
+        # different matrix. Refusing here keeps one rule with the check, which
+        # cannot certify a subclass buffer at all — see
+        # ``require_immutable_coefficients``. A list, tuple or scalar loses
+        # nothing by being converted and still may be.
+        for label, value in (("M", M), ("C", C), ("b", b)):
+            if isinstance(value, np.ndarray) and type(value) is not np.ndarray:
+                raise ValueError(
+                    f"{label} must be an ndarray or ordinary sequence; got "
+                    f"{type(value).__name__}, an ndarray subclass. Converting "
+                    f"it would discard state the coefficient depends on (a "
+                    f"MaskedArray's mask), and that state cannot be frozen "
+                    f"with the buffer (NUMERICS.md C-15.7). Pass "
+                    f"np.asarray(...) of the values you mean."
+                )
+
         M_arr = np.array(M, dtype=float, copy=True)
         C_arr = np.array(C, dtype=float, copy=True)
 
@@ -292,8 +399,14 @@ class AffineDynamics:
         self._b = b_arr
         self._nu = int(C_arr.shape[1])
         #: Set last, so it is present only if every buffer above was
-        #: established and frozen. See :data:`_ROOT_INITIALISED`.
-        self.__dict__[_ROOT_INITIALISED] = True
+        #: established and frozen. Written through the root's own ``__dict__``
+        #: descriptor, which is how :func:`_root_buffers` reads it: a subclass
+        #: exposing a different mapping as ``__dict__`` would otherwise take
+        #: delivery of the marker while the read went to the real instance
+        #: dictionary and found nothing, silencing the check on precisely the
+        #: kind of subclass it exists for. Reading defensively and writing
+        #: trustingly protects nothing.
+        _AFFINE_INSTANCE_DICT.__get__(self)[_ROOT_INITIALISED] = True
 
     def __setstate__(self, state: Any) -> None:
         """Restore state and re-freeze the coefficient buffers — C-15.7.
@@ -301,13 +414,18 @@ class AffineDynamics:
         ``copy.deepcopy`` does not preserve ``writeable=False``: NumPy defines
         ``ndarray.__deepcopy__``, and it returns a writeable array. Pickle,
         which goes through ``__reduce__``, does preserve the flag, and
-        ``copy.copy`` shares the original buffers and so cannot lose it. Only
-        the deep copy unfreezes.
+        ``copy.copy`` shares the original buffers, so for an instance this
+        class constructed, only the deep copy unfreezes. A subclass supplying
+        its own ``__getstate__`` can unfreeze any of the three, which is why
+        the rule below does not depend on which route ran.
 
-        This hook is the one both the copy and pickle protocols run, so
-        re-freezing here covers every route at once. Reconstructing through
-        ``__deepcopy__`` instead would have discarded state a subclass added,
-        which is a worse failure for a smaller gain.
+        This hook is the one both the copy and pickle protocols run **by
+        default**, so re-freezing here covers every route that does not replace
+        the protocol itself. A subclass defining ``__reduce__``, ``__copy__``
+        or ``__deepcopy__`` bypasses it, which is why those are among the
+        hooks verification compares. Reconstructing through ``__deepcopy__``
+        instead would have discarded state a subclass added, which is a worse
+        failure for a smaller gain.
 
         The two-element form of ``state`` has to be handled for that reason to
         hold: ``object.__reduce_ex__`` reports a subclass carrying ``__slots__``
@@ -316,8 +434,90 @@ class AffineDynamics:
         dict here would raise on every copy of one — discarding its state in a
         different and louder way.
 
-        A state missing a coefficient raises ``KeyError``, which is the C-7
-        direction: there is no correct value to substitute.
+        Restoration resolves the buffers by the **same rule verification uses**
+        — attribute access, which follows a slot or a property exactly as ``F``
+        does — and restores them the same way. Literally the same rule: both go
+        through :func:`_resolve_buffer`, because two spellings of one
+        question drifted apart once already. ``getattr`` with a default
+        absorbs only ``AttributeError``, so a general-route subclass whose
+        ``_M`` property raised anything else was accepted by the optimizer
+        and could not be copied, deep-copied or pickled at all; and in the
+        other direction, obliging only names holding an ``ndarray`` here
+        let a delegating subclass with ``csr_array`` coefficients -- which
+        the guard refuses -- round-trip quietly into a writeable copy. Reading them out of the instance
+        dictionary instead re-froze whatever happened to be stored there, which
+        for a subclass declaring ``__slots__ = ("_M",)`` is nothing at all:
+        that shape verified and solved correctly but raised ``KeyError`` on
+        every ``copy.copy``, ``copy.deepcopy`` and pickle round trip. Certifying
+        a shape for one obligation of this clause and not the other is the
+        inconsistency, not the exception.
+
+        **Which** buffers are frozen is asked of the restored object, never of
+        the state it arrived in. Three rules that read the state were tried and
+        a subclass defeated each by shaping it: the marker can be dropped from
+        ``__getstate__``; a buffer can be omitted alongside it, so requiring
+        all three fails too; and a coefficient can be delivered under another
+        name entirely, by a property setter that writes the slot, so it is live
+        and aliased by the inherited ``F`` while appearing in no restored key.
+        Each produced the displacement this clause measures through the public
+        optimizer with every guard quiet. The state is written by the subclass
+        and the object is what the solve will read, so every coefficient name
+        that resolves to an array on the finished instance is frozen.
+
+        That binds what exists when this runs, and nothing later. A subclass
+        can rebuild a coefficient lazily on first access, so there is no array
+        here to freeze; what closes that is the guard at the route decision,
+        which asks the same question again once the buffer exists. That is
+        also the one half of liveness restoration does *not* take from the
+        guard: a name obliged by an inherited reader but resolving to nothing
+        cannot be conjured here, so it stays the route decision's to refuse.
+        Restoration freezes what resolves; the guard obliges what must.
+
+        Where the marker survived, the root established all three and all three
+        are required, so anything else raises, which is the C-7 direction:
+        there is no correct value to substitute. Restoration then records the
+        marker itself rather than passing on the one it was handed, so a later
+        check reads what restoration established.
+
+        Freezing is a **second pass** over re-read values. ``setattr`` runs a
+        subclass property setter, and one that stores a copy of its argument
+        leaves the caller's name bound to the object that was discarded, while
+        one that rewrites a *different* coefficient replaces a buffer frozen
+        earlier in the same loop. Both returned owning, *writeable* buffers
+        from an ordinary round trip of a subclass that verified before it.
+        Nothing is frozen until no coefficient setter can still run. Acting on
+        a value fetched by a path other than the one that will be read is the
+        mistake this clause keeps making, in each of its parts.
+
+        Without the marker, a buffer that is still writeable is **copied
+        before it is frozen** even when it already owns its storage. ``copy.copy`` shares the array with
+        the original, so freezing in place reached back through that sharing
+        and froze the source — changing an object the caller did not ask to
+        change. The marked path keeps sharing, because there both arrays are
+        frozen already and there is nothing to lose. The copy is made by
+        constructing a base array rather than by calling the buffer's own
+        ``copy``, which a subclass of ``ndarray`` is free to define: one
+        returning ``self`` put the freeze straight back onto the source this
+        branch exists to protect.
+
+        The cost is narrow and loud. A subclass may reuse a coefficient name
+        for writeable storage of its own — nothing forbids it, and one does —
+        but its copies cannot be written to, and will answer ``assignment
+        destination is read-only``. That is the trade this clause makes
+        everywhere: refuse a working problem audibly rather than stay quiet
+        about a broken one.
+
+        A buffer already at the constructor's postcondition -- owning and
+        frozen -- is left exactly where it is, because replacing it would gain
+        nothing and costs the only thing this branch can lose: a read-only
+        property answering for a coefficient cannot be assigned to, and an
+        ordinary round trip of a subclass the optimizer accepts raised
+        ``property '_M' ... has no setter``. When the buffer is writeable and
+        the storage still refuses assignment there is no safe outcome -- the
+        copy cannot be stored and freezing the original would change an object
+        the caller did not ask to change -- so restoration refuses, names the
+        buffer and says why, rather than letting a bare ``AttributeError`` out
+        of ``copy.deepcopy``.
 
         A buffer that does not own its storage is replaced by one that does,
         rather than merely frozen. Pickle reconstructs an ``ndarray`` as a view
@@ -331,17 +531,73 @@ class AffineDynamics:
         slots: dict[str, Any] | None = None
         if isinstance(state, tuple) and len(state) == 2:
             state, slots = state
+        storage = _AFFINE_INSTANCE_DICT.__get__(self)
         if state:
-            self.__dict__.update(state)
+            storage.update(state)
         if slots:
             for name, value in slots.items():
                 object.__setattr__(self, name, value)
-        for name in _COEFFICIENT_BUFFERS:
-            buffer = self.__dict__[name]
-            if not buffer.flags.owndata:
-                buffer = buffer.copy()
-                self.__dict__[name] = buffer
+
+        rooted = bool(storage.get(_ROOT_INITIALISED, False))
+        names = _COEFFICIENT_BUFFERS if rooted else _resolving_buffer_names(self)
+        if not names:
+            return
+
+        for name in names:
+            buffer = _resolve_buffer(self, name)
+            if not isinstance(buffer, np.ndarray):
+                continue
+            if buffer.flags.owndata and not buffer.flags.writeable:
+                # Already the constructor's postcondition. Replacing it would
+                # gain nothing and costs the one thing this branch can lose:
+                # a read-only property answering for a coefficient cannot be
+                # assigned to, and an ordinary round trip of a subclass the
+                # optimizer accepts raised ``property has no setter``.
+                continue
+            if rooted and buffer.flags.owndata:
+                continue
+            # Not ``buffer.copy()``: an ``ndarray`` subclass may override it,
+            # and one returning ``self`` put the freeze back on the shared
+            # source this branch exists to protect, while one perturbing the
+            # data changed a coefficient silently. This dispatches to no
+            # user-defined ``copy``. It does run ``__array_finalize__``, which
+            # is unavoidable for any subclass-preserving construction;
+            # ``subok=True`` is kept because normalising here would quietly
+            # turn a buffer the check must refuse into one that passes.
+            replacement = np.array(buffer, copy=True, subok=True)
+            try:
+                setattr(self, name, replacement)
+            except Exception as exc:
+                # The reason is read off the buffer, not assumed. This branch
+                # takes both a writeable buffer and a frozen one that does not
+                # own its storage, and naming the wrong one sends the caller
+                # after the wrong remedy.
+                reason = (
+                    "writeable, and freezing it where it lies would reach back "
+                    "through the sharing a copy leaves and freeze the original"
+                    if buffer.flags.writeable
+                    else "frozen but does not own its storage, so it has to be "
+                    "replaced by one that does"
+                )
+                raise MutableCoefficients(
+                    type(self),
+                    name,
+                    f"{reason}; and it cannot be replaced with a frozen copy "
+                    f"({type(exc).__name__}: {exc}). Give the attribute a "
+                    f"setter, or leave the root's buffers as constructed",
+                ) from exc
+        for name in names:
+            buffer = _resolve_buffer(self, name)
+            if not isinstance(buffer, np.ndarray) or not buffer.flags.owndata:
+                raise MissingCoefficients(
+                    type(self),
+                    name,
+                    None if buffer is _MISSING else buffer,
+                    rooted,
+                )
             buffer.flags.writeable = False
+        if names == _COEFFICIENT_BUFFERS:
+            storage[_ROOT_INITIALISED] = True
 
     @property
     def M(self) -> NDArray:
@@ -727,12 +983,13 @@ _COPY_PROTOCOL_HOOKS = (
     "__reduce_ex__",
 )
 
-#: Distinguishes "defined on neither" from "defined on one". The lookup hooks
-#: are defined on neither root, so the comparison needs a default on both
-#: sides. An object sentinel rather than ``None`` so that "not defined" and
-#: "defined as ``None``" stay distinct, which costs nothing and removes a
-#: question.
-_MISSING: Any = object()
+#: ``type``'s own getset descriptors for ``__mro__`` and ``__dict__``, bound
+#: once. Reading ``cls.__mro__`` or ``klass.__dict__`` is attribute access on a
+#: class and so goes through the *metaclass*, which may define either as a
+#: property; these are the real slots, and ``type`` is not a class any problem
+#: under test gets to shadow.
+_TYPE_MRO: Any = type.__dict__["__mro__"]
+_TYPE_DICT: Any = type.__dict__["__dict__"]
 
 
 def _defined_as(cls: type, name: str) -> Any:
@@ -745,13 +1002,20 @@ def _defined_as(cls: type, name: str) -> Any:
     reports whatever it likes. Walking ``__mro__`` and reading each class's own
     ``__dict__`` reads the binding instead of its result.
 
-    Class ``__dict__`` is a ``mappingproxy`` reached through the metaclass, so
-    it is not interceptable by the class being checked. This is the one lookup
-    in this module that has to be trusted, and it is the narrowest available.
+    Both of those are read through ``type``'s own getset descriptors rather
+    than by attribute access on the class. ``cls.__mro__`` and
+    ``klass.__dict__`` are attribute lookups on a *class*, so they consult the
+    **metaclass**, and a metaclass defining either as a property answers them:
+    one reported a fabricated MRO while Python's own method lookup went on
+    reaching the root's ``f``, ``F`` and ``G``, and the gradient was displaced
+    by the ``0.0770625`` of C-15.7 with every guard quiet. Going through
+    ``type.__dict__`` gets the real slots, which a metaclass cannot shadow
+    because ``type`` is where the descriptor lives.
     """
-    for klass in cls.__mro__:
-        if name in klass.__dict__:
-            return klass.__dict__[name]
+    for klass in _TYPE_MRO.__get__(cls):
+        own = _TYPE_DICT.__get__(klass)
+        if name in own:
+            return own[name]
     return _MISSING
 
 
@@ -778,53 +1042,136 @@ _AFFINE_INSTANCE_DICT: Any = AffineDynamics.__dict__["__dict__"]
 #: the first, and worse, it reads storage that a property or slot may have
 #: displaced: a frozen decoy in the instance dict passed the check while a
 #: writeable array reached ``F``.
-def _root_buffers(problem: object) -> dict[str, NDArray] | None:
-    """The live coefficient buffers, or ``None`` if the root storage is dead.
+def _live_buffer_names(problem: object) -> tuple[str, ...]:
+    """Which coefficient buffers ``problem`` can still hand to the tape.
 
-    ``None`` is the precondition failing, not a refusal. A problem that is not
-    an ``AffineDynamics`` owes nothing here even if it happens to name its own
-    attributes ``_M`` and ``_C``; the hazard belongs to *this* class's storage.
-    Neither does an instance on which ``AffineDynamics.__init__`` never ran --
-    one deriving from both roots in the order that resolves the initialiser to
-    the time-varying one, or a subclass replacing ``f``, ``F`` and ``G``
-    without chaining up. It holds no buffer the tape could alias, and C-16.2
-    requires that refusal to be *quiet*.
+    Empty means the root's storage is dead on this instance: the precondition
+    failing, not a refusal, and C-16.2 requires it to be *quiet*.
 
-    The precondition is the recorded :data:`_ROOT_INITIALISED` flag, not the
-    presence of the buffers, and deliberately so: reaching for ``_M`` on a
-    subclass that never had one evaluates a descriptor that is not ours to
-    evaluate, and reads a partial set as damage when it may be a subclass
-    using one of the same private names. Nothing is touched until the root is
-    known to own the storage. The flag is read through the root's own
-    ``__dict__`` descriptor rather than by attribute access, because unlike
-    the buffers it is not something any subclass is entitled to answer for.
+    Two facts answer this, and the second was missing until a review
+    reproduced its absence. The first is the recorded
+    :data:`_ROOT_INITIALISED` flag: if the root initialiser ran it created all
+    three buffers, so all three are live, whatever the subclass has done
+    since. It is read through the root's own ``__dict__`` descriptor rather
+    than by attribute access, because unlike the buffers it is not something
+    any subclass is entitled to answer for.
 
-    It is not the MRO either. Asking whether ``f``, ``F`` and ``G`` are still
-    the root's own definitions is unsound in the quiet direction, because an
-    override may delegate:
+    The flag alone was the whole precondition, on the reasoning that an
+    instance whose root initialiser never ran holds nothing the tape could
+    alias. That is true only of a subclass that also *replaces the members
+    which hand a buffer back*. One that assigns ``self._M``, ``self._C`` and
+    ``self._b`` itself and inherits ``f``, ``F`` and ``G`` runs the root's
+    ``return self._M`` over writeable storage, and the check skipped it
+    entirely: ``affine_dynamics_verified`` returned ``True`` and the affine
+    route returned a gradient displaced by the full ``0.0770625`` of the
+    C-15.7 fixture.
+
+    So the second fact is which of those three members the MRO still resolves
+    to the root's own definition, and that also says *which* buffers are live
+    rather than demanding all three: ``F`` reads only ``_M``, ``G`` only
+    ``_C``, and ``f`` reads all three. A subclass overriding ``f`` and ``G``
+    but not ``F`` owes ``_M`` and nothing else.
+
+    This is not the MRO test rejected earlier as a *replacement* for the flag.
+    That one is unsound in the quiet direction, because an override may
+    delegate:
 
         def F(self, y, u, t): return super().F(y, u, t)
 
     Three distinct function objects, every buffer read. **Method identity
-    cannot witness what a method reads**, so it is not asked.
+    cannot witness what a method reads**, and it still cannot. Used as a
+    widening rather than as the whole precondition it only ever adds
+    instances to the checked set.
 
-    Once the flag is present the root established three frozen, owning
-    ``ndarray``\\ s, so anything else found in their place is a replacement
-    the tape cannot be reasoned about -- a sparse matrix, a ``memoryview``, a
-    deleted attribute -- and raises rather than being skipped. Skipping was
-    the earlier behaviour and it failed silently: three ``csr_array``
-    coefficients left ``_root_buffers`` with nothing to check, so the problem
-    verified as affine and returned a displaced gradient.
+    A second widening closes what method identity cannot see. A subclass that
+    both declines the root initialiser *and* delegates all three readers to
+    the root's has no marker and no reader of its own, and was left with an
+    empty live set while `super().F(...)` handed out its writeable ``_M``:
+    the full ``0.0770625`` displacement of the C-15.7 fixture, through the
+    public optimizer, with every guard quiet. Each half of that shape is
+    ordinary on its own -- coefficients built from a file or a mesh,
+    instrumentation wrapped round a reader -- so the combination is not
+    exotic. So **any root coefficient name that resolves at all is live**,
+    which is the same question ``__setstate__`` asks of a restored object,
+    asked here for the same reason: the storage is what the tape will alias,
+    whatever the class says about who reads it.
+
+    It is resolution, not type, that makes a name live. Restricting it to
+    ``ndarray`` values left the same delegating shape holding three mutable
+    ``csr_array`` coefficients invisible to both widenings, and it returned
+    the same displacement. Whether the value is usable is decided afterwards
+    by ``_root_buffers``, which raises rather than skipping; deciding it here
+    would be skipping.
+
+    Both widenings are needed, and what identity adds is a name that does not
+    resolve at all. A subclass inheriting ``F`` and holding no ``_M`` is
+    refused *by name* at the route decision rather than raising
+    ``AttributeError`` from inside the first step.
+
+    And the flag remains load-bearing beside both, for the one thing neither
+    can do: remember. Each widening asks what the instance currently is; only
+    the flag knows that three frozen arrays were established here and that
+    two are left. A subclass that delegates its readers and then deletes
+    ``_M`` is invisible to identity and to presence, and is refused by name
+    only because the marker survives.
+
+    The cost is a shape that is refused although it works: a subclass that
+    replaces all three readers and reuses one of the root's buffer names for
+    writeable storage of its own. It pays the standing trade of this clause,
+    it is told exactly which name collided, and renaming the attribute lifts
+    the refusal. Restoration already charged it the same price, and a rule
+    that binds on copying but not on checking is not one rule.
+
+    Asking is not a passive read: a coefficient descriptor is executed here,
+    and one that raises has its exception absorbed. That direction is safe --
+    a name that cannot be read hands nothing to the tape, and if it were
+    load-bearing the reader reaching for it during the solve raises from the
+    same descriptor, loudly. Unreadable *storage*, as distinct from an
+    unreadable name, is a different matter and raises below.
+
+    Once a buffer is live, anything found in its place other than an
+    ``ndarray`` is storage whose aliasing cannot be reasoned about -- a sparse
+    matrix, a ``memoryview``, a deleted attribute -- and raises rather than
+    being skipped.
     """
     if not isinstance(problem, AffineDynamics):
+        return ()
+    if _AFFINE_INSTANCE_DICT.__get__(problem).get(_ROOT_INITIALISED, False):
+        return _COEFFICIENT_BUFFERS
+    cls = type(problem)
+    live = {
+        name
+        for reader, read in _ROOT_BUFFER_READERS.items()
+        if _defined_as(cls, reader) is _defined_as(AffineDynamics, reader)
+        for name in read
+    }
+    live.update(_resolving_buffer_names(problem))
+    return tuple(name for name in _COEFFICIENT_BUFFERS if name in live)
+
+
+def _root_buffers(problem: object) -> dict[str, NDArray] | None:
+    """The live coefficient buffers, or ``None`` if there are none.
+
+    Resolved through :func:`_resolve_buffer`, not by a bare ``getattr``. This
+    read was the one place the shared rule was restated rather than reused,
+    and a name obliged by an inherited reader whose descriptor raised anything
+    but ``AttributeError`` let that exception out of the route decision
+    instead of the ``MissingCoefficients`` naming it.
+    """
+    names = _live_buffer_names(problem)
+    if not names:
         return None
-    if not _AFFINE_INSTANCE_DICT.__get__(problem).get(_ROOT_INITIALISED, False):
-        return None
+    rooted = _AFFINE_INSTANCE_DICT.__get__(problem).get(_ROOT_INITIALISED, False)
     buffers: dict[str, NDArray] = {}
-    for name in _COEFFICIENT_BUFFERS:
-        buffer = getattr(problem, name, None)
+    for name in names:
+        buffer = _resolve_buffer(problem, name)
         if not isinstance(buffer, np.ndarray):
-            raise MissingCoefficients(type(problem), name, buffer)
+            raise MissingCoefficients(
+                type(problem),
+                name,
+                None if buffer is _MISSING else buffer,
+                rooted,
+            )
         buffers[name] = buffer
     return buffers
 
@@ -839,19 +1186,42 @@ def require_immutable_coefficients(problem: object) -> None:
     ``_b`` still matters. It is conditional on that storage being live at all,
     which :func:`_root_buffers` answers first.
 
-    The condition is deliberately the storage rather than which member reads
-    which buffer. Per-buffer liveness would have to be inferred from the
-    override structure, and the paragraph in :func:`_root_buffers` records why
-    that inference is unsound. The cost is refusing a subclass that keeps the
-    root's storage, unfreezes a buffer, and then overrides every member that
-    would have read it -- a loud refusal of a working problem, in exchange for
-    never staying quiet about a broken one.
+    The condition is the storage, not which member reads which value *within*
+    a buffer. Which buffers are live is answered by :func:`_live_buffer_names`,
+    from the recorded flag widened by the readers the MRO still resolves to the
+    root's own; the cost is refusing a subclass that keeps the root's storage,
+    unfreezes a buffer, and then overrides every member that would have read it
+    -- a loud refusal of a working problem, in exchange for never staying quiet
+    about a broken one.
 
-    Both flag conditions are needed, and the second is the one that is easy to
-    miss. ``np.array(b, copy=True).reshape(-1)`` returns a *view*: freezing it
-    leaves ``arr.base`` writeable, so the values behind a buffer reported as
-    read-only could still be rewritten. Requiring ``owndata`` removes the
-    question rather than walking a base chain to answer it.
+    Four conditions, and the last three are the ones that are easy to miss.
+
+    ``writeable = False`` seals the ``ndarray`` it is set on. It does not seal
+    anything that array merely carries or points at, and two of these
+    conditions exist because it does not.
+
+    An ``ndarray`` **subclass** may hold state of its own that the flag never
+    reaches. A ``MaskedArray``'s mask is an ordinary writeable array, and
+    flipping one entry after the check changed what the coefficient means
+    mid-solve: a deep copy verified as affine with its data frozen and owning,
+    and the gradient came back ``0.7706250`` against an exact ``0.6781500`` on
+    the C-15.7 fixture at ``C = 2``. There is no general way to enumerate what
+    a subclass keeps, so the type must be ``ndarray`` exactly. The certified
+    envelope is numeric coefficients, so this refuses nothing C-6 admits.
+
+    ``np.array(b, copy=True).reshape(-1)`` returns a *view*: freezing it leaves
+    ``arr.base`` writeable, so the values behind a buffer reported as read-only
+    could still be rewritten. Requiring ``owndata`` removes the question rather
+    than walking a base chain to answer it.
+
+    An ``object`` dtype makes ``writeable=False`` mean almost nothing. The
+    flag covers the array of references; every object behind those references
+    stays mutable, and a frozen owning ``object`` array holding a
+    zero-dimensional ``ndarray`` gave the full ``0.0770625`` displacement with
+    all three guards passing and both flags intact throughout. There is no
+    depth at which chasing this ends, so the dtype is refused instead.
+    ``AffineDynamics.__init__`` casts to ``float``, so this is reachable only
+    on the path that never ran it.
 
     ``O(1)`` per buffer, once per route decision, against the ``O(n³)`` solve
     it guards. It is a check at a moment, not a lifetime guarantee; C-15.7
@@ -861,11 +1231,27 @@ def require_immutable_coefficients(problem: object) -> None:
     if buffers is None:
         return
     for name, buffer in buffers.items():
+        if type(buffer) is not np.ndarray:
+            raise MutableCoefficients(
+                type(problem),
+                name,
+                f"a {type(buffer).__name__}, an ndarray subclass whose own "
+                f"state the writeable flag does not reach -- a MaskedArray's "
+                f"mask stays writeable and changes what the coefficient "
+                f"means",
+            )
         if buffer.flags.writeable:
             raise MutableCoefficients(type(problem), name, "writeable")
         if not buffer.flags.owndata:
             raise MutableCoefficients(
                 type(problem), name, "non-owning (its base is writeable)"
+            )
+        if buffer.dtype.hasobject:
+            raise MutableCoefficients(
+                type(problem),
+                name,
+                f"of dtype {buffer.dtype!s}, whose elements stay mutable "
+                f"however the array is flagged",
             )
 
 
@@ -979,7 +1365,7 @@ def affine_dynamics_verified(
     ):
         return False
 
-        # Safe only because ``__dict__`` was compared above: the descriptor
+    # Safe only because ``__dict__`` was compared above: the descriptor
     # reached here is the root's, so this returns real instance storage rather
     # than whatever a subclass would prefer the check to see. A class using
     # __slots__ has no instance dict, and a slot shadowing a guaranteed member
