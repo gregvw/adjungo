@@ -57,6 +57,7 @@ import copy
 import pickle
 from collections.abc import Callable
 from typing import Any
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -64,6 +65,7 @@ from numpy.typing import NDArray
 from scipy.sparse import csr_array
 
 from adjungo import GLMOptimizer, ProblemStructure
+from adjungo.core import affine
 from adjungo.core.affine import (
     _COEFFICIENT_BUFFERS,
     _COPY_PROTOCOL_HOOKS,
@@ -71,6 +73,7 @@ from adjungo.core.affine import (
     InvalidCoefficients,
     MissingCoefficients,
     MutableCoefficients,
+    SubstitutedCoefficients,
     TimeVaryingAffineDynamics,
     _defined_as,
     affine_dynamics_verified,
@@ -1714,6 +1717,116 @@ def test_the_refusal_to_replace_names_the_reason_it_read() -> None:
     assert "does not own its storage" not in str(writeable.value)
 
 
+class DerivesASecondHandleInItsSetter(AffineDynamics):
+    """Keeps a view beside the coefficient, rebuilt whenever ``_M`` is set.
+
+    Ordinary enough -- a handle kept for fast access, a reshape, a slice --
+    and the shape that showed restoration was freezing too late. Module level
+    so the pickle routes can reach it.
+    """
+
+    @property
+    def _M(self) -> NDArray:
+        return self._stored_M
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        self._stored_M = value
+        self.matrix_view = value.view()
+
+
+class WritesThroughTheDerivedView(OverwritesCoefficientMidSolve):
+    """Overwrites the coefficient through the setter's view, not through
+    ``_M``, so it reaches whatever the freeze failed to cover.
+    """
+
+    def _fire(self) -> None:
+        if self.target is not None and not self.fired:
+            self.fired = True
+            self.target.matrix_view[0, 0] = M_OVERWRITTEN  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(lambda p: p, id="as-constructed"),
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(lambda p: pickle.loads(pickle.dumps(p, 4)), id="pickle-4"),
+        pytest.param(lambda p: pickle.loads(pickle.dumps(p)), id="pickle-default"),
+    ],
+)
+def test_no_duplication_route_leaves_a_writeable_alias_of_a_coefficient(
+    duplicate: Callable[[Any], Any],
+) -> None:
+    """A handle taken from a writeable array stays writeable, C-15.7.
+
+    ``writeable = False`` is a per-array flag and does not reach views
+    already made from it. Restoration used to hand the setter a *writeable*
+    replacement and freeze the owner afterwards, so a setter that derived a
+    second handle -- a view, a reshape, a slice kept for fast access -- kept
+    one that was writeable and shared the coefficient's memory. The second
+    pass could not see it: it re-reads ``_M``, which answers with the owner.
+
+    The invariant every route must satisfy is that no handle onto a
+    coefficient's memory is left writeable. The routes reach it two
+    different ways, both measured in the companion test below, so this one
+    states only the common claim and then the consequence that matters: the
+    objective here touches the coefficient *only* through the derived view,
+    so if any route leaves that view a writeable alias the gradient moves by
+    the C-15.7 displacement and nothing else complains.
+    """
+    problem = duplicate(DerivesASecondHandleInItsSetter(M_CONST, C_DOUBLED))
+    assert affine_dynamics_verified(problem)
+
+    view = problem.matrix_view
+    assert not (view.flags.writeable and np.shares_memory(view, problem._M))
+
+    exact, displacement = _closed_form(2.0)
+    assert displacement == pytest.approx(0.0770625, abs=EXACT_TOL)
+    try:
+        gradient = np.asarray(_gradient(problem, WritesThroughTheDerivedView(problem)))
+    except ValueError as refused:
+        # The freeze reached the derived handle, so the write is refused
+        # where it is attempted rather than absorbed into the gradient.
+        assert "read-only" in str(refused)
+        assert np.shares_memory(view, problem._M)
+    else:
+        # The handle no longer aliases the coefficient, so the write landed
+        # in an array the solve never reads.
+        assert not np.shares_memory(view, problem._M)
+        assert gradient == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def test_only_a_non_owning_restoration_reaches_the_replacement() -> None:
+    """Why the routes divide, measured rather than assumed.
+
+    Restoration leaves a rooted instance alone when what it resolves to
+    already owns its data, so the setter never runs and the derived view is
+    whatever duplication produced -- for ``deepcopy`` and protocol 4, an
+    independent array that shares no memory with the coefficient. NumPy
+    reconstructs an array from a default-protocol (5) pickle as a view over
+    the pickle buffer instead, which does not own its data, so restoration
+    replaces it and the setter does run. That is the one route that reached
+    the writeable replacement, and it is the route this fixture must keep
+    exercising if the freeze is to stay tested.
+    """
+    reaches_the_setter = {
+        "deepcopy": copy.deepcopy,
+        "pickle-4": lambda p: pickle.loads(pickle.dumps(p, 4)),
+        "pickle-default": lambda p: pickle.loads(pickle.dumps(p)),
+    }
+    shares = {
+        route: np.shares_memory(
+            (restored := duplicate(DerivesASecondHandleInItsSetter(M_CONST, C_DOUBLED)))
+            .matrix_view,
+            restored._M,
+        )
+        for route, duplicate in reaches_the_setter.items()
+    }
+    assert shares == {"deepcopy": False, "pickle-4": False, "pickle-default": True}
+
+
 def test_a_subclass_reading_none_of_the_root_buffers_is_left_alone() -> None:
     """The false-refusal control for running the check first.
 
@@ -2020,52 +2133,187 @@ class RebuildsAnotherCoefficient(AffineDynamics):
             self.__dict__["_M"] = rebuilt
 
 
-@pytest.mark.parametrize(
-    "duplicate",
-    [
-        pytest.param(copy.copy, id="copy"),
-        pytest.param(copy.deepcopy, id="deepcopy"),
-        pytest.param(lambda p: pickle.loads(pickle.dumps(p)), id="pickle"),
-    ],
-)
+class CopiesDerivesThenMatchesTheFlag(AffineDynamics):
+    """``CopiesIntoItsOwnStorage`` with one more ordinary line in the setter.
+
+    The view is taken while the copy is still writeable; the flag is matched
+    onto the copy afterwards. Every line is something a reasonable subclass
+    might write, and together they leave a writeable handle onto the array
+    the tape holds, behind an owner that is frozen, owning, and accepted by
+    every other check in this clause.
+    """
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        return self.__dict__["_store"]
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        stored = np.array(value, dtype=float)
+        self.matrix_view = stored.view()
+        stored.flags.writeable = value.flags.writeable
+        self.__dict__["_store"] = stored
+
+
 @pytest.mark.parametrize(
     "factory",
     [
         pytest.param(CopiesIntoItsOwnStorage, id="stores-a-copy"),
         pytest.param(RebuildsAnotherCoefficient, id="rebuilds-another"),
+        pytest.param(CopiesDerivesThenMatchesTheFlag, id="stores-a-copy-it-aliases"),
     ],
 )
-def test_the_replacement_buffer_is_frozen_as_the_object_resolves_it(
+def test_a_setter_that_substitutes_its_own_storage_is_refused(
     factory: type[AffineDynamics],
-    duplicate: Callable[[AffineDynamics], AffineDynamics],
 ) -> None:
-    """Freezing the value handed to ``setattr`` is not freezing the buffer.
+    """The provenance rule, and why freezing alone could not replace it.
 
-    Restoration replaces a non-owning buffer, and ``setattr`` may run a
-    property setter that stores something else — a copy, in the first case
-    here. The local name stayed bound to the object that was discarded, so the
-    freeze landed on it and the array ``F`` returns came back owning and
-    *writeable*: a subclass that verified before the round trip failed the
-    check after it.
+    Each of these setters stores an array of its own and matches the
+    argument's ``writeable`` flag onto it. That was accepted: the coefficient
+    resolved to a frozen, owning array, which is all any check could ask of
+    the object in front of it.
 
-    The second case is why re-reading in place is not enough either. That
-    setter rewrites ``_M`` as a side effect, so ``_M`` — frozen earlier in the
-    same loop — was replaced while the loop was still running. Freezing had to
-    become a second pass over all three, after no coefficient setter can still
-    run.
+    The third shows what the first two were worth. It differs by one line, a
+    view taken before the flag is matched, and nothing in the object's final
+    state distinguishes it -- the owner is frozen either way. The handle is
+    not reachable from the coefficient, so no check can find it, and it
+    aliases the memory the tape holds.
+
+    So the rule moved from the array's state to its provenance: a coefficient
+    must be the array the root froze before any subclass code could see it.
+    Relocation stays supported -- ``SlottedM`` and the fixtures below store
+    the handed array wherever they like. Substitution is refused here, at
+    construction, before an instance exists to be trusted.
     """
-    original = factory(M_CONST, C_CONST)
-    assert affine_dynamics_verified(original)
+    with pytest.raises(SubstitutedCoefficients) as refusal:
+        factory(M_CONST, C_CONST)
 
-    duplicated = duplicate(original)
+    assert "does not store the array it is handed" in str(refusal.value)
+    assert "before calling super().__init__" in str(refusal.value)
 
-    for name in ("_M", "_C", "_b"):
-        buffer = getattr(duplicated, name)
-        assert not buffer.flags.writeable
-        assert buffer.flags.owndata
-    assert duplicated.F(Y0, U[:1], 0.0) is duplicated._M
-    assert affine_dynamics_verified(duplicated)
-    assert duplicated.M == pytest.approx(M_CONST, abs=EXACT_TOL)
+
+class RelocatesCThenRewritesM(AffineDynamics):
+    """Stores ``_C`` faithfully and rebuilds ``_M`` on the way past.
+
+    Nothing forbids one coefficient's setter from touching another. This one
+    keeps the array it is handed, so ``_C`` itself is beyond reproach, and
+    substitutes ``_M`` -- which was assigned, and would have been checked,
+    before this setter ever ran.
+    """
+
+    @property
+    def _C(self) -> NDArray:  # type: ignore[override]
+        return self.__dict__["_cstore"]
+
+    @_C.setter
+    def _C(self, value: NDArray) -> None:
+        self.__dict__["_cstore"] = value
+        rebuilt = np.array(self.__dict__["_M"], dtype=float)
+        rebuilt.flags.writeable = False
+        self.__dict__["_M"] = rebuilt
+
+
+def test_provenance_is_checked_after_every_setter_has_run() -> None:
+    """Checking each coefficient as it is assigned checks it too early.
+
+    ``_M`` is assigned first and is correct at that instant; ``_C``'s setter
+    then replaces it. A per-assignment check passes all three and leaves the
+    instance holding a substituted ``_M``, which is the whole state this rule
+    exists to refuse. Checking after all three have been set is what catches
+    it, and the name in the refusal is ``_M`` rather than ``_C`` -- the
+    coefficient that ends up wrong, not the setter that made it so.
+    """
+    with pytest.raises(SubstitutedCoefficients, match="'_M'"):
+        RelocatesCThenRewritesM(M_CONST, C_CONST)
+
+
+def test_restoration_refuses_a_substitution_the_constructor_never_saw() -> None:
+    """``__setstate__`` does not run ``__init__``, so it repeats the check.
+
+    Reached the way it is reached in practice: an instance built while the
+    class was well behaved, whose class acquires a substituting setter
+    afterwards. Pickle rebuilds it through ``object.__new__`` and
+    ``__setstate__``, so the constructor's refusal never runs and only
+    restoration's does.
+
+    ``copy`` and ``deepcopy`` are absent here deliberately, and their absence
+    is asserted rather than assumed: both hand back an array that already
+    owns its data, which a rooted restoration leaves in place without calling
+    any setter. Nothing is substituted because nothing is assigned.
+    """
+    problem = AffineDynamics(M_CONST, C_CONST)
+    problem.__dict__["_store"] = problem.__dict__["_M"]
+    problem.__class__ = CopiesIntoItsOwnStorage
+
+    with pytest.raises(SubstitutedCoefficients, match="'_M'"):
+        pickle.loads(pickle.dumps(problem))
+
+    for untouched in (copy.copy, copy.deepcopy):
+        duplicate = untouched(problem)
+        assert duplicate.__dict__["_store"] is duplicate.__dict__["_M"]
+        assert not duplicate._M.flags.writeable
+
+
+def test_restoration_also_checks_provenance_after_every_setter() -> None:
+    """The constructor's ordering rule, restated where it is easy to lose.
+
+    ``__setstate__`` assigns the coefficients in its own loop, so it repeats
+    the constructor's deferral as well as its check: a name validated the
+    instant it was assigned is validated before the setter that rewrites it
+    has run. Checking inside the assignment loop let ``_C``'s setter replace
+    an already-approved ``_M``, and the round trip produced an instance that
+    verified while the subclass held a writeable view of the coefficient.
+
+    Reached as restoration is reached for such a class -- built while it was
+    well behaved, pickled after its class acquired the setter -- since the
+    constructor refuses it outright.
+    """
+    problem = AffineDynamics(M_CONST, C_CONST)
+    problem.__dict__["_cstore"] = problem.__dict__["_C"]
+    problem.__class__ = RelocatesCThenRewritesM
+
+    with pytest.raises(SubstitutedCoefficients, match="'_M'"):
+        pickle.loads(pickle.dumps(problem))
+
+
+class WritesThroughTheSubstitutedView(OverwritesCoefficientMidSolve):
+    """Rewrites the coefficient through the setter's retained view."""
+
+    def _fire(self) -> None:
+        if self.target is not None and not self.fired:
+            self.fired = True
+            self.target.matrix_view[0, 0] = M_OVERWRITTEN  # type: ignore[attr-defined]
+
+
+def test_the_refused_substitution_is_the_one_that_moves_the_gradient() -> None:
+    """What the refusal above buys, measured through the public optimizer.
+
+    The provenance rule is suspended for the construction and put straight
+    back, so what is measured is this library with exactly one rule removed
+    rather than a hand-built imitation of it. The instance then verifies as
+    affine -- its coefficient is frozen and owning, and the guard can see
+    nothing else -- while the setter's view still aliases that memory.
+
+    On the C-15.7 fixture (C = 2, M = 0.4 rewritten to 0.9 in the terminal
+    derivative callback, explicit Euler, two steps of h = 0.25 from y0 = 0.8),
+    the optimizer returns the closed form displaced by h^2 C y2 (M' - M).
+    """
+    with mock.patch.object(affine, "_require_stored_as_handed", lambda *a: None):
+        problem = CopiesDerivesThenMatchesTheFlag(M_CONST, C_DOUBLED)
+
+    assert not problem._M.flags.writeable
+    assert problem._M.flags.owndata
+    assert affine_dynamics_verified(problem)
+    assert problem.matrix_view.flags.writeable
+    assert np.shares_memory(problem.matrix_view, problem._M)
+
+    exact, displacement = _closed_form(2.0)
+    gradient = np.asarray(_gradient(problem, WritesThroughTheSubstitutedView(problem)))
+    assert gradient[0] == pytest.approx(exact[0] + displacement, abs=EXACT_TOL)
+
+    # And with the rule in place the same subclass never reaches the solve.
+    with pytest.raises(SubstitutedCoefficients):
+        CopiesDerivesThenMatchesTheFlag(M_CONST, C_DOUBLED)
 
 
 class SlottedM(AffineDynamics):
@@ -2163,11 +2411,16 @@ def test_a_subclass_without_root_storage_can_still_be_duplicated() -> None:
 def test_a_coefficient_property_is_read_through_the_property() -> None:
     """The decoy case, and the reason the instance dictionary is not consulted.
 
-    A subclass may resolve ``_M`` through a property while the root's
-    ``__dict__`` still holds the array ``__init__`` froze. Reading the stored
-    value then checks a decoy: it is frozen, the check passes, and ``F`` hands
-    the tape the writeable array the property returns. Attribute access sees
+    A subclass may resolve ``_M`` through a property while leaving a frozen
+    array of its own under ``_M`` in the instance dictionary. Reading the
+    stored value then checks a decoy: it is frozen, the check passes, and
+    ``F`` hands the tape whatever the property returns. Attribute access sees
     what ``F`` sees.
+
+    The setter here *relocates* the array it is handed rather than storing a
+    substitute for it, which is the line the provenance rule draws: the
+    coefficient is still the array the root froze, so this verifies, and the
+    decoy beside it is harmless until the live array is unfrozen.
     """
 
     class PropertyM(AffineDynamics):
@@ -2177,13 +2430,20 @@ def test_a_coefficient_property_is_read_through_the_property() -> None:
 
         @_M.setter
         def _M(self, value: NDArray) -> None:
-            self.__dict__["_M"] = value
-            self._live = np.array(value, dtype=float)
+            decoy = np.array(value, dtype=float)
+            decoy.flags.writeable = False
+            self.__dict__["_M"] = decoy
+            self._live = value
 
     problem = PropertyM(M_CONST, C_CONST)
+    assert problem.__dict__["_M"] is not problem._live
     assert not problem.__dict__["_M"].flags.writeable
     assert problem.F(Y0, U[:1], 0.0) is problem._live
+    assert affine_dynamics_verified(problem)
 
+    # The decoy stays frozen; only the array F returns is unfrozen.
+    problem._live.flags.writeable = True
+    assert not problem.__dict__["_M"].flags.writeable
     with pytest.raises(MutableCoefficients, match="_M"):
         affine_dynamics_verified(problem)
 

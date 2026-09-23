@@ -1427,6 +1427,78 @@ setter can still run. Acting on a value fetched by a path other than the one
 that will be read is the mistake this clause keeps making, in each of its
 parts.
 
+**The replacement is nevertheless frozen before the setter sees it.** That is
+a second claim, not a weakening of the first. The second pass asks what the
+object resolves to once every setter has run, so it only ever reaches the
+owner; but a setter may derive a *second* handle from its argument — a view, a
+reshape, a slice kept for fast access — and `writeable` is a per-array flag
+that does not reach views already made from an array. A handle taken from a
+writeable replacement therefore stayed writeable over the coefficient's own
+memory while the owner was frozen behind it, and the guard, which re-reads
+`_M`, was answered by the owner and saw nothing wrong. A default-protocol
+pickle round trip of such a subclass verified and returned `0.7552125` against
+an exact `0.6781500` on the fixture above. Only that route reached it: NumPy
+reconstructs the array as a view over the pickle buffer, which does not own its
+data, while `deepcopy` and protocol 4 hand back an owning array that a rooted
+restoration leaves alone. Handing the setter a read-only array closes that at the source
+*for a handle derived from that array*, a view of a read-only array being
+read-only. It does not reach a setter that allocates storage of its own, which
+is the next rule.
+
+**And a coefficient must be the array the root froze.** This is the rule that
+makes the freeze mean anything, and it is about provenance rather than state.
+Everything above arranges for the array a coefficient resolves to be frozen. A
+subclass setter is ordinary code and may store an array of its own; if it does,
+it can derive a handle while that array is still writeable and then match the
+argument's `writeable` flag onto the copy it keeps. The result satisfies every
+check this clause can make — the coefficient resolves to an owning, frozen
+array — while the subclass holds a writeable alias of the memory the tape
+holds. Measured on the fixture above at `C = 2`, from plain construction, from
+`copy.copy`, and from a default-protocol pickle: the problem verified and the
+optimizer returned `0.7552125` against a closed-form `0.6781500`.
+
+No ordering reaches it. The constructor and restoration both freeze before they
+assign, but the setter chooses which memory becomes the coefficient and may
+choose memory it has already aliased. So the coefficient is required to *be*
+the array the root froze, checked by identity after assignment in both places —
+`__setstate__` does not run `__init__`, and without its own check a pickle
+reintroduces the subclass the constructor turns away.
+
+**What that closes, and what it does not.** Once the coefficient is the array
+the root froze, NumPy refuses to make a writeable view of it — by `view`,
+`as_strided`, `reshape` or `frombuffer` alike — so a setter cannot derive a
+writeable handle from what it was handed. It *can* unfreeze that array first,
+take the handle, and freeze it again before storing it; the result is
+indistinguishable and is not reached. That is the excluded class this clause
+already names, occurring a few lines earlier than the usual example, and it is
+listed in the ENVELOPE below with its measurement. The rule closes
+*substitution*, which was reachable without anyone intending it. It does not
+close sabotage, and a raw `ctypes` pointer — which defeats a C++ `const` just
+as completely — is outside the envelope for the same reason.
+
+Nor does it reach a subclass that never calls `super().__init__`. There is no
+root array to compare against, and requiring one would refuse every unrooted
+general-route problem that happens to hold these names, a shape this clause
+deliberately supports. Such a subclass owns its coefficients outright; its
+buffers are still checked for being frozen and owning, and their provenance is
+its own affair.
+
+The check runs after all three coefficients are assigned, not after each, in
+the constructor and in restoration alike. One coefficient's setter may rewrite
+another, and a subclass that stores `_C` faithfully while rebuilding `_M` on
+the way past passes a per-assignment check on every name and still ends up
+holding a substituted `_M` — measured through both paths, and the restoration
+half was written the wrong way round first.
+
+The cost is narrow and loud. A setter may **relocate** what it is handed — into
+another key, a slot, under any name — and several supported subclasses do. It
+may not store a **substitute**. Two subclasses this clause previously called
+verified did exactly that, and they are kept as refusal cases: their difference
+from the aliasing one is a single line, a view taken before the flag is
+matched, which nothing in the object's final state can distinguish. A subclass
+that wants to normalise its coefficients does so before `super().__init__`,
+where the array is still its own.
+
 **Which buffers are frozen is asked of the restored object, never of the state
 it arrived in.** Three rules that read the state were tried, and a subclass
 defeated each by shaping it:
@@ -1594,7 +1666,13 @@ unfreezing a buffer once the tape is built (`OBSERVED`: a cached
 `objective_value(U)`, then `p.M.flags.writeable = True` and a mutation, then
 `gradient(U)` returns `0.7552125`), handing `adjoint_solve` a trajectory built
 by hand — it takes a `Trajectory`, not a problem, so it has no `problem` to
-check — or a descriptor that answers the check and the solve differently.
+check — or a descriptor that answers the check and the solve differently, or a raw
+`ctypes` pointer taken to a frozen buffer's memory, or a coefficient setter
+that unfreezes the array it is handed, derives a handle from it and freezes it
+again before storing it (`OBSERVED`: on the fixture above at `C = 2`, verified,
+frozen and owning, with a writeable alias sharing its memory, `0.7552125`), or
+a subclass that never calls `super().__init__` and aliases coefficient storage
+it built itself.
 These are not separate defects to be closed one at a time. They are the same
 fact about Python, and chasing them costs more than it buys: the only
 construction that would close the first is copying `F` and `G`'s result at
@@ -1626,17 +1704,17 @@ eligible.
 
 #### Injection evidence — `OBSERVED`
 
-Under [R-11](#r-11) against a 715-test baseline with 0 failures, 50 of 50
+Under [R-11](#r-11) against a 722-test baseline with 0 failures, 56 of 56
 injected defects detected. Counts are as emitted by the campaign:
 
 | Injected defect | Failing tests |
 |---|---|
-| `__setstate__` removed entirely | 36 |
-| `__setstate__` restores state but does not re-freeze | 33 |
-| `__setstate__` leaves the buffers writeable outright | 36 |
+| `__setstate__` removed entirely | 38 |
+| `__setstate__` restores state but does not re-freeze | 35 |
+| `__setstate__` leaves the buffers writeable outright | 35 |
 | Only `_M` is re-frozen; `_C` and `_b` are missed | 20 |
 | `__setstate__` assumes a plain dict, breaking `__slots__` subclasses | 7 |
-| `__setstate__` freezes without restoring ownership | 16 |
+| `__setstate__` freezes without restoring ownership | 24 |
 | Verification stops checking the copy-protocol hooks | 8 |
 | `__setstate__` dropped from the guarded copy hooks | 2 |
 | `__deepcopy__` dropped from the guarded copy hooks | 1 |
@@ -1644,7 +1722,7 @@ injected defects detected. Counts are as emitted by the campaign:
 | The refusal returns `False` instead of raising | 24 |
 | The refusal checks `writeable` but not `owndata` | 1 |
 | `b` is reshaped into a view rather than an owning copy | 64 |
-| The freeze is dropped from the constructor as well | 123 |
+| The freeze is dropped from the constructor as well | 120 |
 | The refusal is ordered last again, behind the quiet checks | 17 |
 | Unreadable storage is skipped rather than refused | 10 |
 | `GLMOptimizer` stops enforcing validity at construction | 2 |
@@ -1667,9 +1745,9 @@ injected defects detected. Counts are as emitted by the campaign:
 | `MissingCoefficients` always claims the initialiser ran | 3 |
 | The class gate is dropped, catching unrelated problems | 305 |
 | Buffers are read from the instance dict rather than by attribute | 14 |
-| The root-initialised flag is never recorded | 3 |
+| The root-initialised flag is never recorded | 5 |
 | The root-initialised flag is written where it is not read | 1 |
-| Restoration reads coefficients from the instance dict | 15 |
+| Restoration reads coefficients from the instance dict | 14 |
 | Restoration freezes names the instance does not hold | 13 |
 | Restoration trusts the restored flag alone | 21 |
 | Restoration reads the restored keys rather than the object | 11 |
@@ -1680,7 +1758,13 @@ injected defects detected. Counts are as emitted by the campaign:
 | Restoration replaces a buffer already at the postcondition | 3 |
 | Restoration lets a failed `setattr` out as it comes | 2 |
 | The replacement is frozen in one pass, before setters finish | 14 |
+| The replacement is handed to the setter writeable | 1 |
 | An unmarked buffer is frozen in place, reaching into the source | 3 |
+| The constructor stops checking what the setter stored | 5 |
+| Restoration stops checking what the setter stored | 2 |
+| The provenance rule compares by value, not identity | 7 |
+| The constructor checks each coefficient before the next is set | 1 |
+| Restoration checks each coefficient before the next is set | 1 |
 
 Several of these are detected only because their fixtures were changed, and
 the change is the same each time. A guard reached by three mechanisms cannot

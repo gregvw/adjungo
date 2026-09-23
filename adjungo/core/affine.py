@@ -108,6 +108,7 @@ __all__ = [
     "InvalidCoefficients",
     "MissingCoefficients",
     "MutableCoefficients",
+    "SubstitutedCoefficients",
     "TimeVaryingAffineDynamics",
     "affine_dynamics_verified",
     "require_immutable_coefficients",
@@ -169,6 +170,45 @@ class MutableCoefficients(InvalidCoefficients):
             f"general route, which reads F the same way. Build the problem "
             f"with AffineDynamics(M, C, b) and do not rebind or replace "
             f"{name!r} afterwards.",
+        )
+
+
+class SubstitutedCoefficients(InvalidCoefficients):
+    """A setter stored an array other than the one it was handed — C-15.7.
+
+    Distinct from :class:`MutableCoefficients` because the array in place is
+    perfectly frozen; what is wrong is its provenance. The root freezes each
+    coefficient before assigning it, so an instance holding exactly those
+    arrays holds memory no subclass code has ever seen writeable. A setter
+    that substitutes storage of its own breaks that chain, and it can — with
+    no more than an ordinary copy, a retained view, and a line matching the
+    argument's ``writeable`` flag — leave a writeable alias of the tape's
+    memory behind a frozen owner that every check accepts.
+
+    A separate class because the remedy is different: nothing here is
+    writeable and nothing is missing, so neither of those messages would send
+    the caller anywhere useful.
+    """
+
+    def __init__(self, cls: type, name: str, stored: object = None) -> None:
+        found = (
+            "nothing"
+            if stored is _MISSING or stored is None
+            else f"a different {type(stored).__name__}"
+        )
+        super().__init__(
+            name,
+            f"{cls.__name__} defines a setter for the coefficient buffer "
+            f"{name!r} that does not store the array it is handed: after "
+            f"assignment, {name!r} resolves to {found}. AffineDynamics "
+            f"freezes each coefficient before assigning it, so that the array "
+            f"F returns and the backward sweeps hold is one no subclass has "
+            f"seen writeable; a setter that stores a copy instead can keep a "
+            f"writeable handle onto that copy, and the buffer then changes "
+            f"under a tape that verified as immutable (NUMERICS.md C-15.7). "
+            f"Relocating the array is fine -- store {name!r} itself under any "
+            f"key or slot you like. To normalise or reshape it, do so before "
+            f"calling super().__init__, where the array is still your own."
         )
 
 
@@ -326,6 +366,59 @@ def _resolving_buffer_names(problem: object) -> tuple[str, ...]:
     )
 
 
+def _require_stored_as_handed(problem: object, name: str, handed: Any) -> None:
+    """Refuse a setter that stored something other than what it was handed.
+
+    The one rule that makes the freeze mean anything. Everything else in this
+    clause arranges for the array a coefficient resolves to be frozen; this
+    arranges for that array to be *the root's own*, frozen before any
+    subclass code saw it. Those are not the same promise, and only the second
+    one can be kept.
+
+    A setter is ordinary code and may allocate storage of its own. If it
+    does, it can derive a handle from that storage while it is still writeable
+    and then match the argument's ``writeable`` flag onto the copy it stores.
+    The result passes every check this clause makes -- the coefficient
+    resolves to an owning, frozen array -- while the subclass retains a
+    writeable alias of the very memory the tape holds. Measured on the C-15.7
+    fixture at ``C = 2``, from plain construction, from ``copy.copy`` and from
+    a default-protocol pickle: the problem verified and the optimizer returned
+    ``0.7552125`` against a closed-form ``0.6781500``.
+
+    No ordering reaches it. Restoration and the constructor both freeze before
+    they assign, but the setter picks which memory becomes the coefficient,
+    and it can pick memory it has already aliased. The only closure is to
+    refuse the substitution.
+
+    What that leaves is narrower than it first appears, and the difference is
+    worth stating. Once the coefficient is the array the root froze, NumPy
+    refuses to make a writeable view of it -- by ``view``, ``as_strided``,
+    ``reshape`` or ``frombuffer`` alike -- so a setter cannot derive a
+    writeable handle from what it was handed. It *can* unfreeze that array
+    first, take the handle, and freeze it again before storing it. Nothing
+    distinguishes the result, and nothing here tries to: deliberate
+    unfreezing is the excluded class C-15.7 names, and this is it happening a
+    few lines earlier than the usual example. The rule closes substitution,
+    which was reachable without intending it; it does not close sabotage.
+
+    Nor does it reach a subclass that never calls ``super().__init__``. There
+    is no root array to compare against there, and requiring one would refuse
+    every unrooted general-route problem that happens to hold these names --
+    a shape this clause deliberately supports. Such a subclass owns its
+    coefficients outright, and its buffers are still checked for being frozen
+    and owning; their provenance is its own affair.
+
+    The cost is narrow and loud. A setter may still *relocate* what it is
+    handed -- into another key, into a slot, under another name -- and several
+    supported subclasses do. It may not store a substitute. A subclass that
+    wants to normalise its coefficients does so before ``super().__init__``,
+    where the array is still its own.
+    """
+    stored = _resolve_buffer(problem, name)
+    if stored is not handed:
+        raise SubstitutedCoefficients(type(problem), name, stored)
+
+
 class AffineDynamics:
     """``y' = M y + C u + b`` with constant coefficients.
 
@@ -397,6 +490,10 @@ class AffineDynamics:
         self._M = M_arr
         self._C = C_arr
         self._b = b_arr
+        # Checked after all three, not after each: one coefficient's setter is
+        # free to rewrite another, and a subclass that does exists.
+        for name, handed in (("_M", M_arr), ("_C", C_arr), ("_b", b_arr)):
+            _require_stored_as_handed(self, name, handed)
         self._nu = int(C_arr.shape[1])
         #: Set last, so it is present only if every buffer above was
         #: established and frozen. Written through the root's own ``__dict__``
@@ -489,6 +586,17 @@ class AffineDynamics:
         a value fetched by a path other than the one that will be read is the
         mistake this clause keeps making, in each of its parts.
 
+        **The replacement is nevertheless frozen before the setter sees it**,
+        which is a different claim and does not soften that one. The second
+        pass asks what the object resolves to once every setter has run, and
+        so only ever reaches the owner. A setter is free to derive a *second*
+        handle from its argument -- a view, a reshape, a slice kept for fast
+        access -- and ``writeable`` is a per-array flag that does not reach
+        views already made, so a handle taken from a writeable replacement
+        stayed writeable over the coefficient's own memory while the owner was
+        frozen behind it. Handing the setter a read-only array closes that at
+        the source, a view of a read-only array being read-only.
+
         Without the marker, a buffer that is still writeable is **copied
         before it is frozen** even when it already owns its storage. ``copy.copy`` shares the array with
         the original, so freezing in place reached back through that sharing
@@ -543,6 +651,7 @@ class AffineDynamics:
         if not names:
             return
 
+        handed: list[tuple[str, NDArray[np.float64]]] = []
         for name in names:
             buffer = _resolve_buffer(self, name)
             if not isinstance(buffer, np.ndarray):
@@ -565,6 +674,20 @@ class AffineDynamics:
             # ``subok=True`` is kept because normalising here would quietly
             # turn a buffer the check must refuse into one that passes.
             replacement = np.array(buffer, copy=True, subok=True)
+            # Frozen *before* the setter sees it, not only afterwards. A setter
+            # is free to derive a second handle from its argument -- a view, a
+            # reshape, a slice kept for fast access -- and a handle taken from
+            # a writeable array stays writeable when the array it came from is
+            # frozen later, because that flag is per-array and does not
+            # propagate to views already made. The second pass then froze the
+            # owner while the derived view kept writing to the same memory, and
+            # a default-protocol pickle round trip of such a subclass verified
+            # and returned the displacement C-15.7 measures. Freezing here
+            # closes that at the source for a handle derived from *this*
+            # array: a view of a read-only array is read-only. A setter that
+            # allocates storage of its own instead is beyond any ordering, and
+            # is refused below.
+            replacement.flags.writeable = False
             try:
                 setattr(self, name, replacement)
             except Exception as exc:
@@ -586,6 +709,16 @@ class AffineDynamics:
                     f"({type(exc).__name__}: {exc}). Give the attribute a "
                     f"setter, or leave the root's buffers as constructed",
                 ) from exc
+            handed.append((name, replacement))
+
+        # Restoration does not run ``__init__``, so this is where the same
+        # substitution is refused on the way back in; without it a pickle
+        # reintroduces the subclass the constructor turns away. Deferred to
+        # here for the reason the constructor defers it: one coefficient's
+        # setter may replace another, so a name checked the instant it was
+        # assigned is checked before the setter that rewrites it has run.
+        for name, replacement in handed:
+            _require_stored_as_handed(self, name, replacement)
         for name in names:
             buffer = _resolve_buffer(self, name)
             if not isinstance(buffer, np.ndarray) or not buffer.flags.owndata:

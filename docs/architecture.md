@@ -413,7 +413,21 @@ differ, C-13 governs.
     subclass that verifies can also be copied and pickled. It freezes in a
     second pass over re-read values, because a property setter may store a
     copy of its argument or rewrite another coefficient, leaving the freeze on
-    an object already discarded. And it decides *which* buffers to freeze by
+    an object already discarded. It also freezes the replacement *before* the
+    setter sees it, which is a separate claim: that second pass reaches only
+    what the object finally resolves to, and `writeable` does not propagate to
+    views already made, so a setter deriving a handle from a writeable
+    replacement kept a writeable alias of the coefficient's memory behind a
+    frozen owner — and because no ordering reaches a setter that allocates
+    storage of its own, a coefficient must additionally *be* the array the
+    root froze, checked by identity after assignment in the constructor and
+    in restoration alike, after all three names rather than after each,
+    because one coefficient's setter may rewrite another. A setter may
+    relocate what it is handed; it may not substitute. This closes
+    substitution, not sabotage: a setter that unfreezes its argument before
+    deriving a handle, and an unrooted subclass aliasing storage it built
+    itself, stay in the excluded class C-15.7 names. And it
+    decides *which* buffers to freeze by
     asking the restored object, not the state it arrived in: three rules that
     read the state — the marker, all three names, any name — were each
     defeated by a subclass shaping what it serialised, the last by delivering
