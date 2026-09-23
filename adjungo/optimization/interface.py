@@ -5,7 +5,10 @@ from collections.abc import Callable
 import numpy as np
 from numpy.typing import NDArray
 
-from adjungo.core.affine import affine_dynamics_verified
+from adjungo.core.affine import (
+    affine_dynamics_verified,
+    require_immutable_coefficients,
+)
 from adjungo.core.method import GLMethod, StageType
 from adjungo.core.objective import Objective
 from adjungo.core.problem import Linearity, Problem, ProblemStructure
@@ -108,6 +111,18 @@ class GLMOptimizer:
         _enforce_envelope(method, t_span, N)
 
         self.h = (t_span[1] - t_span[0]) / N
+
+        # Coefficient validity is a property of the problem, not of the route,
+        # so it is answered here rather than inside the deduction below. A
+        # caller who supplies an explicit ProblemStructure never reaches
+        # affine_dynamics_verified, and a rewritable coefficient displaces the
+        # general route by exactly the amount it displaces the affine one
+        # (C-15.7) -- so on that path the wrong gradient was returned in
+        # silence. Measured at 0.0770625 against an exact 0.6781500. Repeated
+        # in forward_solve, which is the boundary the invariant is really
+        # about; this one refuses before any work is done rather than at the
+        # first step of the first solve.
+        require_immutable_coefficients(problem)
 
         # Deduce problem structure if not provided
         if problem_structure is None:

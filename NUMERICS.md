@@ -1117,26 +1117,241 @@ and copies values out of `F`, and is *not* displaced by this mutation. What
 decides the matter is not whether a route reads `F` but whether it retains the
 object `F` returned, which the `GLMOptimizer` stage-solver paths do.
 
+#### A check that raises may not sit behind checks that return
+
+The guard above was correct, and unreachable by exactly the problems with the
+strongest claim on it. It was written as the last of four checks in
+`affine_dynamics_verified`, after three that answer quietly, so a problem
+refused for any unrelated reason never reached it — and a quiet refusal is
+exactly the outcome the preceding section establishes as unsafe. Problems that
+were otherwise eligible did reach it, and every test of the guard exercised
+that path, which is why the whole suite passed throughout.
+
+This was not a remote corner. The clause itself makes overriding a copy hook
+grounds for refusal, and deep-copying such a subclass is precisely what leaves
+the buffers writeable, so the two conditions coincide by construction rather
+than by coincidence: deep-copying a subclass that overrides `__setstate__`
+returns `0.7552125` against an exact `0.678150` on the `C = 2` fixture above,
+the full `0.0770625`.
+
+**Validity is a question about the object; eligibility is a question about the
+route. The first is answered first.** Three consequences follow, none of them
+optional:
+
+- The coefficient read may no longer rely on the checks that now run after it.
+  `__dict__` is one of the lookup hooks being compared, so `problem.__dict__`
+  would be a lookup whose honesty has not yet been established — a subclass
+  defining it as a property could hand the check frozen decoys and then be
+  refused quietly a few lines later. Instead the read binds `AffineDynamics`'s
+  own `__dict__` descriptor and calls it, the same narrowing `_defined_as`
+  applies to class attributes and for the same reason.
+- The three eligibility checks must still answer quietly for a *valid*
+  problem. Each is paired with a control asserting that the same shape, with
+  its coefficients intact, still returns `False`. Without those the reordering
+  would be satisfied by a check that raises for every subclass.
+- Running ahead of eligibility means the check can no longer borrow
+  eligibility's conclusions, and it had been borrowing one. See below.
+
+##### The invariant is conditional, so the check carries its own precondition
+
+Coefficient immutability is not a property every `AffineDynamics` instance
+owes. It exists because `AffineDynamics.F` and `G` hand back `self._M` and
+`self._C` *by identity* and the tape retains them. (`f` returns a fresh array,
+but reads all three buffers to build it, which is why an unfrozen `_b` still
+matters even though nothing hands it out.) An instance holding none of that
+storage has nothing the tape can alias.
+
+Gating the check on `isinstance(problem, AffineDynamics)` alone assumed
+otherwise and refused two working shapes outright:
+
+| Shape | Was | Should be |
+|---|---|---|
+| Subclass overriding `f`, `F`, `G`, not calling `super().__init__` | raises | quiet `False`, exact gradient on the general route |
+| `class C(TimeVaryingAffineDynamics, AffineDynamics)` | raises | quiet `False` per [C-16.2](#c-16) |
+
+Both are correct general-route problems, and the second is a refusal this
+contract already requires to be *quiet*. Raising there is a regression dressed
+as a guard.
+
+The precondition is therefore **class membership together with a flag the
+root initialiser records about itself**: `AffineDynamics.__init__` writes
+`_affine_root_initialised` into the instance dictionary after it has
+established and frozen all three buffers. Nothing else is consulted, and in
+particular no coefficient attribute is evaluated until that flag is present.
+
+Two inferences were written before it, and both are wrong.
+
+**From the MRO** — "is any of `f`, `F`, `G` still the root's own definition?"
+This is unsound in the quiet direction, because an override may delegate:
+
+```python
+class Instrumented(AffineDynamics):
+    def F(self, y, u, t): return super().F(y, u, t)   # ...and f, G likewise
+```
+
+Three distinct function objects, every buffer read. The check was skipped and
+the fixture below returned `0.7552125` against an exact `0.6781500`. **Method
+identity cannot witness what a method reads.** Delegating wrappers —
+instrumentation, unit conversion, logging — are ordinary, not adversarial.
+
+**From presence** — "are `_M`, `_C`, `_b` there?" This evaluates descriptors
+on classes that never had them. A valid general-route subclass may leave `_M`
+as a property that must never run, and asking made the *check* raise. It also
+misreads a subclass that reuses one of those names for its own storage as a
+root instance taken apart after construction. A recorded flag asks nobody
+anything.
+
+The flag is read through `AffineDynamics.__dict__["__dict__"]`, not by
+attribute access, because unlike a coefficient it is not something a subclass
+is entitled to answer for — one defining `__dict__` as a property returning
+`{}` would otherwise hide it and silence the check. The buffers are read the
+opposite way, and the next section says why.
+
+Once the flag is present the root established three frozen owning `ndarray`s,
+so anything else found in their place raises `MissingCoefficients` rather than
+being skipped. Skipping was the earlier behaviour and it failed in the silent
+direction: coefficients replaced by `scipy.sparse` arrays were unreadable, an
+unreadable buffer was treated as an absent one, the precondition concluded
+there was no root storage, and the problem verified as affine with its tape
+aliasing them unchecked.
+
+The cost of not inferring liveness is over-refusal: a subclass that keeps the
+root's storage, unfreezes a buffer and then overrides every member that would
+have read it is refused, loudly, although it works. That trade is deliberate —
+a loud refusal of a working problem, against never staying quiet about a
+broken one — and is pinned by a test so that narrowing it later is a decision
+rather than an accident.
+
+##### The buffer is read the way the method reads it
+
+`AffineDynamics.F` is `return self._M`, so `getattr(problem, "_M")` resolves
+what `F` resolves. Two more-defensive-looking reads were tried and are both
+wrong:
+
+| Read | Fails on |
+|---|---|
+| `problem.__dict__[name]` | a `__slots__` buffer (absent from the dict); a subclass `__dict__` property |
+| `AffineDynamics.__dict__["__dict__"].__get__(problem)` | a `__slots__` buffer; a `_M` **property**, where the dict still holds the frozen array `__init__` wrote while `F` returns the writeable one the property computes |
+
+The second is the instructive failure. It was chosen precisely to bypass the
+subclass's attribute machinery — and bypassing it meant reading storage that
+the machinery had displaced, so `affine_dynamics_verified` returned `True` on
+a problem whose gradient was displaced by `0.0770625`. A more suspicious read
+is not a more faithful one. Plain attribute access resolves slots, properties
+and descriptors exactly as `F` does; a subclass `__getattribute__` that lied
+would have to lie to `F` too, and then the lie *is* what gets retained.
+
+This is faithful for any descriptor that answers **consistently**, which is
+the assumption and the limit. One that returns a frozen array to the check and
+a writeable one to the next read defeats it, and is out of envelope for the
+same reason as the rest of this section: it is not a mistake anyone makes, it
+is a mechanism built to defeat the check, and `const` removes the question in
+the C++ port. Checking the retained `F` value inside the step cache instead
+would close it, at the price of refusing every ordinary subclass whose `F`
+returns a fresh writeable array — a real defect traded for a hypothetical one.
+
+##### Where the check runs
+
+`affine_dynamics_verified` is reached from `GLMOptimizer` only when the
+structure has to be deduced, so a caller supplying an explicit
+`ProblemStructure` bypassed the coefficient check altogether and received the
+displaced gradient in silence — the same `0.7552125`.
+
+Guarding `GLMOptimizer` is still not sufficient, because it is not the only
+way in. `forward_solve`, `adjoint_solve` and `assemble_gradient` are exported
+from `adjungo.stepping` and `adjungo.optimization` and compose into a gradient
+without touching `GLMOptimizer` at all; that composition returned the same
+`0.7552125`. The invariant belongs at the point of *retention*, and that point
+is `forward_solve`: every step stores what `F` and `G` returned in the step
+cache, and from there the tape aliases the buffers. Checking there covers
+every composition that produces a trajectory, rather than every caller that
+consumes one.
+
+`require_immutable_coefficients` is called in three places for three different
+reasons, and is public for that reason:
+
+| Call site | Why |
+|---|---|
+| `affine_dynamics_verified` | validity before eligibility, so no quiet refusal pre-empts it |
+| `GLMOptimizer.__init__` | refuses before any work, on both structure paths |
+| `forward_solve` | the retention boundary; covers every low-level composition |
+
+Three overlapping guards mean the outer two are individually invisible to any
+behavioural test, and the first injection campaign proved it: removing the
+`GLMOptimizer.__init__` call failed **zero** tests, because the regression
+asserted `pytest.raises` around `GLMOptimizer(...).gradient(U)` as one
+expression and `forward_solve` raised instead. The distinct claim — that the
+refusal precedes any work — is only tested by constructing and *not* solving,
+which is what that test now does. This is [C-15.5](#c-15) again: when a guard
+is shadowed by a downstream one, assert it directly or it is decoration.
+
+##### What the check is, and what it is not — `ENVELOPE`
+
+It is a check **at a moment**, not a lifetime guarantee, and the three call
+sites do not change that. Two shapes are outside it, both `OBSERVED`:
+
+- **Unfreezing after the check.** `flags.writeable` is settable by anyone at
+  any time. A caller who runs a solve, then executes `p.M.flags.writeable =
+  True` and mutates, rewrites a tape that is already built; on the fixture
+  below a cached `objective_value(U)` followed by that mutation and
+  `gradient(U)` returns `0.7552125`.
+- **A trajectory built by hand.** `adjoint_solve` takes a `Trajectory`, not a
+  problem — it has no `problem` parameter and so cannot perform this check at
+  all. A caller who constructs step caches directly, aliasing live arrays,
+  never passes the retention boundary.
+
+Neither is reached without the caller explicitly defeating a documented
+invariant, which is the line [C-1](#c-1) draws: this is a reference
+implementation in a language where no array can be made permanently read-only,
+and the only construction that would close these is copying `F` and `G`'s
+result at every step — which is exactly the aliasing the design exists to
+avoid. **In the C++ port both vanish**: the coefficients are `const` members,
+so the first is a compile error and the second cannot alias a mutable array.
+What the check does reach is the whole defect class that arises *without*
+anyone intending it — `copy.deepcopy` returning writeable buffers, a subclass
+copying in `__init__`, a property or slot displacing the frozen storage — and
+that is what it is claimed to reach.
+
+The general rule this leaves: **a check that raises must not be placed behind
+checks that return, and must be gated on the precondition for its own
+invariant rather than on the refusals it precedes.** The second half is not
+optional decoration — without it the first half converts a required quiet
+refusal into a raise. Ordering is part of the guarantee, not an implementation
+detail, and it is the part no accuracy test can see — every test of the guard
+itself passed throughout, because each presented a problem that was otherwise
+eligible.
+
 #### Injection evidence — `OBSERVED`
 
-Under [R-11](#r-11) against a 640-test baseline with 0 failures:
+Under [R-11](#r-11) against a 668-test baseline with 0 failures, 24 of 24
+injected defects detected:
 
 | Injected defect | Failing tests |
 |---|---|
 | `__setstate__` removed entirely (the state this clause corrects) | 9 |
 | `__setstate__` restores state but does not re-freeze | 9 |
 | `__setstate__` leaves the buffers writeable outright | 12 |
-| Only `_M` is re-frozen; `_C` and `_b` are missed | 1 |
+| Only `_M` is re-frozen; `_C` and `_b` are missed | 9 |
 | `__setstate__` assumes a plain dict, breaking `__slots__` subclasses | 1 |
 | `__setstate__` freezes without restoring ownership | 4 |
 | Verification stops checking the copy-protocol hooks | 8 |
 | `__setstate__` dropped from the guarded copy hooks | 2 |
 | `__deepcopy__` dropped from the guarded copy hooks | 1 |
-| The mutable-coefficient refusal is removed | 5 |
-| The refusal returns `False` instead of raising | 4 |
+| The mutable-coefficient refusal is removed | 17 |
+| The refusal returns `False` instead of raising | 20 |
 | The refusal checks `writeable` but not `owndata` | 1 |
-| `b` is reshaped into a view rather than an owning copy | 57 |
-| The freeze is dropped from the constructor as well | 69 |
+| The refusal is ordered last again, behind the quiet checks | 8 |
+| Unreadable storage is skipped rather than refused | 2 |
+| `GLMOptimizer` stops enforcing validity at construction | 2 |
+| `forward_solve` stops enforcing validity at the retention point | 1 |
+| The precondition reverts to method identity in the MRO | 2 |
+| The precondition reverts to probing for buffer presence | 2 |
+| The root-initialised flag is read by attribute access | 1 |
+| The root-initialised flag is never recorded | 23 |
+| The class gate is dropped, catching unrelated problems | 305 |
+| Buffers are read from the instance dict rather than by attribute | 2 |
+| `b` is reshaped into a view rather than an owning copy | 64 |
+| The freeze is dropped from the constructor as well | 114 |
 
 The ownership half of the refusal was initially **undetected**, and is
 recorded for the reason [C-15.5](#c-15) already gives: once `__init__` and

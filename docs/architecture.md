@@ -317,8 +317,58 @@ of what must carry forward; it currently has nine items. The short version:
     that check *raises* where every other refusal in that function returns
     `False`: refusing merely selects the general route, which retains what `F`
     returns in the same way, so for this one defect there is no route that
-    gives a better answer. In C++ the whole class of problem is a `const`
-    member and a correct copy constructor.
+    gives a better answer. That asymmetry also fixes *where* the check runs:
+    a check that raises may not sit behind checks that return, so it is
+    answered before the eligibility comparisons rather than after them.
+    Ordered last, it was reachable only by problems that passed all three
+    eligibility comparisons — so the subclass that had unfrozen its buffers by
+    overriding a copy hook was refused quietly for that override and never
+    reached it.
+
+    Hoisting a raise, though, widens what it refuses, and immutability is a
+    *conditional* invariant: it matters only because `AffineDynamics.F` and
+    `G` return `self._M` and `self._C` by identity and `f` reads all three to
+    build its result. An instance holding none of that storage — one that
+    never ran the root initialiser — has nothing the tape could alias, and
+    gating on `isinstance` alone made two such valid general-route problems
+    raise where C-16.2 requires a quiet refusal. So the check carries its own
+    precondition: class membership *and* a flag `AffineDynamics.__init__`
+    records once it has frozen all three buffers.
+
+    Not, as first written, whether `f`, `F` and `G` still resolve to the
+    root's own definitions. An override may delegate — `return super().F(...)`
+    is three different function objects reading every buffer — so method
+    identity cannot witness what a method reads, and that precondition let a
+    displaced gradient through in silence. Nor whether the buffers are
+    present: asking evaluates descriptors on classes that never had them, and
+    misreads a subclass reusing one of those names as a root instance taken
+    apart. So `__init__` records that it ran, and that record is the
+    precondition. The cost is over-refusal — a subclass that keeps the
+    buffers, unfreezes one and overrides every member that would have read it
+    is refused although it works. A loud refusal of a working problem is the
+    right side of that trade, and a test pins it.
+
+    The buffers are read by plain attribute access, because that is how `F`
+    reads them. Reading the instance dictionary instead — even through the
+    root's own `__dict__` descriptor, chosen to bypass a subclass's attribute
+    machinery — misses a `__slots__` buffer entirely and, worse, reads storage
+    that a `_M` property may have displaced: a frozen decoy in the dictionary
+    while `F` returns the writeable array. A more suspicious read is not a
+    more faithful one. The *flag* is read the opposite way, through that same
+    descriptor, because unlike a coefficient it is not something a subclass is
+    entitled to answer for.
+
+    Three call sites, for three different reasons:
+    `affine_dynamics_verified` answers validity before eligibility;
+    `GLMOptimizer.__init__` refuses before any work is done, on both the
+    explicit-structure and the deduced-structure paths; and `forward_solve`
+    is the retention boundary — every step stores what `F` and `G` returned,
+    so checking there covers every composition that *produces* a trajectory
+    rather than every caller that consumes one. It remains a check at a
+    moment: a caller who unfreezes after the solve, or who hands
+    `adjoint_solve` a trajectory built by hand, is outside it, and C-15.7
+    states that envelope. In C++ both vanish — the whole class of problem is a
+    `const` member with a correct copy constructor.
 
 ### Modified Newton: the refusal is narrower than it looks
 

@@ -5,6 +5,7 @@ from collections.abc import Callable
 import numpy as np
 from numpy.typing import NDArray
 
+from adjungo.core.affine import require_immutable_coefficients
 from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
 from adjungo.solvers.base import StageSolver
@@ -40,6 +41,16 @@ def forward_solve(
     Returns:
         Trajectory containing Y, Z, and cached data
     """
+    # The boundary the C-15.7 invariant is actually about. Every step below
+    # stores what problem.F and problem.G returned in the step cache, and
+    # AffineDynamics returns its buffers by identity, so from here on the tape
+    # aliases them. forward_solve is exported, and composing it with
+    # adjoint_solve and assemble_gradient bypasses GLMOptimizer entirely --
+    # which returned the full 0.0770625 displacement in silence. Checking at
+    # the point of retention covers every composition rather than every
+    # caller.
+    require_immutable_coefficients(problem)
+
     h = (t_span[1] - t_span[0]) / N
     s, r, n = method.s, method.r, problem.state_dim
 

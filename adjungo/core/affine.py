@@ -105,38 +105,62 @@ from numpy.typing import NDArray
 
 __all__ = [
     "AffineDynamics",
+    "InvalidCoefficients",
+    "MissingCoefficients",
     "MutableCoefficients",
     "TimeVaryingAffineDynamics",
     "affine_dynamics_verified",
+    "require_immutable_coefficients",
 ]
 
 
-class MutableCoefficients(RuntimeError):
-    """An affine problem's coefficient buffers are not immutable — C-15.7.
+class InvalidCoefficients(RuntimeError):
+    """An affine problem's live coefficient buffers cannot be relied on.
+
+    Base for the two ways that happens — the data can be rewritten, or it was
+    never established. Both are refusals that **raise rather than return**
+    ``False``, which is what separates them from every other refusal in this
+    module and is the substance of C-15.7.
+
+    The others are safe to answer quietly because the general route then
+    computes the same derivative, only more slowly. These are not: the general
+    route reads ``F`` and retains what it returns exactly as the affine route
+    does, so a problem whose coefficients can change mid-solve is wrong by the
+    same amount on both. Declining to certify it would pick a route already
+    known to give no better an answer — the silent-sentinel shape C-7 forbids.
+
+    That asymmetry also decides *when* the check runs: before the eligibility
+    checks rather than after them, since a problem refused quietly for some
+    unrelated reason is handed the general route and displaced there by the
+    same amount. See :func:`require_immutable_coefficients` for the
+    precondition that makes running first safe.
+    """
+
+    def __init__(self, name: str, message: str) -> None:
+        super().__init__(message)
+        self.name = name
+
+
+class MutableCoefficients(InvalidCoefficients):
+    """A coefficient buffer can still be written — C-15.7.
 
     ``AffineDynamics`` freezes its coefficients at construction so that ``F``
     may return ``self._M`` itself rather than a copy. The backward sweeps then
     read a tape of references to that one buffer, and the object's whole claim
     to be affine by construction rests on the buffer not changing under them.
 
-    Unlike every other refusal in this module, this one **raises rather than
-    returning** ``False``. The others are safe to answer quietly because the
-    general route computes the same derivative, only more slowly. This one is
-    not: the general route reads ``F`` and retains what it returns exactly as
-    the affine route does, so a problem whose coefficients can be rewritten
-    mid-solve is wrong by the same amount on both. Declining to certify it
-    would pick a route already known to give no better an answer, which is
-    the silent-sentinel shape C-7 forbids.
-
     Reached in practice by a subclass that replaces a buffer after
     ``super().__init__`` — ``self._M = self._M.copy()`` looks defensive and
-    produces a writeable array.
+    produces a writeable array — and by deep-copying a subclass that overrides
+    a copy hook, where the override both unfreezes the buffers and is itself
+    grounds for a quiet refusal.
     """
 
     def __init__(self, cls: type, name: str, reason: str) -> None:
         super().__init__(
-            f"{cls.__name__} instance has a {reason} coefficient buffer "
-            f"{name!r}. AffineDynamics freezes its coefficients at "
+            name,
+            f"{cls.__name__} instance has a coefficient buffer {name!r} "
+            f"that is {reason}. AffineDynamics freezes its coefficients at "
             f"construction because F returns the buffer itself and the "
             f"backward sweeps hold references to it; a buffer that can be "
             f"rewritten between the forward solve and the adjoint seeds the "
@@ -144,9 +168,49 @@ class MutableCoefficients(RuntimeError):
             f"(NUMERICS.md C-15.7). This cannot be answered by taking the "
             f"general route, which reads F the same way. Build the problem "
             f"with AffineDynamics(M, C, b) and do not rebind or replace "
-            f"{name!r} afterwards."
+            f"{name!r} afterwards.",
         )
-        self.name = name
+
+
+class MissingCoefficients(InvalidCoefficients):
+    """The root's coefficient storage no longer resolves to an ``ndarray``.
+
+    ``AffineDynamics.__init__`` establishes all of ``_COEFFICIENT_BUFFERS`` as
+    frozen, owning arrays and records that it did, so once that record is
+    present anything else found in their place -- deleted, or replaced by a
+    sparse matrix, a ``memoryview``, or any other storage whose aliasing
+    cannot be reasoned about -- is a modification made after construction.
+
+    It raises rather than being skipped. Skipping is the silent direction:
+    coefficients the check could not read were once treated as coefficients
+    that were not there, so the problem verified as affine and the tape
+    aliased them unchecked.
+
+    Not an error when the record itself is absent. The root initialiser never
+    ran, there is no retained buffer to protect, and
+    :func:`require_immutable_coefficients` says nothing -- C-16.2 requires
+    that refusal to be quiet.
+
+    A separate class from :class:`MutableCoefficients` because the remedy is
+    different and the word would otherwise be false: nothing here is mutable.
+    """
+
+    def __init__(self, cls: type, name: str, found: object = None) -> None:
+        found_desc = (
+            "is absent"
+            if found is None
+            else f"resolves to {type(found).__name__}, not ndarray"
+        )
+        super().__init__(
+            name,
+            f"{cls.__name__} ran AffineDynamics.__init__, which freezes "
+            f"{', '.join(map(repr, _COEFFICIENT_BUFFERS))} as owning arrays, "
+            f"but {name!r} now {found_desc}. Something has replaced it after "
+            f"construction, and its aliasing cannot be checked, so the first "
+            f"solve would retain it unguarded (NUMERICS.md C-15.7). Leave the "
+            f"root's buffers as constructed, or do not call super().__init__ "
+            f"at all and supply f, F and G yourself.",
+        )
 
 
 #: The instance attributes holding frozen coefficient data. Named once because
@@ -154,6 +218,23 @@ class MutableCoefficients(RuntimeError):
 #: fourth buffer added to one and not the other would be silently writeable
 #: after a deep copy.
 _COEFFICIENT_BUFFERS = ("_M", "_C", "_b")
+
+
+#: Records that ``AffineDynamics.__init__`` ran to completion on *this*
+#: instance, and therefore that it established all of
+#: :data:`_COEFFICIENT_BUFFERS` as frozen, owning ``ndarray``\ s. Written into
+#: ``__dict__`` directly so that no subclass property or slot can intercept
+#: it, and carried through ``__setstate__`` with the rest of the state.
+#:
+#: This is the precondition for the immutability invariant, and it is recorded
+#: rather than inferred because both available inferences are wrong. Asking
+#: which of ``f``, ``F``, ``G`` are still the root's own definitions is
+#: defeated by an override that delegates to ``super()``. Asking whether the
+#: buffers are *present* means evaluating ``_M``, ``_C`` and ``_b`` on a
+#: subclass that may never have had them -- running descriptors that are not
+#: ours to run, and reading a partial set as damage when it is simply a
+#: subclass using one of the same private names.
+_ROOT_INITIALISED = "_affine_root_initialised"
 
 
 class AffineDynamics:
@@ -210,6 +291,9 @@ class AffineDynamics:
         self._C = C_arr
         self._b = b_arr
         self._nu = int(C_arr.shape[1])
+        #: Set last, so it is present only if every buffer above was
+        #: established and frozen. See :data:`_ROOT_INITIALISED`.
+        self.__dict__[_ROOT_INITIALISED] = True
 
     def __setstate__(self, state: Any) -> None:
         """Restore state and re-freeze the coefficient buffers — C-15.7.
@@ -241,7 +325,7 @@ class AffineDynamics:
         immutable, "frozen view over something else" is a weaker property than
         the constructor establishes and a more expensive one to check. The copy
         is ``O(n²)`` and restores exactly the constructor's postcondition, which
-        is what :func:`_refuse_mutable_coefficients` is then able to assert
+        is what :func:`require_immutable_coefficients` is then able to assert
         cheaply.
         """
         slots: dict[str, Any] | None = None
@@ -671,20 +755,112 @@ def _defined_as(cls: type, name: str) -> Any:
     return _MISSING
 
 
-def _refuse_mutable_coefficients(problem: AffineDynamics) -> None:
-    """Raise unless every coefficient buffer is frozen and owns its storage.
+#: ``AffineDynamics``'s own ``__dict__`` getset descriptor, bound once.
+#: :data:`_ROOT_INITIALISED` is the root's bookkeeping about itself, so no
+#: subclass may answer for it: one defining ``__dict__`` as a property
+#: returning ``{}`` would otherwise hide the marker and silence the check.
+#:
+#: Only the marker is read this way. The *buffers* are read by ordinary
+#: attribute access, because that is how ``F`` resolves them -- see
+#: :func:`_root_buffers`.
+_AFFINE_INSTANCE_DICT: Any = AffineDynamics.__dict__["__dict__"]
 
-    Both conditions are needed, and the second is the one that is easy to
+
+#: The buffers a problem actually reads, obtained the way its own methods
+#: obtain them. ``AffineDynamics.F`` is ``return self._M``, so
+#: ``getattr(problem, "_M")`` is by construction the object ``F`` hands to the
+#: tape -- through a ``__slots__`` descriptor, a property, or a subclass
+#: ``__getattribute__`` alike, because ``F`` goes through those too.
+#:
+#: Two sounder-looking reads were tried and are wrong. ``problem.__dict__``
+#: misses a slotted buffer and can be answered by a subclass ``__dict__``
+#: property. The root's own ``__dict__`` descriptor fixes the second but not
+#: the first, and worse, it reads storage that a property or slot may have
+#: displaced: a frozen decoy in the instance dict passed the check while a
+#: writeable array reached ``F``.
+def _root_buffers(problem: object) -> dict[str, NDArray] | None:
+    """The live coefficient buffers, or ``None`` if the root storage is dead.
+
+    ``None`` is the precondition failing, not a refusal. A problem that is not
+    an ``AffineDynamics`` owes nothing here even if it happens to name its own
+    attributes ``_M`` and ``_C``; the hazard belongs to *this* class's storage.
+    Neither does an instance on which ``AffineDynamics.__init__`` never ran --
+    one deriving from both roots in the order that resolves the initialiser to
+    the time-varying one, or a subclass replacing ``f``, ``F`` and ``G``
+    without chaining up. It holds no buffer the tape could alias, and C-16.2
+    requires that refusal to be *quiet*.
+
+    The precondition is the recorded :data:`_ROOT_INITIALISED` flag, not the
+    presence of the buffers, and deliberately so: reaching for ``_M`` on a
+    subclass that never had one evaluates a descriptor that is not ours to
+    evaluate, and reads a partial set as damage when it may be a subclass
+    using one of the same private names. Nothing is touched until the root is
+    known to own the storage. The flag is read through the root's own
+    ``__dict__`` descriptor rather than by attribute access, because unlike
+    the buffers it is not something any subclass is entitled to answer for.
+
+    It is not the MRO either. Asking whether ``f``, ``F`` and ``G`` are still
+    the root's own definitions is unsound in the quiet direction, because an
+    override may delegate:
+
+        def F(self, y, u, t): return super().F(y, u, t)
+
+    Three distinct function objects, every buffer read. **Method identity
+    cannot witness what a method reads**, so it is not asked.
+
+    Once the flag is present the root established three frozen, owning
+    ``ndarray``\\ s, so anything else found in their place is a replacement
+    the tape cannot be reasoned about -- a sparse matrix, a ``memoryview``, a
+    deleted attribute -- and raises rather than being skipped. Skipping was
+    the earlier behaviour and it failed silently: three ``csr_array``
+    coefficients left ``_root_buffers`` with nothing to check, so the problem
+    verified as affine and returned a displaced gradient.
+    """
+    if not isinstance(problem, AffineDynamics):
+        return None
+    if not _AFFINE_INSTANCE_DICT.__get__(problem).get(_ROOT_INITIALISED, False):
+        return None
+    buffers: dict[str, NDArray] = {}
+    for name in _COEFFICIENT_BUFFERS:
+        buffer = getattr(problem, name, None)
+        if not isinstance(buffer, np.ndarray):
+            raise MissingCoefficients(type(problem), name, buffer)
+        buffers[name] = buffer
+    return buffers
+
+
+def require_immutable_coefficients(problem: object) -> None:
+    """Raise unless the coefficient buffers ``problem`` reads are frozen and
+    own their storage.
+
+    The invariant exists because ``AffineDynamics.F`` and ``G`` hand back
+    ``self._M`` and ``self._C`` *by identity* and the tape retains them;
+    ``f`` reads all three to build a fresh array, which is why an unfrozen
+    ``_b`` still matters. It is conditional on that storage being live at all,
+    which :func:`_root_buffers` answers first.
+
+    The condition is deliberately the storage rather than which member reads
+    which buffer. Per-buffer liveness would have to be inferred from the
+    override structure, and the paragraph in :func:`_root_buffers` records why
+    that inference is unsound. The cost is refusing a subclass that keeps the
+    root's storage, unfreezes a buffer, and then overrides every member that
+    would have read it -- a loud refusal of a working problem, in exchange for
+    never staying quiet about a broken one.
+
+    Both flag conditions are needed, and the second is the one that is easy to
     miss. ``np.array(b, copy=True).reshape(-1)`` returns a *view*: freezing it
     leaves ``arr.base`` writeable, so the values behind a buffer reported as
     read-only could still be rewritten. Requiring ``owndata`` removes the
     question rather than walking a base chain to answer it.
 
     ``O(1)`` per buffer, once per route decision, against the ``O(n³)`` solve
-    it guards.
+    it guards. It is a check at a moment, not a lifetime guarantee; C-15.7
+    records what that does and does not reach.
     """
-    for name in _COEFFICIENT_BUFFERS:
-        buffer = problem.__dict__[name]
+    buffers = _root_buffers(problem)
+    if buffers is None:
+        return
+    for name, buffer in buffers.items():
         if buffer.flags.writeable:
             raise MutableCoefficients(type(problem), name, "writeable")
         if not buffer.flags.owndata:
@@ -717,13 +893,28 @@ def affine_dynamics_verified(
     and the cost of refusing it is that a caller who wrote one gets the general
     route.
 
-    Four things are checked. The second is the one that is easy to omit, and
-    the fourth is the only one that raises:
+    Four things are checked, and the order is load-bearing. The **first** is a
+    question of validity and is the only one that raises; the three after it
+    are questions of eligibility and are answered quietly. The second of those
+    three is the one that is easy to omit:
 
-    1. **The class.** Every guaranteed member bound in the MRO is the object
+    1. **The coefficients themselves.** Every buffer is present, frozen, and
+       owns its storage. This one **raises** :class:`MutableCoefficients`
+       instead of returning ``False``, and that is why it runs first rather
+       than last. The three below are safe to answer quietly because the
+       general route computes the same derivative more slowly, whereas the
+       general route reads ``F`` and retains what it returns exactly as the
+       affine route does. There is no route that repairs a rewritable
+       coefficient, so declining to certify it would choose a route already
+       known to be no better — the silent sentinel C-7 forbids. Ordered after
+       the others, it was reachable only once they had all passed, so any
+       problem that was both mutable *and* ineligible for some unrelated
+       reason bypassed it and took the general route silently. C-15.7 measures
+       that bypass at ``0.0770625`` on the two-step fixture.
+    2. **The class.** Every guaranteed member bound in the MRO is the object
        the root class binds, read by :func:`_defined_as` rather than by
        ``getattr`` so that the descriptor protocol cannot answer for it.
-    2. **The instance.** No *invoked* guaranteed member is shadowed in the
+    3. **The instance.** No *invoked* guaranteed member is shadowed in the
        problem's own ``__dict__``. Checking only the class leaves
        ``problem.f = something_else`` verified. What that costs is narrower
        than it first appears and is worth stating exactly: an instance
@@ -736,22 +927,13 @@ def affine_dynamics_verified(
        equally wrong on the general route, and verification never bore on it.
        The members in :data:`_SKIPPED_ON_THE_AFFINE_ROUTE` are exempt, because
        C-16.5's tripwire requires shadowing them to leave the problem verified.
-    3. **Attribute lookup.** ``__getattribute__``, ``__getattr__`` and
+    4. **Attribute lookup.** ``__getattribute__``, ``__getattr__`` and
        ``__dict__`` are the root's, so the members compared above are the
        members the solver will later receive, and the instance storage read in
-       step 2 is the real one. The copy and pickle hooks are compared here too,
+       step 3 is the real one. The copy and pickle hooks are compared here too,
        so that a copy of a verified problem is one the constructor could have
        produced — in particular one whose coefficients are still immutable
        (C-15.7).
-    4. **The coefficients themselves.** Every buffer is frozen and owns its
-       storage. This one **raises** :class:`MutableCoefficients` instead of
-       returning ``False``, and the asymmetry is the point: the three checks
-       above are safe to answer quietly because the general route computes the
-       same derivative more slowly, whereas the general route reads ``F`` and
-       retains what it returns exactly as the affine route does. There is no
-       route that repairs a rewritable coefficient, so declining to certify it
-       would choose a route already known to be no better — the silent
-       sentinel C-7 forbids.
 
     Per C-1 this is not a claim of robustness against a hostile caller, and it
     is not one. What it does not reach: patching the **root class itself**
@@ -769,6 +951,15 @@ def affine_dynamics_verified(
     ``getattr`` default that would silently choose a route for a problem that
     did not supply the fact. C-7 forbids that kind of default.
     """
+    # Validity, before eligibility. A rewritable coefficient is wrong on every
+    # route that retains what ``F`` returns, so unlike the three checks below
+    # this one may not be reached only when the problem is otherwise a
+    # candidate for the affine route: an earlier quiet refusal would hand the
+    # caller the general route, which is displaced by exactly the same amount
+    # (C-15.7). It carries its own precondition, so problems that never read
+    # the root's buffers pass through it untouched.
+    require_immutable_coefficients(problem)
+
     roots = [
         root for root in _GUARANTEED_MEMBERS if isinstance(problem, root)
     ]
@@ -788,19 +979,14 @@ def affine_dynamics_verified(
     ):
         return False
 
-    # Safe only because ``__dict__`` was compared above: the descriptor
+        # Safe only because ``__dict__`` was compared above: the descriptor
     # reached here is the root's, so this returns real instance storage rather
     # than whatever a subclass would prefer the check to see. A class using
     # __slots__ has no instance dict, and a slot shadowing a guaranteed member
     # is a class-level descriptor already refused above.
     shadowed = getattr(problem, "__dict__", {})
-    if any(
+    return not any(
         name in shadowed
         for name in guaranteed
         if name not in _SKIPPED_ON_THE_AFFINE_ROUTE
-    ):
-        return False
-
-    if root is AffineDynamics:
-        _refuse_mutable_coefficients(problem)
-    return True
+    )
