@@ -296,6 +296,16 @@ of what must carry forward; it currently has nine items. The short version:
     reimplementation can enforce this far better than Python can, by making
     the coefficient-owning type `final`.
 
+    Ownership has to be established of the *instance*, not just the type.
+    Comparing the members of `type(problem)` against the root class leaves
+    `problem.f = ...` verified, and NUMERICS.md C-16.9 records what that was
+    worth: a consistently shadowed nonlinear system keeps the gradient exact,
+    so only the Hessian moves, by `0.911` on the fixture there, in silence.
+    The check now also compares the instance `__dict__` and the attribute
+    lookup hooks. A `final` type in C++ removes the class half of this
+    outright; the instance half has no C++ analogue, since a member function
+    cannot be rebound per object.
+
 ### Modified Newton: the refusal is narrower than it looks
 
 The "not built" table above refuses lagged and modified Jacobians. The reason

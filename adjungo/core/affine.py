@@ -479,6 +479,70 @@ _GUARANTEED_MEMBERS: dict[type, tuple[str, ...]] = {
     + ("coefficients_constant", "M", "C", "b", "_coefficient"),
 }
 
+#: The guaranteed members the affine route never calls, and which may
+#: therefore be replaced **on the instance** without disturbing the guarantee.
+#:
+#: This exemption is not a convenience. C-16.5 requires a tripwire that
+#: replaces exactly these three with functions that raise and then asserts a
+#: **Hessian-vector product** still computes — evidence, unobtainable from a
+#: counter, that no path reaches a curvature term. A gradient would prove
+#: nothing here, since the gradient never consults these callbacks on any
+#: route. The tripwire only works if shadowing them leaves the problem
+#: verified, so the exemption is load-bearing and must not be closed without
+#: amending C-16.5.
+#:
+#: It is sound **on the route verification selects**, and that qualifier is
+#: the whole of it: the deduced structure sets ``jointly_affine=True``, under
+#: which C-16.6 skips these three, and a replacement that is never called
+#: cannot change an answer. C-16.9 states the boundary. Entry points that do
+#: not consult the deduced structure — an explicit ``ProblemStructure`` with
+#: ``jointly_affine=False``, :func:`adjungo.validation.reference.reference_hessian`,
+#: or ``assemble_hessian_vector_product``/``adjoint_sensitivity`` called
+#: directly with ``structure=None`` — call these callbacks and would read a
+#: shadow. Those are outside the exemption's justification, and C-1 governs
+#: them.
+_SKIPPED_ON_THE_AFFINE_ROUTE = ("F_yy_action", "F_yu_action", "F_uu_action")
+
+#: Attribute lookup itself is part of the guarantee. Every comparison below
+#: would otherwise reach the problem through ordinary attribute access, so a
+#: class that redefines how attribute access works can answer the check with
+#: one object and the solver with another. ``__dict__`` is here for the same
+#: reason and is not hypothetical: a subclass defining ``__dict__`` as a
+#: property returning ``{}`` hides its own instance shadows from the check
+#: below, and reinstates the C-16.9 silent Hessian error exactly.
+#:
+#: These are conservative refusals, not free ones. A subclass using
+#: ``__getattr__`` for unrelated metadata is refused too, and pays the general
+#: route for it. That is the correct direction under C-16.2.
+_LOOKUP_HOOKS = ("__getattribute__", "__getattr__", "__dict__")
+
+#: Distinguishes "defined on neither" from "defined on one". The lookup hooks
+#: are defined on neither root, so the comparison needs a default on both
+#: sides. An object sentinel rather than ``None`` so that "not defined" and
+#: "defined as ``None``" stay distinct, which costs nothing and removes a
+#: question.
+_MISSING: Any = object()
+
+
+def _defined_as(cls: type, name: str) -> Any:
+    """The object ``name`` is bound to in ``cls``'s MRO, found without
+    invoking the descriptor protocol.
+
+    ``getattr(cls, name)`` is not usable here. It is itself attribute access,
+    so it consults the very machinery this module is trying to verify: a class
+    that defines ``__dict__`` as a property gets that property *called*, and
+    reports whatever it likes. Walking ``__mro__`` and reading each class's own
+    ``__dict__`` reads the binding instead of its result.
+
+    Class ``__dict__`` is a ``mappingproxy`` reached through the metaclass, so
+    it is not interceptable by the class being checked. This is the one lookup
+    in this module that has to be trusted, and it is the narrowest available.
+    """
+    for klass in cls.__mro__:
+        if name in klass.__dict__:
+            return klass.__dict__[name]
+    return _MISSING
+
 
 def affine_dynamics_verified(
     problem: Any,
@@ -504,6 +568,39 @@ def affine_dynamics_verified(
     and the cost of refusing it is that a caller who wrote one gets the general
     route.
 
+    Three things are checked, and the second is the one that is easy to omit:
+
+    1. **The class.** Every guaranteed member bound in the MRO is the object
+       the root class binds, read by :func:`_defined_as` rather than by
+       ``getattr`` so that the descriptor protocol cannot answer for it.
+    2. **The instance.** No *invoked* guaranteed member is shadowed in the
+       problem's own ``__dict__``. Checking only the class leaves
+       ``problem.f = something_else`` verified. What that costs is narrower
+       than it first appears and is worth stating exactly: an instance
+       carrying a *consistent* nonlinear system still produces an exact
+       gradient, because the gradient reads only ``f``, ``F`` and ``G`` and
+       those agree — but the route is chosen from the stale class-level fact,
+       so C-16.6 skips a curvature term that is now nonzero and the **Hessian**
+       is silently wrong. C-16.9 measures it at ``0.911``. An inconsistent
+       ``f``/``F`` pair is a different thing entirely and not this: it is
+       equally wrong on the general route, and verification never bore on it.
+       The members in :data:`_SKIPPED_ON_THE_AFFINE_ROUTE` are exempt, because
+       C-16.5's tripwire requires shadowing them to leave the problem verified.
+    3. **Attribute lookup.** ``__getattribute__``, ``__getattr__`` and
+       ``__dict__`` are the root's, so the members compared above are the
+       members the solver will later receive, and the instance storage read in
+       step 2 is the real one.
+
+    Per C-1 this is not a claim of robustness against a hostile caller, and it
+    is not one. What it does not reach: patching the **root class itself**
+    (``AffineDynamics.f = ...`` changes both sides of every comparison, so
+    every comparison still passes), and, for the time-varying class, the caller
+    keeping a reference to a coefficient callable and rebinding what it
+    computes. Both are beyond a cheap exact check. What it does reach is the
+    ordinary case — a monkeypatch left in place, a cached bound method, a
+    subclass that means well — and the error direction remains one way, toward
+    the general route.
+
     The return type narrows to the root classes rather than being a plain
     ``bool``. That is the point of the check: a caller that has passed it may
     read ``coefficients_constant`` directly, instead of reaching for it with a
@@ -517,7 +614,26 @@ def affine_dynamics_verified(
         return False
     root = roots[0]
     cls = type(problem)
-    return all(
-        getattr(cls, name, None) is getattr(root, name)
-        for name in _GUARANTEED_MEMBERS[root]
+
+    for name in _LOOKUP_HOOKS:
+        if _defined_as(cls, name) is not _defined_as(root, name):
+            return False
+
+    guaranteed = _GUARANTEED_MEMBERS[root]
+    if any(
+        _defined_as(cls, name) is not _defined_as(root, name)
+        for name in guaranteed
+    ):
+        return False
+
+    # Safe only because ``__dict__`` was compared above: the descriptor
+    # reached here is the root's, so this returns real instance storage rather
+    # than whatever a subclass would prefer the check to see. A class using
+    # __slots__ has no instance dict, and a slot shadowing a guaranteed member
+    # is a class-level descriptor already refused above.
+    shadowed = getattr(problem, "__dict__", {})
+    return not any(
+        name in shadowed
+        for name in guaranteed
+        if name not in _SKIPPED_ON_THE_AFFINE_ROUTE
     )

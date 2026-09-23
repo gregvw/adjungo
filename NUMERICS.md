@@ -1148,6 +1148,12 @@ clause are therefore asserted by **tripwire**:
   functions that raise. Affineness is verified from the class, so the problem
   stays verified while any actual call fails.
 
+  [C-16.9](#c-16) tightened verification to reject instance shadowing, and
+  exempts exactly these three so that this tripwire keeps working. The
+  exemption and this clause stand or fall together: removing it costs 13
+  failures here, and closing it deliberately requires amending this clause in
+  the same commit.
+
 This requirement exists because [C-15.6](#c-15)'s injection round nearly missed
 a Newton call that bypassed the factorization store: the count was taken at the
 store, the bypassing call never reached it, and the answers were unchanged
@@ -1232,6 +1238,116 @@ cause: a population that cannot reach the defect.**
    behavioural test could. It is now asserted directly, which is
    [C-15.1](#c-15) once more: a value that nothing reads is not evidenced by
    being correct.
+
+### C-16.9 Verification is checked at the instance, not only at the class — `APPROVED`
+
+M6 established affineness by comparing every guaranteed member of
+`type(problem)` against the root class. That reads a fact about a *class* and
+applies it to an *instance*, and the two can disagree: `problem.f = ...` writes
+to the instance `__dict__` and disturbs no class-level comparison. Verification
+must therefore check both, and additionally that attribute lookup itself is the
+root's, since every comparison reaches the problem through it.
+
+**What this is not.** The obvious reproduction is not this defect, and mistaking
+one for the other is the trap here. Writing a nonlinear `f` onto the instance
+while leaving `F` the affine Jacobian gives a gradient wrong by `6.395` — and a
+plain callback problem supplying the same mismatched pair is wrong by *exactly*
+the same amount, on the general route, with no affine class anywhere near it.
+That is the universal obligation that `F` be the Jacobian of `f`. Verification
+never bore on it, and a fix justified by that number would be justified by
+nothing.
+
+**What it is.** The cost needs a *consistent* shadow: an instance carrying a
+complete, self-consistent nonlinear system. The gradient is then right, because
+it reads only `f`, `F` and `G` and those agree. But the route is still chosen
+from the stale class-level fact, so `jointly_affine` holds and [C-16.6](#c-16)
+skips a curvature term that is now genuinely nonzero. **Only the Hessian
+exposes it, and it is silent.**
+
+Measured: `f = 0.4y + u + 5y²`, `F = 0.4 + 10y`, `G = 1`,
+`F_yy_action = 10v`, the other two zero, written with `object.__setattr__`
+onto an `AffineDynamics([[0.4]], [[1.0]])`; `y₀ = 0.8`, `t_span = (0, 0.5)`,
+`N = 2`, explicit Euler, `J = y_N²/2`, `u = ((0.3), (0.2))`, `v = ((1), (0))`.
+The M6 predicate returns `Hv₀ = 1.882` against an exact `2.793`, an absolute
+error of `0.911`; `Hv₁` is unchanged, so the defect is localised to the
+component the curvature reaches.
+
+**Explicit methods specifically.** On an implicit method this shadow is already
+refused loudly — the stage equation is nonlinear, one linear solve cannot
+satisfy it, and [C-16.4](#c-16) raises. An explicit method solves no stage
+equation and so has no residual to check. The certification population is built
+on `explicit_euler` for that reason.
+
+**The curvature callbacks are exempt from the instance check, and that
+exemption is load-bearing.** [C-16.5](#c-16) requires a tripwire that replaces
+`F_yy_action`, `F_yu_action` and `F_uu_action` on the instance with functions
+that raise and then asserts a **Hessian-vector product** still computes. (Not a
+gradient: the gradient never consults these callbacks on any route, so a
+gradient-based tripwire would be vacuous.) That evidence is only obtainable
+while shadowing them leaves the problem verified. Closing the exemption disarms
+C-16.5 — injected below, 13 failures — and must not be done without amending
+it.
+
+**The exemption is sound on the route verification selects, and that qualifier
+is the whole of it.** The deduced structure sets `jointly_affine=True`, under
+which C-16.6 skips those three, and a replacement that is never called cannot
+change an answer. Four entry points do not consult the deduced structure and
+*do* call them, so a shadow would be read there:
+
+- `GLMOptimizer` constructed with an explicit `ProblemStructure` carrying
+  `jointly_affine=False`;
+- `adjungo.validation.reference.reference_hessian`, which calls all three
+  unconditionally — by design, since it is the independent oracle and must
+  share no dispatch with the code it checks;
+- `assemble_hessian_vector_product` called directly with `structure=None`;
+- `adjoint_sensitivity` called directly with `structure=None`.
+
+None is reached by `GLMOptimizer.hessian_vector_product` on a deduced
+structure, which is the certified route. The rest is [C-1](#c-1).
+
+**Attribute lookup is part of the check, and `__dict__` is part of attribute
+lookup.** The instance check reads `problem.__dict__`, which is itself an
+attribute access the class being checked can answer. A subclass defining
+`__dict__` as a property returning `{}` shows the check an empty mapping while
+the real storage holds every shadow, and reinstates this clause's own silent
+Hessian error in full — `Hv₀ = 1.882` against `2.793`, through the default
+public route. The first implementation of this clause had that hole and it was
+found by review before release. Verification therefore reads bindings out of
+the MRO directly (`affine.py::_defined_as`) instead of through `getattr`, and
+compares `__getattribute__`, `__getattr__` and `__dict__` against the root.
+
+These are conservative refusals, not free ones: a subclass using `__getattr__`
+only for unrelated metadata is refused too, and pays the general route.
+
+Per C-1 none of this is a claim of robustness against a hostile caller. Patching
+the root class itself changes both sides of every comparison and still passes.
+The error direction is unchanged and one-way: a problem that fails the check
+takes the general route and gets more work, never a wrong answer.
+
+#### Injection evidence — `OBSERVED`
+
+Baseline 596 passed, 0 failed, under the [R-11](#r-11) procedure:
+
+| Defect | Failures |
+|---|---|
+| the instance shadow check is dropped entirely | 13 |
+| the skipped-member exemption is removed, disarming C-16.5 | 13 |
+| the exemption is widened to `f`, `F` and `G` | 9 |
+| attribute lookup is no longer compared against the root | 2 |
+| `__dict__` alone is no longer compared, reopening the hidden-dict bypass | 1 |
+| the instance check reads the class dict instead of the instance | 61 |
+| member comparison goes back through `getattr` instead of the MRO | 1 |
+| `_defined_as` stops walking the MRO past the class itself | 3 |
+
+The seventh went **undetected on the first round**, and its cure is the
+lesson. `_defined_as` and `getattr` differ for a guaranteed member only when a
+*metaclass* answers for the class — the same shape of defect as the `__dict__`
+property one level up. Nothing in the suite exercised it, so swapping the safer
+lookup for the unsafe one changed no test at all. Cured by
+`test_a_metaclass_answering_for_the_class_is_refused`. **A hardening whose
+only justification is a channel no test travels is not evidenced by passing.**
+
+Evidence: `tests/test_instance_shadowing.py`.
 
 ---
 
@@ -1423,7 +1539,7 @@ read the coefficients at one consistent time.
 
 ### C-17.5 Injection evidence — `OBSERVED`
 
-Baseline 564 passed, 0 failed. Each defect introduced alone, under the
+Baseline 596 passed, 0 failed. Each defect introduced alone, under the
 [R-11](#r-11) cache-clearing procedure:
 
 | Defect | Failures |
@@ -1433,7 +1549,7 @@ Baseline 564 passed, 0 failed. Each defect introduced alone, under the
 | `F` reads `M` at a fixed time instead of the stage abscissa | 56 |
 | the coefficient value aliases the caller's buffer | 1 |
 | the coefficient shape is not checked where it is used | 2 |
-| verification stops guarding the constancy claim and the accessors | 5 |
+| verification stops guarding the constancy claim and the accessors | 9 |
 | verification resolves a multi-root class by MRO instead of refusing | 1 |
 | `f` drops the time-varying forcing `b(t)` | 4 |
 
@@ -1461,6 +1577,7 @@ Evidence: `tests/test_time_varying_affine.py`.
 | C-Q4 | Do multistep external vectors hold `y` history or `h·f` history under C-8.1? | Any future `r > 1` work |
 | C-Q5 | Characteristic state scale `y_scale` for C-5.1 — is `max(‖y₀‖_∞, 1)` adequate for problems with large transients? | Tightening C-5 |
 | C-Q6 | Should `TimeVaryingAffineDynamics` own coefficient *samples* on the solve mesh instead of invoking caller callables, closing the [C-17.1](#c-17) closure-capture residue by construction? Needs a mesh-aware constructor and an index rather than a float-`t` lookup, so it changes the `Problem` protocol. | Nothing currently; removes a silent-failure obligation |
+| C-Q7 | `copy.deepcopy` of an `AffineDynamics` returns coefficient buffers with `writeable=True`, losing the C-15.6 immutability the constructor established; `copy.copy` and `pickle` both preserve it. Verified under NumPy 2.5.3. Should the class define `__deepcopy__` to re-freeze, or should writeability be checked at verification? | Nothing currently; pre-existing, [C-1](#c-1) territory |
 
 ---
 

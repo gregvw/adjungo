@@ -72,8 +72,10 @@ def test_numerics_internal_links_resolve():
 #: test from passing merely because a citation was deleted along with its
 #: target.
 CITED_IDENTIFIERS = [
+    "C-1",
     "C-2",
     "C-3",
+    "C-3.2",
     "C-3.4",
     "C-4",
     "C-5.1",
@@ -103,7 +105,10 @@ CITED_IDENTIFIERS = [
     "C-16.5",
     "C-16.6",
     "C-16.8",
+    "C-16.9",
     "C-17",
+    "C-17.1",
+    "C-17.3",
     "R-1",
     "R-2",
     "R-4",
