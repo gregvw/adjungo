@@ -97,6 +97,7 @@ solve with the wrong operator. The separation here keeps that guard from ever
 being needed, but does not replace it.
 """
 
+import copyreg
 import types
 import weakref
 from collections.abc import Callable, Mapping
@@ -484,10 +485,18 @@ _TRAVERSAL_HOOKS = (
 )
 
 #: Types whose copying this walk models directly, so their own definitions of
-#: the hooks above are expected rather than disqualifying.
+#: the hooks above are expected rather than disqualifying. ``memoryview`` is
+#: here because protocol 5 leaves one in the base chain of a contiguous
+#: numeric array it restores out of band; it cannot be subclassed, so the
+#: exact type is the whole statement. Discriminating its constructor slot from a *written*
+#: ``__new__`` by type was tried instead and is refuted: ``__new__`` can be
+#: assigned after a class exists, and a bound built-in assigned there is
+#: indistinguishable from a slot while handing back an object prepared in
+#: advance (C-15.7).
 _TRAVERSAL_MODELLED = (
     object,
     np.ndarray,
+    memoryview,
     dict,
     list,
     tuple,
@@ -512,8 +521,48 @@ def _class_dict(klass: type) -> Mapping[str, Any]:
     )
 
 
+#: Registrations this walk models, compared by identity. ``copyreg`` is not
+#: empty at import: the standard library registers ``pickle_complex`` for
+#: ``complex``, which returns ``(complex, (real, imag))`` and so can rebuild
+#: nothing but a complex number. Modelling that one entry is what keeps a
+#: problem carrying an ordinary complex number answerable. Anything else
+#: registered for the same type, including a replacement of this reducer, is
+#: a traversal this walk has not read (C-15.7).
+_TRAVERSAL_MODELLED_REDUCERS: Mapping[type, Any] = {
+    # ``pickle_complex`` is present at runtime and omitted from typeshed.
+    complex: copyreg.pickle_complex,  # type: ignore[attr-defined]
+}
+
+
+def _reducer_is_registered_for(obj: object) -> bool:
+    """Whether ``copyreg`` holds a reducer this walk has not modelled.
+
+    A reducer registered through ``copyreg.pickle`` appears in no class
+    namespace at all -- it is held in a module-level table ``deepcopy`` and
+    ``pickle`` consult by exact type -- so a scan of namespaces cannot see
+    it, and registering one is an ordinary use of the copy protocol rather
+    than tampering. It reaches the modelled types in particular, whose own
+    hooks that scan deliberately skips: a reducer registered for
+    ``memoryview``, rebuilding a view over storage it allocated and kept a
+    writeable handle on, gave a verified deep copy holding a writeable alias
+    of its frozen ``_M`` (C-15.7). The table is keyed by exact type, so a
+    subclass of a registered type is not covered by the entry and is not
+    condemned by it either.
+    """
+    klass = type(obj)
+    registered = copyreg.dispatch_table.get(klass)
+    return registered is not None and (
+        registered is not _TRAVERSAL_MODELLED_REDUCERS.get(klass)
+    )
+
+
 def _redefines_its_copying(obj: object) -> bool:
-    """Whether this object replaces the traversal the walk below assumes."""
+    """Whether a namespace replaces the traversal the walk below assumes.
+
+    A registration is the other half of the same question and is asked
+    separately, by ``_reducer_is_registered_for`` at the top of the walk:
+    it has to be asked of atomic values too, which never reach here.
+    """
     chain = type.__dict__["__mro__"].__get__(type(obj))
     for klass in chain:
         if klass in _TRAVERSAL_MODELLED:
@@ -651,6 +700,17 @@ def _arrays_a_traversal_would_reach(state: Any) -> tuple[set[int], bool]:
         # address is only unique while something holds it.
         alive.append(obj)
 
+        if _reducer_is_registered_for(obj):
+            # Asked of every object here, and before atomicity, because a
+            # registration replaces the traversal of an atomic type too:
+            # ``deepcopy`` answers a ``complex`` from its own dispatch, but
+            # every pickle protocol consults the registered reducer, and one
+            # substituting the value while allocating a coefficient behind
+            # it gave a verified round trip holding a writeable alias
+            # (C-15.7). A namespace is read separately, further down, where
+            # only the objects that have one arrive.
+            complete = False
+
         # Atomicity is a property of the *exact* type. A subclass of ``int``
         # or ``str`` carries an instance dictionary that an ordinary copy
         # reconstructs, and one was used to hide a materialising companion
@@ -693,6 +753,19 @@ def _arrays_a_traversal_would_reach(state: Any) -> tuple[set[int], bool]:
             pending.extend(set.__iter__(obj))
         elif isinstance(obj, frozenset):
             pending.extend(frozenset.__iter__(obj))
+        elif isinstance(obj, memoryview):
+            # A memoryview holds exactly one reference, to whatever exposed
+            # the buffer. Pickle protocol 5 serialises a contiguous numeric
+            # array out of band and restores it as a view whose base chain
+            # ends in one of these, and with nothing read from it the object
+            # is opaque, which gives up the whole walk -- so a problem
+            # answering from an unassignable buffer survived its first
+            # protocol-5 round trip and was refused on its second (C-15.7).
+            # A released view has no referent to read.
+            try:
+                pending.append(obj.obj)
+            except ValueError:
+                complete = False
 
         if _redefines_its_copying(obj):
             # Everything below predicts the traversal from the graph as it
@@ -712,7 +785,10 @@ def _arrays_a_traversal_would_reach(state: Any) -> tuple[set[int], bool]:
         described = (
             members is not None
             or slotted
-            or isinstance(obj, (np.ndarray, dict, list, tuple, set, frozenset))
+            or isinstance(
+                obj,
+                (np.ndarray, dict, list, tuple, set, frozenset, memoryview),
+            )
         )
         if not described:
             # Nothing to look inside and no modelled traversal to fall back

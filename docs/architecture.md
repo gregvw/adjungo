@@ -527,6 +527,49 @@ differ, C-13 governs.
     before and after the first duplication, accepting a problem and then
     refusing that same problem's next round trip.
 
+    `memoryview` joins the modelled types for the same reason `ndarray` and
+    `dict` are there: protocol 5 serialises a contiguous numeric array out
+    of band and restores it as a view whose base chain ends in one, and a
+    walk that read nothing from it called it opaque and gave up, refusing
+    the *second* round trip of a problem the first had answered for. It is
+    read through `.obj`, the single reference it holds, and it cannot be
+    subclassed, so naming the exact type is the whole statement.
+
+    Reading namespaces is not the whole of the answer either. A reducer
+    registered through `copyreg.pickle` lives in a module-level table that
+    `deepcopy` and `pickle` consult by exact type, is in no namespace, and
+    reaches the modelled types precisely because their own hooks are
+    skipped — one registered for `memoryview` gave a verified deep copy
+    holding a writeable alias of its frozen coefficient and the full
+    C-15.7 displacement. An exact type in `copyreg.dispatch_table` is
+    inconclusive before any namespace is read — and before atomicity is
+    read, since `deepcopy` answers a `complex` from its own dispatch table
+    while every pickle protocol consults the registration, so a walk asking
+    about atomicity first read the deep copy correctly and the round trip
+    not at all. `copyreg` is not empty at import, so what keeps an ordinary
+    complex number answerable is not its atomicity but that the walk models
+    that one registration, comparing it with `copyreg.pickle_complex` by
+    identity. The registration is asked at one site, of every object the
+    walk reaches; a second copy inside the namespace scan was removed once
+    the campaign reported it as a defect no test could detect. A
+    per-`Pickler` dispatch table, `reducer_override` and the
+    persistent-id hooks stay outside the envelope: all are chosen by
+    whoever runs the pickler and none is visible from the object.
+
+    Discriminating a constructor slot from a written `__new__` by type was
+    tried first and is refuted: `__new__` can be assigned after the class
+    exists, and a bound built-in assigned there is indistinguishable from
+    the slot every C type carries while handing back an object prepared in
+    advance — a companion holding a writeable view of the coefficient,
+    verified after `copy.deepcopy`, displacing the gradient by the full
+    C-15.7 amount. How a hook is spelled is not what it does.
+
+    That was invisible because a route does not hand back what it was
+    given, and every duplication test built its case from a fresh source:
+    protocol 5's own output is the only input carrying a `memoryview`. The
+    evidence now chains each route three deep from its own output and mixes
+    kinds.
+
     Inferring the producer from the class was tried first and failed in both
     directions. Asking which copy-protocol hooks the subclass overrides was
     too narrow — `__copy__`, `__deepcopy__` and `__replace__` replace what the

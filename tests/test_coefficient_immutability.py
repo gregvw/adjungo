@@ -54,6 +54,8 @@ in closed form rather than merely observed to differ, per C-14.1.
 from __future__ import annotations
 
 import copy
+import copyreg
+import datetime
 import functools
 import pickle
 import weakref
@@ -3282,6 +3284,68 @@ def test_metadata_of_a_subclassed_type_costs_no_answer(
     ) == pytest.approx(exact, abs=EXACT_TOL)
 
 
+@pytest.mark.parametrize(
+    "route",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        *[
+            pytest.param(
+                functools.partial(_round_trip_through_pickle, protocol),
+                id=f"pickle-p{protocol}",
+            )
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        ],
+    ],
+)
+def test_a_duplicate_can_itself_be_duplicated(
+    route: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """Each link is copied from the one before it, not from a fresh source.
+
+    A route does not hand back what it was given. Protocol 5 serialises a
+    contiguous numeric array out of band and restores it as a view whose
+    base chain ends in a ``memoryview``, which a walk that read nothing from
+    it called opaque -- so the *second* round trip of a problem the first had
+    just answered for was refused, its coefficient being answered from a
+    buffer nothing can replace.
+
+    `OBSERVED` on the C-15.7 fixture: the first protocol-5 round trip gave
+    the closed-form ``0.3026375`` and the second raised
+    ``MutableCoefficients`` naming ``_M``, as did a deep copy of the first.
+    Protocols 0 to 4 survived three links throughout, which is why a test
+    building each link from a fresh source could not see it.
+    """
+    problem: AffineDynamics = AnswersWithAFrozenBuffer()
+    exact, _ = _closed_form(1.0)
+
+    for link in range(3):
+        problem = route(problem)
+        assert np.asarray(
+            _gradient(problem, OverwritesCoefficientMidSolve(None))
+        ) == pytest.approx(exact, abs=EXACT_TOL), f"link {link}"
+
+
+def test_a_route_can_follow_a_route_of_another_kind() -> None:
+    """The kinds hand back different things, so the chain must mix them.
+
+    `OBSERVED` on the C-15.7 fixture: a deep copy of a protocol-5 round trip
+    raised ``MutableCoefficients`` while either alone answered exactly.
+    """
+    exact, _ = _closed_form(1.0)
+    restored = _round_trip_through_pickle(
+        pickle.HIGHEST_PROTOCOL, AnswersWithAFrozenBuffer()
+    )
+    for problem in (
+        copy.deepcopy(restored),
+        copy.copy(restored),
+        _round_trip_through_pickle(0, restored),
+    ):
+        assert np.asarray(
+            _gradient(problem, OverwritesCoefficientMidSolve(None))
+        ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
 def test_a_class_answers_the_same_after_it_has_been_copied_once() -> None:
     """A class namespace is not a fixed property of the class.
 
@@ -3514,6 +3578,254 @@ class HidesTheCompanionBehindItsOwnNew(AffineDynamics):
         _hold_outside(value)
 
 
+#: What the substituting reducer for ``complex`` built, keyed by the token it
+#: handed back in place of the original.
+_BUILT_BY_A_COMPLEX_REDUCER: dict[complex, tuple[NDArray, NDArray]] = {}
+
+_ORIGINAL_TOKEN = 1 + 2j
+_SUBSTITUTED_TOKEN = 3 + 4j
+
+
+def _rebuild_a_complex(real: float, imag: float) -> complex:
+    """Materialise the coefficient while rebuilding an ordinary number."""
+    matrix = np.array(_EXTERNALLY_HELD[0], copy=True)
+    alias = matrix.reshape(-1)
+    matrix.flags.writeable = False
+    _BUILT_BY_A_COMPLEX_REDUCER[_SUBSTITUTED_TOKEN] = (matrix, alias)
+    return _SUBSTITUTED_TOKEN
+
+
+def _substitute_a_complex(value: complex) -> tuple[Any, tuple[float, float]]:
+    return _rebuild_a_complex, (value.real, value.imag)
+
+
+class HidesTheCompanionBehindAComplexToken(AffineDynamics):
+    """``_M`` is answered from storage keyed by an ordinary complex number."""
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        built = _BUILT_BY_A_COMPLEX_REDUCER.get(self.__dict__.get("token"))
+        return _EXTERNALLY_HELD[0] if built is None else built[0]
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        self.__dict__.setdefault("token", _ORIGINAL_TOKEN)
+        _hold_outside(value)
+
+
+def test_the_standard_complex_reducer_is_modelled_and_costs_no_answer() -> None:
+    """``copyreg`` is not empty at import, and one entry is worth modelling.
+
+    The standard library has registered ``pickle_complex`` for ``complex``
+    since long before this library existed. It returns
+    ``(complex, (real, imag))``, which can rebuild nothing but a complex
+    number, so it is compared by identity and excused. Without that, every
+    problem carrying an ordinary complex number beside a coefficient it
+    cannot replace would lose its answer.
+    """
+    assert copyreg.dispatch_table[complex] is copyreg.pickle_complex
+
+    source = AnswersWithAFrozenBufferAndCarriesInertMetadata(1 + 2j)
+    exact, _ = _closed_form(1.0)
+    for duplicate in (
+        copy.copy(source),
+        copy.deepcopy(source),
+        *(
+            _round_trip_through_pickle(protocol, source)
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        ),
+    ):
+        require_immutable_coefficients(duplicate)
+        assert np.asarray(
+            _gradient(duplicate, OverwritesCoefficientMidSolve(None))
+        ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def test_a_replaced_reducer_costs_an_atomic_type_its_atomicity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Atomicity is a statement about the traversal, not about the type.
+
+    ``copy.deepcopy`` answers a ``complex`` from its own dispatch table and
+    never consults ``copyreg``, but *every* pickle protocol does -- so a walk
+    that skipped an atomic value before asking what was registered for it
+    read the deep copy correctly and the round trip not at all.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2`` before the cure, with the
+    standard reducer replaced by one that substitutes the token while
+    allocating the coefficient and keeping a writeable handle on it: the
+    protocol-5 round trip verified with ``_M`` frozen and owning, the handle
+    shared its memory and was writeable, and a write through it in the
+    terminal derivative callback moved the first gradient component from
+    ``0.6781500`` to ``0.7552125``.
+    """
+    monkeypatch.setitem(copyreg.dispatch_table, complex, _substitute_a_complex)
+    _EXTERNALLY_HELD.clear()
+    _BUILT_BY_A_COMPLEX_REDUCER.clear()
+
+    source = HidesTheCompanionBehindAComplexToken(M_CONST, C_DOUBLED)
+    assert affine_dynamics_verified(source)
+    assert source._M is _EXTERNALLY_HELD[0], "the state must not carry it"
+
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    with pytest.raises(SubstitutedCoefficients, match="_M"):
+        _round_trip_through_pickle(pickle.HIGHEST_PROTOCOL, source)
+
+
+def test_a_registered_type_costs_the_same_answer_a_written_hook_does() -> None:
+    """The cost of the rule above, pinned so that widening it is deliberate.
+
+    NumPy registers a reducer for ``ufunc``, so a problem answering from a
+    buffer nothing can replace and carrying ``np.sin`` beside it is refused.
+    That is not a new class of over-refusal: a ``datetime.date``, whose
+    ``__reduce__`` is written on the type itself, is refused identically and
+    was before any of this. Where the hook is kept does not change what it
+    can do, and neither refusal is silent.
+    """
+    assert np.ufunc in copyreg.dispatch_table, "the premise of this test"
+
+    for metadata in (np.sin, datetime.date(2020, 1, 1)):
+        source = AnswersWithAFrozenBufferAndCarriesInertMetadata(metadata)
+        with pytest.raises(MutableCoefficients, match="_M"):
+            copy.deepcopy(source)
+
+
+#: What the reducer registered for ``memoryview`` built, keyed by the view it
+#: handed back. The view is held here too, so no identity is ever reused.
+_BUILT_BY_A_REGISTERED_REDUCER: dict[int, tuple[Any, NDArray, NDArray]] = {}
+
+
+def _rebuild_a_view(data: bytes) -> memoryview:
+    """Materialise the coefficient while rebuilding an ordinary buffer."""
+    view = memoryview(bytearray(data))
+    matrix = np.array(_EXTERNALLY_HELD[0], copy=True)
+    alias = matrix.reshape(-1)
+    matrix.flags.writeable = False
+    _BUILT_BY_A_REGISTERED_REDUCER[id(view)] = (view, matrix, alias)
+    return view
+
+
+def _reduce_a_view(view: memoryview) -> tuple[Any, tuple[bytes]]:
+    return _rebuild_a_view, (bytes(view),)
+
+
+class HidesTheCompanionBehindARegisteredReducer(AffineDynamics):
+    """``_M`` is answered from storage keyed by an ordinary ``memoryview``.
+
+    Nothing here is overridden that verification could object to, and the
+    view itself is an exact ``memoryview``, a type the walk models.
+    """
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        built = _BUILT_BY_A_REGISTERED_REDUCER.get(
+            id(self.__dict__.get("view"))
+        )
+        return _EXTERNALLY_HELD[0] if built is None else built[1]
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        self.__dict__.setdefault("view", memoryview(bytearray(8)))
+        _hold_outside(value)
+
+
+def test_a_registered_reducer_makes_a_modelled_type_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``copyreg.pickle`` replaces a traversal from outside every namespace.
+
+    The walk decides whether an object is predictable by reading class
+    namespaces. A reducer registered through ``copyreg`` is in none of them:
+    it sits in a module-level table that ``deepcopy`` and ``pickle`` consult
+    by exact type, and registering one is an ordinary use of the copy
+    protocol. It reaches the *modelled* types in particular, whose own hooks
+    the scan skips on the grounds that their copying is understood.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2`` before the cure, with a
+    reducer registered for ``memoryview`` that rebuilds a view and, while
+    doing so, allocates the coefficient and keeps a writeable handle on it:
+    the deep copy verified with ``_M`` frozen and owning, the handle shared
+    its memory and was writeable, and a write through it in the terminal
+    derivative callback moved the first gradient component from ``0.6781500``
+    to ``0.7552125``.
+    """
+    monkeypatch.setitem(copyreg.dispatch_table, memoryview, _reduce_a_view)
+    _EXTERNALLY_HELD.clear()
+    _BUILT_BY_A_REGISTERED_REDUCER.clear()
+
+    source = HidesTheCompanionBehindARegisteredReducer(M_CONST, C_DOUBLED)
+    assert affine_dynamics_verified(source)
+    assert source._M is _EXTERNALLY_HELD[0], "the state must not carry it"
+
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    with pytest.raises(SubstitutedCoefficients, match="_M"):
+        copy.deepcopy(source)
+
+
+#: Instances handed back by :class:`AllocatesInAnAssignedNew`, whose
+#: ``__new__`` is a bound built-in and so cannot run code of its own.
+_PREPARED_IN_NEW: dict[type, Any] = {}
+
+
+class AllocatesInAnAssignedNew:
+    """A companion whose ``__new__`` is a bound built-in assigned afterwards.
+
+    A ``__new__`` written in a class body is stored as a ``staticmethod``,
+    while one assigned after the class exists keeps whatever type it already
+    had. A bound method of a built-in type is a
+    ``builtin_function_or_method``, which is exactly what every type
+    implemented in C carries as its constructor slot -- so the two are
+    indistinguishable by type, although one of them hands back an object
+    prepared in advance and the other allocates a blank.
+
+    What this one hands back holds a writeable view of the coefficient the
+    problem answers with, kept outside the instance so the produced state
+    does not carry it.
+    """
+
+    @property
+    def matrix(self) -> NDArray | None:
+        built = _ALLOCATED_IN_NEW.get(self)
+        return None if built is None else built[0]
+
+    @property
+    def flat(self) -> NDArray | None:
+        built = _ALLOCATED_IN_NEW.get(self)
+        return None if built is None else built[1]
+
+
+AllocatesInAnAssignedNew.__new__ = _PREPARED_IN_NEW.get  # type: ignore[assignment]
+
+
+class HidesTheCompanionBehindAnAssignedNew(AffineDynamics):
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        return _answer_from_outside(self.__dict__.get("box"))
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        if "box" not in self.__dict__:
+            # The instance's own box is empty, so this one answers with the
+            # array it was handed. The prepared box is a different object,
+            # reached only by a route that calls ``__new__``.
+            prepared = object.__new__(AllocatesInAnAssignedNew)
+            matrix = np.array(value, copy=True)
+            alias = matrix.reshape(-1)
+            matrix.flags.writeable = False
+            _ALLOCATED_IN_NEW[prepared] = (matrix, alias)
+            _PREPARED_IN_NEW[AllocatesInAnAssignedNew] = prepared
+            self.__dict__["box"] = object.__new__(AllocatesInAnAssignedNew)
+        _hold_outside(value)
+
+
 class HidesTheCompanionBehindItemAssignment(AffineDynamics):
     @property
     def _M(self) -> NDArray:  # type: ignore[override]
@@ -3543,6 +3855,7 @@ class HidesTheCompanionBehindItemAssignment(AffineDynamics):
         HidesTheCompanionBehindAFilteringMapping,
         HidesTheCompanionBehindItemAssignment,
         HidesTheCompanionBehindItsOwnNew,
+        HidesTheCompanionBehindAnAssignedNew,
     ],
     ids=[
         "container-subclass-attribute",
@@ -3554,6 +3867,7 @@ class HidesTheCompanionBehindItemAssignment(AffineDynamics):
         "filtering-mapping-contents",
         "mapping-item-assignment",
         "companion-own-new",
+        "companion-assigned-new",
     ],
 )
 def test_the_walk_reaches_a_companion_wherever_the_traversal_would(
