@@ -527,13 +527,26 @@ differ, C-13 governs.
     before and after the first duplication, accepting a problem and then
     refusing that same problem's next round trip.
 
-    `memoryview` joins the modelled types for the same reason `ndarray` and
-    `dict` are there: protocol 5 serialises a contiguous numeric array out
-    of band and restores it as a view whose base chain ends in one, and a
-    walk that read nothing from it called it opaque and gave up, refusing
-    the *second* round trip of a problem the first had answered for. It is
-    read through `.obj`, the single reference it holds, and it cannot be
-    subclassed, so naming the exact type is the whole statement.
+    Storage is not reconstruction, and the walk no longer follows what an
+    array shares memory with. Following `ndarray.base` and `memoryview.obj`
+    rested on the theory that a view travels with whatever owns its memory;
+    a test now pins the opposite, since default `deepcopy` and the in-band
+    pickle protocols rebuild each array independently and serialise no
+    `.base` relationship, and a shallow copy hands back the same objects. A
+    faithful out-of-band load borrows the buffers it is handed and so can
+    preserve sharing, but it still rebuilds no exporter and calls no hooks
+    of one, which is the part the walk depends on. The claim is about
+    sharing rather than ownership: in band, protocol 5 returns a contiguous
+    array as a non-owning view of an incidental one it just made. The
+    chain cost answers both ways: it recorded owners no copy would rebuild,
+    and it judged what it found there by hooks no copy would call — an
+    ordinary `np.frombuffer(array("d", ...))` carried as metadata reaches an
+    `array.array` and cost a problem with an unassignable coefficient its
+    answer. The earlier protocol-5 symptom, where the *second* round trip of
+    a problem the first had answered for was refused, was the same mistake
+    from the other side; modelling `memoryview` cured the symptom and is
+    withdrawn with the chain, since `complete` decides nothing on the one
+    route that can carry a memoryview at all.
 
     Reading namespaces is not the whole of the answer either. A reducer
     registered through `copyreg.pickle` lives in a module-level table that
@@ -552,9 +565,13 @@ differ, C-13 governs.
     identity. The registration is asked at one site, of every object the
     walk reaches; a second copy inside the namespace scan was removed once
     the campaign reported it as a defect no test could detect. A
-    per-`Pickler` dispatch table, `reducer_override` and the
-    persistent-id hooks stay outside the envelope: all are chosen by
-    whoever runs the pickler and none is visible from the object.
+    per-`Pickler` dispatch table, `reducer_override`, replacement
+    out-of-band buffers supplied to the loader — any provider backed by
+    storage other than the storage the dump returned, even a byte-for-byte
+    faithful copy received over a transport, since loading from the original
+    providers, or from wrappers over that same storage, is supported and
+    asserted — and persistent-id hooks stay outside the envelope: all are
+    chosen by whoever runs the pickler and none is visible from the object.
 
     Discriminating a constructor slot from a written `__new__` by type was
     tried first and is refuted: `__new__` can be assigned after the class

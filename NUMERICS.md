@@ -1717,16 +1717,61 @@ are therefore excluded by name, and the assertion held is that the answer
 does not depend on the round trip's ordinal — which nothing weaker than
 repeating the round trip can check.
 
-A `memoryview` is **modelled**, alongside `ndarray`, `dict` and the rest,
-and read through `.obj`, the single reference it holds. Pickle protocol 5
-serialises a contiguous numeric array out of band and restores it as a view
-whose base chain ends in such a buffer, so a walk that read nothing from it
-called it opaque and gave up. `memoryview` cannot be subclassed, so naming
-the exact type says everything there is to say about it; a released one has
-no referent and is inconclusive on that ground instead. The referent is read rather
-than assumed: an out-of-band load can retain the exporting array itself, not
-merely the bytes the route wrote, and a state whose only path to a
-coefficient runs through a view is constructible.
+**Storage is not reconstruction.** The walk does not follow what an array
+shares memory with. It once followed `ndarray.base` and, through it,
+`memoryview.obj`, on the stated theory that "a view travels with whatever
+owns its memory". That theory is false, and is now pinned by a test:
+`OBSERVED` for a dictionary carrying an array and a view of it, `deepcopy`
+and in-band pickle protocols 0 through 5 each returned a pair that shares no
+memory, because each array is reconstructed independently and no `.base`
+relationship is serialised; `copy.copy` returns the very same two objects
+and rebuilds nothing. An owner reached only through a view is therefore
+never rebuilt, and nothing it declares about its own copying is ever called.
+
+The scope is the **default** routes. A faithful out-of-band load borrows the
+buffers it is handed, and so can preserve sharing between the restored pair
+and with the source — `OBSERVED` for the same dictionary dumped with
+`buffer_callback` and loaded from those buffers. It still does not rebuild
+the exporter or call its hooks, which is the property this walk depends on;
+what it shares is the source's own storage, and a verified source's
+coefficients are frozen.
+
+The claim is about *sharing*, not ownership. In band, protocol 5 hands a
+contiguous array back as a **non-owning** view of an incidental array it
+made while restoring — `OBSERVED` for C-contiguous, Fortran-ordered and
+`np.frombuffer` arrays alike, each restored with `owndata` false and a base
+chain ending in a `memoryview`, and each sharing no memory with its source.
+A strided slice was restored owning its storage. So "the copy owns its
+bytes" is false and "the copy shares with nothing that travelled beside it"
+is what holds.
+
+Following the chain anyway cost answers in both directions available to it.
+It recorded owners as *carried* that no copy would rebuild, which forces a
+replacement the coefficient may have no setter for; and it judged whatever
+it found at the end of the chain by hooks no copy would consult. `OBSERVED`
+on the fixture above with metadata built by `np.frombuffer(array("d", ...))`
+— an ordinary way to read a numeric array, whose base chain ends in a
+`memoryview` over an `array.array`, and `array.array` defines
+`__reduce_ex__`, `__copy__` and `__deepcopy__`: `deepcopy` and pickle
+protocols 4 and 5 all raised `MutableCoefficients` naming `_M`, the
+module-level frozen array a read-only property answers with and nothing can
+replace, for a problem whose coefficient the metadata has nothing to do
+with.
+
+The earlier symptom was the same mistake seen from the other side. A
+problem answering from an unassignable buffer survived its first protocol-5
+round trip and was refused on its second, because protocol 5 restores a
+contiguous numeric array as a view whose base chain ends in a `memoryview`
+that the walk could read nothing from and so called opaque. Modelling
+`memoryview` cured that symptom and is now withdrawn with the chain itself:
+with storage links unfollowed, a `memoryview` can reach the walk only by
+being carried in the state directly, and `complete` decides nothing on that
+route — a shallow copy passes the state through, so a coefficient already at
+the postcondition is vouched for and left alone, while no *default* deep
+route can copy a `memoryview` at all, Python raising before this library is
+consulted. A registered reducer can, and is read as inconclusive on its own
+grounds below, whether or not the type is modelled.
+A guard whose removal the injection campaign cannot detect is not kept.
 
 **A namespace is not where all of the answer is.** A reducer registered
 through `copyreg.pickle` sits in a module-level table that `deepcopy` and
@@ -2155,6 +2200,38 @@ the protocol, and `Pickler.reducer_override` and the persistent-id hooks
 belong to it for the same reason: all of them are chosen by whoever runs the
 pickler, and none of them is visible from the object being pickled.
 
+**Out-of-band buffers** join that list, and are the sharpest case in it.
+Protocol 5 serialises a buffer out of band only when the caller passes
+`buffer_callback` to the dump, and the restored object reads whatever the
+caller then passes as `buffers` to the load. Neither end is visible from the
+object, and the two need not agree: a caller can hand back a buffer other
+than the one produced, backed by memory it retains a writeable view of.
+`OBSERVED` on the fixture above at `C = 2` with a coefficient answered from
+the array that exports a metadata view, and one substituted buffer: the
+clone verified with `_M` frozen and owning, the retained view shared its
+memory and was writeable, and a write through it in the terminal derivative
+callback moved the first gradient component from `0.6781500` to `0.7552125`.
+Every default route answered `0.6781500`, and so did an out-of-band round
+trip handing back the buffers the dump produced — which is asserted, so that
+the supported half of the mechanism is held rather than merely described.
+
+What makes this an exclusion rather than a defect is that zero-copy sharing
+with memory the caller holds *is what the mechanism is for*. A library
+cannot both honour the request and refuse the sharing it asks for.
+
+The boundary is mechanical, and it is deliberately drawn wider than
+mismatched or hostile buffers. **Supported**: loading in the same process
+from the buffer providers that dump returned, or from wrappers over that
+same storage. **Excluded**: any replacement provider — copied,
+reconstituted, or received over a transport — *even when its bytes, sizes
+and order are exactly right*. That excludes the ordinary cross-process
+workflow, where the sender forwards the bytes and the receiver wraps them in
+a fresh `bytearray`, `memoryview` or shared-memory block. Nothing is wrong
+with that workflow; it simply hands the restored object storage this library
+cannot see and the receiver may still hold writeably, which is the state the
+measurement above describes. The contract declines to promise what it cannot
+check, rather than accusing the caller of anything.
+
 These are not separate defects to be closed one at a time. They are the same
 fact about Python, and chasing them costs more than it buys: the only
 construction that would close the first is copying `F` and `G`'s result at
@@ -2186,17 +2263,17 @@ eligible.
 
 #### Injection evidence — `OBSERVED`
 
-Under [R-11](#r-11) against an 809-test baseline with 0 failures, 96 of 96
+Under [R-11](#r-11) against an 822-test baseline with 0 failures, 95 of 95
 injected defects detected. Counts are as emitted by the campaign:
 
 | Injected defect | Failing tests |
 |---|---|
-| `__setstate__` removed entirely | 76 |
-| `__setstate__` restores state but does not re-freeze | 75 |
-| `__setstate__` leaves the buffers writeable outright | 101 |
-| only `_M` is re-frozen; `_C` and `_b` are missed | 66 |
+| `__setstate__` removed entirely | 78 |
+| `__setstate__` restores state but does not re-freeze | 77 |
+| `__setstate__` leaves the buffers writeable outright | 113 |
+| only `_M` is re-frozen; `_C` and `_b` are missed | 68 |
 | `__setstate__` assumes a plain `dict`, breaking `__slots__` subclasses | 8 |
-| `__setstate__` freezes without restoring ownership | 50 |
+| `__setstate__` freezes without restoring ownership | 52 |
 | verification stops checking the copy-protocol hooks | 8 |
 | `__setstate__` dropped from the guarded copy hooks | 2 |
 | `__deepcopy__` dropped from the guarded copy hooks | 1 |
@@ -2226,30 +2303,30 @@ injected defects detected. Counts are as emitted by the campaign:
 | the defensive copy dispatches to the buffer's own copy() | 2 |
 | MissingCoefficients always claims the initialiser ran | 3 |
 | the class gate is dropped, catching unrelated problems | 305 |
-| buffers are read from the instance `dict`, not by attribute | 73 |
+| buffers are read from the instance `dict`, not by attribute | 83 |
 | the root-initialised flag is never recorded | 4 |
 | the marker is written where it is not read | 1 |
-| restoration reads coefficients from the instance `dict` | 56 |
-| restoration freezes names the instance does not hold | 49 |
+| restoration reads coefficients from the instance `dict` | 65 |
+| restoration freezes names the instance does not hold | 58 |
 | restoration trusts the restored marker alone | 21 |
 | restoration reads the restored keys, not the object | 11 |
 | restoration does not record what it concluded | 1 |
 | the guard restates the resolution rule as a bare getattr | 1 |
 | a failed replacement always reports the buffer as writeable | 1 |
 | restoration absorbs only AttributeError from a descriptor | 4 |
-| restoration replaces a postcondition buffer whatever the record says | 43 |
+| restoration replaces a postcondition buffer whatever the record says | 52 |
 | restoration takes a buffer at the postcondition on trust | 27 |
 | restoration lets a failed setattr out as it comes | 3 |
 | each coefficient is copied only when its turn comes | 4 |
 | the record is trusted by name rather than by array identity | 3 |
 | restoration does not ask about a delegating `__setstate__` | 2 |
 | the record is written into the live instance dictionary | 5 |
-| a coefficient the state does not carry is left out of the record | 39 |
+| a coefficient the state does not carry is left out of the record | 47 |
 | what travelled is decided by dictionary membership | 17 |
 | the slot mapping is left out of the reachability walk | 1 |
 | a rebuilt state is vouched for by identity alone | 10 |
-| the untravelled marker is never recorded | 4 |
-| the provenance record is never attached to the produced state | 43 |
+| the untravelled marker is never recorded | 5 |
+| the provenance record is never attached to the produced state | 52 |
 | the replacement is frozen in one pass, before setters finish | 3 |
 | the replacement is handed to the setter writeable | 4 |
 | the constructor stops checking what the setter stored | 5 |
@@ -2271,22 +2348,21 @@ injected defects detected. Counts are as emitted by the campaign:
 | atomicity is decided by isinstance, so subclasses inherit it | 1 |
 | a subclass of a modelled type is assumed to copy like it | 2 |
 | an object array is walked as though it held no objects | 1 |
-| an inconclusive walk refuses rather than replacing | 29 |
+| an inconclusive walk refuses rather than replacing | 30 |
 | only an `ndarray` subclass copies by rules of its own | 1 |
 | `__new__` is not treated as a reconstruction hook | 2 |
 | a subclass `__new__` does not withhold the exemption | 1 |
 | validity asks the arrays alone, not what established them | 1 |
-| restoration does not record what it established | 40 |
+| restoration does not record what it established | 42 |
 | a hook no rebuilding route calls makes the walk inconclusive | 1 |
 | being an inexact subclass is disqualifying on its own | 22 |
 | a name the copy protocol itself writes is read as a declaration | 13 |
-| establishment is recorded against the problem, not the array | 169 |
+| establishment is recorded against the problem, not the array | 171 |
 | `__new__` is judged by how it is spelled | 1 |
-| a `memoryview` is not modelled, so its own slot disqualifies it | 2 |
-| a `memoryview` is walked but not counted as described | 2 |
 | a `complex` number is no longer atomic | 1 |
-| a reducer registered through `copyreg` is not noticed | 2 |
+| a reducer registered through `copyreg` is not noticed | 1 |
 | any registration is excused for a modelled type | 1 |
+| storage ownership is walked as though a copy rebuilt through it | 9 |
 
 Several of these are detected only because their fixtures were changed, and
 the change is the same each time. A guard reached by three mechanisms cannot

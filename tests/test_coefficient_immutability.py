@@ -59,6 +59,7 @@ import datetime
 import functools
 import pickle
 import weakref
+from array import array
 from collections.abc import Callable
 from typing import Any, Self, cast
 from unittest import mock
@@ -3287,6 +3288,191 @@ def test_metadata_of_a_subclassed_type_costs_no_answer(
 @pytest.mark.parametrize(
     "route",
     [
+        pytest.param(lambda p: p, id="as-constructed"),
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        *[
+            pytest.param(
+                functools.partial(_round_trip_through_pickle, protocol),
+                id=f"pickle-p{protocol}",
+            )
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        ],
+    ],
+)
+def test_metadata_over_an_external_buffer_costs_no_answer(
+    route: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """What a metadata array shares memory with is not held against it.
+
+    ``np.frombuffer`` is an ordinary way to read a numeric array, and the
+    result does not own its storage: its base chain ends in a ``memoryview``
+    over an ``array.array``, which defines ``__reduce_ex__``, ``__copy__``
+    and ``__deepcopy__``.
+
+    `OBSERVED` on the C-15.7 fixture while the walk followed that chain:
+    ``deepcopy`` and pickle protocols 4 and 5 all raised
+    ``MutableCoefficients`` naming ``_M`` -- the module-level frozen array
+    the property returns and nothing can replace -- for a problem whose
+    coefficient the metadata has nothing to do with. No copy route rebuilds
+    an array through what owns its memory, so those hooks are never called
+    and cannot reach anything.
+    """
+    source = AnswersWithAFrozenBufferAndCarriesInertMetadata(
+        np.frombuffer(array("d", [0.0, 1.0]), dtype=np.float64)
+    )
+    exact, _ = _closed_form(1.0)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL), "the source itself answers"
+
+    duplicate = route(source)
+    require_immutable_coefficients(duplicate)
+    assert np.asarray(
+        _gradient(duplicate, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def test_metadata_holding_a_memoryview_costs_no_answer() -> None:
+    """A state can carry a memoryview, and shallow copying keeps the answer.
+
+    ``complete`` only decides anything on a route that *rebuilds* the state:
+    a shallow copy passes the state through, so a coefficient already at the
+    postcondition is vouched for and left alone. No *default* deep route can
+    copy a memoryview at all -- Python raises before this library is
+    consulted -- so a memoryview can never cost a coefficient its answer,
+    and the walk models nothing about it. A registered reducer can copy one,
+    and is read as inconclusive on its own grounds, above.
+
+    The deep routes are refused by Python itself rather than by this
+    library, and that boundary is asserted too: the refusal must not be
+    ``MutableCoefficients``, which would mean the walk had blamed the
+    coefficient for the metadata.
+    """
+    source = AnswersWithAFrozenBufferAndCarriesInertMetadata(
+        memoryview(bytearray(b"ordinary metadata"))
+    )
+    exact, _ = _closed_form(1.0)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL), "the source itself answers"
+
+    shallow = copy.copy(source)
+    require_immutable_coefficients(shallow)
+    assert np.asarray(
+        _gradient(shallow, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    for route in (
+        copy.deepcopy,
+        functools.partial(_round_trip_through_pickle, pickle.HIGHEST_PROTOCOL),
+    ):
+        with pytest.raises(TypeError, match="memoryview"):
+            route(source)
+
+
+def test_no_default_route_rebuilds_an_array_through_its_storage() -> None:
+    """The premise under which the walk stopped following ``.base``.
+
+    The walk once followed ``ndarray.base`` and ``memoryview.obj`` on the
+    theory that a view travels with whatever owns its memory. It does not:
+    ``deepcopy`` and the in-band pickle protocols reconstruct each array
+    independently and serialise no ``.base`` relationship, so what comes
+    back shares storage with neither the source nor a separately serialised
+    view of it; a shallow copy hands back the very same objects and rebuilds
+    nothing. So an owner reached only through a view is never rebuilt, and
+    nothing it declares about its own copying is ever consulted.
+
+    The **default** routes are the scope, which is why this is not named for
+    every route. A faithful out-of-band load borrows the buffers it is given
+    and can preserve sharing; it still rebuilds no exporter and calls no
+    hooks of one, which is the part the walk depends on.
+
+    The claim is about *sharing*, not ownership. In band, protocol 5 hands
+    back a contiguous array as a non-owning view of an incidental one it
+    made while restoring, which is why the assertion below is that nothing
+    shares rather than that everything owns.
+
+    This is a statement about NumPy and the copy protocol rather than about
+    this library, which is why it is pinned here: were it to stop holding,
+    the descent would have to come back, and the cost of not noticing is a
+    coefficient aliased by something the walk never recorded.
+    """
+    owner = np.arange(6.0)
+    view = owner[:3]
+    assert np.shares_memory(owner, view), "the source shares, as set up"
+
+    def shares(duplicate: dict[str, NDArray]) -> bool:
+        return bool(np.shares_memory(duplicate["owner"], duplicate["view"]))
+
+    source = {"owner": owner, "view": view}
+    assert not shares(copy.deepcopy(source))
+    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+        rebuilt = pickle.loads(pickle.dumps(source, protocol))
+        assert not shares(rebuilt), f"protocol {protocol} rebuilt the sharing"
+        assert rebuilt["view"].flags.owndata or rebuilt["view"].base is not (
+            rebuilt["owner"]
+        ), "a restored view owns its bytes or borrows from an incidental array"
+
+    shallow = copy.copy(source)
+    assert shallow["owner"] is owner and shallow["view"] is view, (
+        "a shallow copy shares the objects themselves, so it rebuilds nothing"
+    )
+
+
+@pytest.mark.parametrize(
+    "supply",
+    [
+        pytest.param(lambda produced: list(produced), id="original-providers"),
+        pytest.param(
+            lambda produced: [memoryview(b.raw()) for b in produced],
+            id="wrappers-over-the-same-storage",
+        ),
+    ],
+)
+def test_an_out_of_band_round_trip_that_hands_back_its_own_buffers(
+    supply: Callable[[list[pickle.PickleBuffer]], list[Any]],
+) -> None:
+    """The supported half of PEP 574, pinned against the excluded half.
+
+    Serialising out of band is chosen by the caller at both ends --
+    ``buffer_callback`` on the dump, ``buffers`` on the load -- and neither
+    is visible from the object. What is supported is loading from the
+    providers the dump returned, or from wrappers over *that same storage*;
+    both forms are exercised here, because the boundary is drawn by the
+    backing storage rather than by the identity of the provider.
+
+    A provider backed by *other* storage is excluded by C-15.7, even a
+    byte-for-byte faithful one received over a transport, because zero-copy
+    sharing with memory the caller holds is the mechanism's purpose rather
+    than a defect in it. `OBSERVED` on the C-15.7 fixture at ``C = 2`` with
+    a coefficient answered from the array exporting a metadata view, and a
+    substituted buffer whose backing array the caller kept a writeable view
+    of: the clone verified with ``_M`` frozen and owning, the retained view
+    shared its memory and was writeable, and a write through it in the
+    terminal derivative callback moved the first gradient component from
+    ``0.6781500`` to ``0.7552125``. Every default route answered
+    ``0.6781500``, as does the faithful out-of-band round trip asserted
+    here.
+    """
+    source = AffineDynamics(M_CONST, C_DOUBLED)
+    exact, _ = _closed_form(2.0)
+
+    buffers: list[pickle.PickleBuffer] = []
+    payload = pickle.dumps(source, protocol=5, buffer_callback=buffers.append)
+    assert buffers, "the fixture must actually serialise out of band"
+
+    restored = pickle.loads(payload, buffers=supply(buffers))
+    require_immutable_coefficients(restored)
+    assert not restored._M.flags.writeable
+    assert np.asarray(
+        _gradient(restored, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
         pytest.param(copy.copy, id="copy"),
         pytest.param(copy.deepcopy, id="deepcopy"),
         *[
@@ -3716,8 +3902,15 @@ def _reduce_a_view(view: memoryview) -> tuple[Any, tuple[bytes]]:
 class HidesTheCompanionBehindARegisteredReducer(AffineDynamics):
     """``_M`` is answered from storage keyed by an ordinary ``memoryview``.
 
-    Nothing here is overridden that verification could object to, and the
-    view itself is an exact ``memoryview``, a type the walk models.
+    Nothing here is overridden that verification could object to. The view
+    was an exact ``memoryview`` when that type was modelled, which is what
+    the case originally turned on; with the modelling withdrawn the
+    memoryview's own ``__new__`` is inconclusive on its own, so the
+    load-bearing evidence for the registration check is now
+    ``test_a_replaced_reducer_costs_an_atomic_type_its_atomicity``, whose
+    type is atomic and cannot become inconclusive any other way. This case
+    remains the one that shows a registered reducer *can* carry a deep route
+    through a type no default route would copy at all.
     """
 
     @property
@@ -3733,17 +3926,24 @@ class HidesTheCompanionBehindARegisteredReducer(AffineDynamics):
         _hold_outside(value)
 
 
-def test_a_registered_reducer_makes_a_modelled_type_inconclusive(
+def test_a_registered_reducer_carries_a_route_no_default_route_takes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``copyreg.pickle`` replaces a traversal from outside every namespace.
+
+    A ``memoryview`` is the sharpest demonstration of that: no default deep
+    route copies one at all, and registering a reducer for it gives
+    ``deepcopy`` a way through that no namespace records.
 
     The walk decides whether an object is predictable by reading class
     namespaces. A reducer registered through ``copyreg`` is in none of them:
     it sits in a module-level table that ``deepcopy`` and ``pickle`` consult
     by exact type, and registering one is an ordinary use of the copy
     protocol. It reaches the *modelled* types in particular, whose own hooks
-    the scan skips on the grounds that their copying is understood.
+    the scan skips on the grounds that their copying is understood, and it
+    is read whether or not the type is modelled -- which is what this case
+    turns on now, since a registered reducer is the only way a deep route
+    copies a ``memoryview`` at all.
 
     `OBSERVED` on the C-15.7 fixture at ``C = 2`` before the cure, with a
     reducer registered for ``memoryview`` that rebuilds a view and, while

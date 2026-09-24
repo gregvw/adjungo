@@ -485,18 +485,20 @@ _TRAVERSAL_HOOKS = (
 )
 
 #: Types whose copying this walk models directly, so their own definitions of
-#: the hooks above are expected rather than disqualifying. ``memoryview`` is
-#: here because protocol 5 leaves one in the base chain of a contiguous
-#: numeric array it restores out of band; it cannot be subclassed, so the
-#: exact type is the whole statement. Discriminating its constructor slot from a *written*
-#: ``__new__`` by type was tried instead and is refuted: ``__new__`` can be
+#: the hooks above are expected rather than disqualifying. ``memoryview`` was
+#: modelled here while the walk followed storage links; with those gone it is
+#: unreachable in any way that can change an answer, since ``complete`` bites
+#: only on a route that rebuilds the state and no *default* deep route can
+#: copy a memoryview at all. A registered reducer can, which is how one was
+#: used to hide a companion -- but a registration is read regardless of
+#: modelling, above. Discriminating a constructor slot from a *written*
+#: ``__new__`` by type was tried and is refuted: ``__new__`` can be
 #: assigned after a class exists, and a bound built-in assigned there is
 #: indistinguishable from a slot while handing back an object prepared in
 #: advance (C-15.7).
 _TRAVERSAL_MODELLED = (
     object,
     np.ndarray,
-    memoryview,
     dict,
     list,
     tuple,
@@ -685,6 +687,27 @@ def _arrays_a_traversal_would_reach(state: Any) -> tuple[set[int], bool]:
     costs a replacement it may not have needed and, where the replacement
     cannot be stored, a loud refusal. The quiet direction is the one that
     must not be guessed.
+
+    **Storage is not reconstruction.** What a view shares memory with is not
+    walked, because no route rebuilds anything through it. Default
+    ``deepcopy`` and the in-band pickle protocols reconstruct each array
+    independently and serialise no ``.base`` relationship, so what comes
+    back shares storage with neither the source nor a separately serialised
+    view of it; a shallow copy shares the very same objects and rebuilds
+    nothing. It is *not* that the result owns its storage -- in band,
+    protocol 5 hands back a contiguous array as a view of an incidental one
+    it just made. A faithful out-of-band load does borrow the supplied
+    buffers, and so can preserve sharing, but it still does not rebuild the
+    exporter or call its hooks.
+
+    Following ``ndarray.base`` and ``memoryview.obj`` on the theory that "a
+    view travels with whatever owns its memory" recorded owners no copy
+    would rebuild and, worse, condemned whatever it found there for defining
+    hooks no copy would call -- an ordinary
+    ``np.frombuffer(array("d", ...))`` carried as metadata reaches an
+    ``array.array``, whose reduction hooks made the walk inconclusive and
+    cost a problem answering from an unassignable buffer its answer
+    (C-15.7).
     """
     found: set[int] = set()
     seen: set[int] = set()
@@ -720,10 +743,6 @@ def _arrays_a_traversal_would_reach(state: Any) -> tuple[set[int], bool]:
 
         if isinstance(obj, np.ndarray):
             found.add(id(obj))
-            # A view travels with whatever owns its memory, and freezing the
-            # view leaves the owner writeable, so the owner is reachable too.
-            if obj.base is not None:
-                pending.append(obj.base)
             if obj.dtype.hasobject:
                 # An object array is a container of Python objects, and NumPy
                 # copies each of them. What they are is not described by the
@@ -753,19 +772,6 @@ def _arrays_a_traversal_would_reach(state: Any) -> tuple[set[int], bool]:
             pending.extend(set.__iter__(obj))
         elif isinstance(obj, frozenset):
             pending.extend(frozenset.__iter__(obj))
-        elif isinstance(obj, memoryview):
-            # A memoryview holds exactly one reference, to whatever exposed
-            # the buffer. Pickle protocol 5 serialises a contiguous numeric
-            # array out of band and restores it as a view whose base chain
-            # ends in one of these, and with nothing read from it the object
-            # is opaque, which gives up the whole walk -- so a problem
-            # answering from an unassignable buffer survived its first
-            # protocol-5 round trip and was refused on its second (C-15.7).
-            # A released view has no referent to read.
-            try:
-                pending.append(obj.obj)
-            except ValueError:
-                complete = False
 
         if _redefines_its_copying(obj):
             # Everything below predicts the traversal from the graph as it
@@ -787,7 +793,7 @@ def _arrays_a_traversal_would_reach(state: Any) -> tuple[set[int], bool]:
             or slotted
             or isinstance(
                 obj,
-                (np.ndarray, dict, list, tuple, set, frozenset, memoryview),
+                (np.ndarray, dict, list, tuple, set, frozenset),
             )
         )
         if not described:
