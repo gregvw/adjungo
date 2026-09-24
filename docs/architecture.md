@@ -422,8 +422,129 @@ differ, C-13 governs.
     storage of its own, a coefficient must additionally *be* the array the
     root froze, checked by identity after assignment in the constructor and
     in restoration alike, after all three names rather than after each,
-    because one coefficient's setter may rewrite another. A setter may
-    relocate what it is handed; it may not substitute. This closes
+    because one coefficient's setter may rewrite another — and for every
+    name, not only the ones restoration replaced, since a coefficient that
+    arrives already frozen and owning is skipped but is still one another
+    setter can rebuild, and for names that were *absent* when restoration
+    began, since an unrooted instance can gain one from a setter that rebuilds
+    a coefficient the state did not carry. A setter may relocate what it is
+    handed; it may not substitute, and the refusal separates whose setter did
+    it — a setter that faithfully stored its own argument can still be holding
+    a substitute a later setter left it. Nor is any coefficient left writeable
+    while a setter can still run: `deepcopy` and protocol 4 rebuild one owning
+    but writeable, which used to be skipped on the reasoning that a rooted
+    instance's arrays were frozen already, and it then stayed writeable long
+    enough for another coefficient's setter to take a view of it, so anything
+    not already at the postcondition is now replaced by a frozen copy first,
+    and every copy is taken before the *first* setter runs rather than one
+    name at a time: interleaving them left the later names holding those
+    writeable arrays while an earlier setter ran, and one writing into a
+    not-yet-copied `_C` had the change carried into the replacement, so a
+    `deepcopy` of a problem built at `C = 2` verified, differentiated exactly,
+    and did so for `C = 3`.
+    So is anything *at* it, when the subclass produced the state — satisfying
+    the postcondition is not the same as having been put there by the
+    constructor, since a `__getstate__` can allocate a coefficient, keep a
+    writeable view of it, freeze it and return both, and identity then
+    confirms itself because the fabricated array is the only one restoration
+    ever saw. So a coefficient at the postcondition is left where it is only
+    when the root can vouch for the array itself: `__getstate__` records,
+    under a private key in the state it returns, the array each coefficient
+    resolved to — or `None` for a name the state does not carry — and
+    restoration lifts that record out first and exempts a buffer only when the
+    array that arrived *is* the one recorded. `deepcopy` and `pickle` memoise
+    by identity, so that correspondence is carried across the honest routes
+    rather than asserted; a substitution breaks it, including one made by
+    taking the root's own state and replacing an entry.
+
+    Identity says where an array came from, not what was done to it on the
+    way, so the exemption also requires a state that was handed on unchanged.
+    A copy arrives writeable and is frozen only afterwards, so anything else
+    copied in the same traversal may keep a view of it — and memoisation
+    carries the record across for the aliased copy too, so identity agrees.
+    A plain `AffineDynamics` carrying an ordinary attribute that rebuilds a
+    flattened view of `M` in its `__deepcopy__` verified after `copy.deepcopy`
+    with a writeable alias of its frozen coefficient. The record therefore
+    carries a marker that `copy.copy` passes through and every rebuilding
+    route replaces; a rebuilt state has its coefficients replaced, severing
+    any such view, which costs nothing because that state is the traversal's
+    own. A coefficient the state does not carry keeps its exemption either
+    way, having never been copied — where "does not carry" is reachability
+    through the whole produced state, dictionary and slots, through
+    containers and through objects, with a view's owner reachable through the
+    view. Membership in the instance dictionary is a weaker statement, and a
+    coefficient answered from inside an attribute object or held in a slot
+    fell through it and came back aliased.
+
+    An object that redefines its own copying makes the walk inconclusive, and
+    an inconclusive walk treats every coefficient as reachable. The walk
+    predicts a traversal from the graph as it stands; a hook may build
+    something that graph does not contain. An *empty* companion whose
+    `__deepcopy__` allocates the coefficient from storage outside the state
+    and takes a writeable view of it before freezing it is the witness, and
+    overrides nothing on the problem class for verification to object to.
+    Scope had to match the traversal's, and eight hiding places each defeated
+    it alone: a container subclass's own attributes (not just its contents);
+    slots read from member descriptors rather than by replaying `__slots__`,
+    whose legal bare-string form iterates one character at a time; a
+    class-level `__getattribute__` answering a request for `__deepcopy__`
+    with a hook written down nowhere; atomicity decided by `isinstance`, so
+    that an `int` subclass carrying an instance dictionary was skipped; an
+    inexact subclass of any modelled type *that declares anything of its
+    own*, which needs no listed hook at all, because NumPy calls an
+    `ndarray` subclass's `__array_finalize__` while building the copy and a
+    `dict` subclass is rebuilt blank and repopulated through its own
+    `__setitem__` — the question being whether it declares any name, not
+    which, since a subclass declaring none is rebuilt exactly as its base; `__new__`, which every rebuilding route
+    calls before it puts any state in; an object-dtype array, which is an
+    exact `ndarray` holding Python objects NumPy copies one by one; and a
+    mapping's own `keys` and `values`, read instead through `dict`'s, though
+    the subclass rule now subsumes that one. Class namespaces are read
+    through `type`'s own descriptor so a metaclass cannot answer for them.
+
+    None of that reaches a hook that never calls restoration at all, and
+    ineligibility for the affine route is not safety: `F` returns `_M` by
+    identity and the general route reads it the same way. A clone assembled
+    by a plausible hand-written `__deepcopy__` — copy the state, keep a
+    handle, freeze the buffers — is owning and frozen and holds a writeable
+    alias, because coefficients arrive writeable and the flag is not part of
+    what a copy carries. Its final state is indistinguishable from an honest
+    one, so validity stops inspecting the arrays and asks instead for
+    positive evidence: the root records the exact arrays it established at
+    the end of its own initialisation and restoration, and a coefficient must
+    be one of them. The register is module-level so no state can carry or
+    forge it, checked last so it cannot mask a precise diagnosis, and applied
+    only to rooted instances so a subclass that reads none of the root's
+    buffers is not refused for never having used it. It records the *array*
+    rather than the problem holding it, since a frozen owning array cannot
+    acquire a writeable alias afterwards and is therefore as sound to read
+    from a second object as from the first.
+
+    One trap is worth naming on its own, because it makes a class namespace
+    something other than a property of the class: `copyreg` caches
+    `__slotnames__` into a class the first time an instance is copied or
+    pickled. A rule reading a namespace consequently answered differently
+    before and after the first duplication, accepting a problem and then
+    refusing that same problem's next round trip.
+
+    Inferring the producer from the class was tried first and failed in both
+    directions. Asking which copy-protocol hooks the subclass overrides was
+    too narrow — `__copy__`, `__deepcopy__` and `__replace__` replace what the
+    route *does*, not the restoration it performs, and each may call
+    `__setstate__` with a state it chose, as may an overridden `__setstate__`
+    delegating to `super()`, or a class overriding nothing and answering the
+    `getattr` of `__reduce_ex__` through `__getattribute__`. It was also too
+    wide, which is worse: a class defining only `__replace__`, which
+    `copy.copy` never calls, lost the exemption, so its setter ran against
+    state shared with the source and rewrote the source's own `_C` — copying
+    the problem moved the gradient of the object being copied. Which hooks a
+    route consults is a property of the route, and a static list sees only the
+    class. The exemption does not turn on whether the attribute is settable
+    either — excusing an `AttributeError` reopens the same hole behind a
+    read-only property — and leaving a coefficient alone is the reason an
+    expectation is still recorded for every name rather than only the replaced
+    ones.
+    This closes
     substitution, not sabotage: a setter that unfreezes its argument before
     deriving a handle, and an unrooted subclass aliasing storage it built
     itself, stay in the excluded class C-15.7 names. And it

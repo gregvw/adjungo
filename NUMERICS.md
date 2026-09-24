@@ -315,19 +315,86 @@ under [R-11](#r-11) against a 312-test baseline with 0 failures:
 
 | Injected defect | Failing tests |
 |---|---|
-| Contract marks a refused family (`r > 1` multistep) as certified | 1 |
-| Contract downgrades a family the code certifies | 1 |
-| A fabricated family row is appended to the table | 1 |
-| An archived historical report loses its superseded banner | 1 |
-| An archived report is dropped from the `docs/history/` accounting table | 1 |
-| An ad-hoc report reappears in the repository root | 1 |
-| An internal cross-reference anchor is deleted | 1 |
-| `docs/architecture.md` names a module that does not exist | 1 |
-| `docs/architecture.md` omits a module that does exist | 1 |
-| The `glm_opt.tex`-to-code symbol map cites a stale attribute | 1 |
-| The symbol-map table is removed | 1 |
-| `docs/architecture.md` stops recording IMEX as unbuilt | 1 |
-| `docs/architecture.md` lists a certified family as unbuilt | 1 |
+| __setstate__ removed entirely | 61 |
+| __setstate__ restores state but does not re-freeze | 60 |
+| __setstate__ leaves the buffers writeable outright | 53 |
+| Only _M is re-frozen; _C and _b are missed | 57 |
+| __setstate__ assumes a plain dict, breaking __slots__ subclasses | 8 |
+| __setstate__ freezes without restoring ownership | 41 |
+| Verification stops checking the copy-protocol hooks | 8 |
+| __setstate__ dropped from the guarded copy hooks | 2 |
+| __deepcopy__ dropped from the guarded copy hooks | 1 |
+| The mutable-coefficient refusal is removed | 30 |
+| The refusal returns False instead of raising | 24 |
+| The refusal checks writeable but not owndata | 1 |
+| B is reshaped into a view rather than an owning copy | 64 |
+| The freeze is dropped from the constructor as well | 133 |
+| The refusal is ordered last again, behind the quiet checks | 17 |
+| Unreadable storage is skipped rather than refused | 10 |
+| GLMOptimizer stops enforcing validity at construction | 2 |
+| Forward_solve stops enforcing validity at the retention point | 2 |
+| The precondition is method identity alone, without the flag | 3 |
+| The precondition reverts to probing for buffer presence | 12 |
+| The root-initialised flag is read by attribute access | 2 |
+| Both widenings are dropped, leaving the flag alone | 17 |
+| Any inherited reader obliges all three buffers | 3 |
+| F is dropped from the readers that oblige a buffer | 2 |
+| _defined_as reads the MRO through the metaclass | 1 |
+| The presence widening is dropped, leaving reader identity alone | 7 |
+| Presence obliges only names holding an ndarray | 4 |
+| Presence replaces reader identity rather than widening it | 4 |
+| The ndarray-subclass refusal is removed | 2 |
+| The root initialiser converts an ndarray subclass silently | 1 |
+| The object-dtype refusal is removed | 1 |
+| The defensive copy normalises away the buffer's subclass | 1 |
+| The defensive copy dispatches to the buffer's own copy() | 2 |
+| MissingCoefficients always claims the initialiser ran | 3 |
+| The class gate is dropped, catching unrelated problems | 305 |
+| Buffers are read from the instance dict, not by attribute | 27 |
+| The root-initialised flag is never recorded | 3 |
+| The marker is written where it is not read | 1 |
+| Restoration reads coefficients from the instance dict | 19 |
+| Restoration freezes names the instance does not hold | 13 |
+| Restoration trusts the restored marker alone | 20 |
+| Restoration reads the restored keys, not the object | 10 |
+| Restoration does not record what it concluded | 1 |
+| The guard restates the resolution rule as a bare getattr | 1 |
+| A failed replacement always reports the buffer as writeable | 1 |
+| Restoration absorbs only AttributeError from a descriptor | 4 |
+| Restoration replaces a postcondition buffer whatever the record says | 7 |
+| Restoration takes a buffer at the postcondition on trust | 19 |
+| Restoration lets a failed setattr out as it comes | 2 |
+| Each coefficient is copied only when its turn comes | 3 |
+| The record is trusted by name rather than by array identity | 2 |
+| Restoration does not ask about a delegating __setstate__ | 2 |
+| The record is written into the live instance dictionary | 3 |
+| A coefficient the state does not carry is left out of the record | 3 |
+| What travelled is decided by dictionary membership | 9 |
+| The slot mapping is left out of the reachability walk | 1 |
+| A rebuilt state is vouched for by identity alone | 9 |
+| The untravelled marker is never recorded | 4 |
+| The provenance record is never attached to the produced state | 7 |
+| The replacement is frozen in one pass, before setters finish | 3 |
+| The replacement is handed to the setter writeable | 4 |
+| The constructor stops checking what the setter stored | 5 |
+| Restoration stops checking what the setter stored | 11 |
+| Restoration records an expectation only where it replaced | 4 |
+| A replaced coefficient is reported as one that was not assigned | 1 |
+| Restoration blames a name's own setter for a later one's doing | 1 |
+| The constructor blames a name's own setter regardless | 1 |
+| Restoration skips a rooted buffer that still owns its data | 22 |
+| Restoration does not re-enumerate the names afterwards | 1 |
+| Restoration checks each coefficient before the next is set | 3 |
+| The provenance rule compares by value, not identity | 15 |
+| The constructor checks each coefficient before the next is set | 1 |
+| An unmarked buffer is frozen in place, reaching into the source | 25 |
+| A copy hook does not make the walk inconclusive | 6 |
+| A container subclass's own attributes are not walked | 1 |
+| Slots are replayed from the declaration, not the descriptors | 1 |
+| A hook supplied by attribute lookup is not noticed | 1 |
+| Atomicity is decided by isinstance, so subclasses inherit it | 1 |
+| An ndarray subclass is assumed to copy like an ndarray | 1 |
+| An object array is walked as though it held no objects | 1 |
 
 #### Additional evidence for the fully implicit family
 
@@ -1490,6 +1557,373 @@ the way past passes a per-assignment check on every name and still ends up
 holding a substituted `_M` — measured through both paths, and the restoration
 half was written the wrong way round first.
 
+**And the expectation is recorded for every name, not only the ones assigned.**
+Restoration does not replace a coefficient that already satisfies the
+constructor's postcondition, and recording an expectation only where it
+replaced one left the skipped names unexamined. A subclass whose `_C` arrives
+as a view — so it must be replaced — and whose `_M` arrives owning and frozen —
+so it is left alone — can rebuild `_M` from inside `_C`'s setter and keep a
+writeable view of the rebuild. `OBSERVED` on the fixture above at `C = 2`,
+through ordinary construction and `copy.copy` with nothing patched and nothing
+deliberately unfrozen: the copy passed every check restoration makes, and the
+optimizer returned `0.7552125` against a closed-form and independently
+referenced `0.6781500`. Being skipped is not being exempt; it only means the
+expectation is the array that arrived rather than the one restoration made.
+
+**And the names to check are not final until the last setter has run.** They
+were enumerated once, before the assignment loop, so a name that was *absent*
+at that moment was absent from every later check. An unrooted instance can
+gain one: a setter that reconstructs a coefficient the arriving state did not
+carry produces a buffer the root never froze, holding whatever handle the
+setter kept. `OBSERVED`, same fixture and same displacement, with every check
+quiet. Restoration re-enumerates afterwards and records an absent name as
+having been *expected to stay absent*, which is what makes the refusal true
+rather than merely convenient.
+
+The refusal distinguishes four cases, because the remedy does, and *whether a
+name was assigned* does not decide between them. A setter can store its own
+argument faithfully and still be holding a substitute at the end, because a
+later setter replaced it. So the refusal separates: its own setter substituted;
+its own setter was faithful and a later one replaced it; it was never assigned
+and another setter replaced it; and it did not exist when restoration began.
+Naming any of these as another sends the caller to a setter that is behaving
+perfectly, or to one that was never called.
+
+**Nothing is left writeable while a setter can still run.** Restoration used to
+skip a rooted instance's buffer whenever it owned its data, on the reasoning
+that a rooted instance's arrays were frozen already. They are not: `deepcopy`
+and pickle protocol 4 rebuild a coefficient as an owning but *writeable* array,
+and the pass that freezes it runs after every setter. The buffer therefore
+stayed writeable for exactly as long as the other coefficients' setters were
+running, and one of them took a view of it — `OBSERVED`, same fixture, same
+displacement, with the finished object indistinguishable from a correct one:
+the owner frozen, its provenance intact, and the view reachable from no
+coefficient. Only the ordering was wrong. The rule is now uniform — anything
+not already at the postcondition is replaced by a frozen copy before any setter
+runs — which costs one extra copy on the `deepcopy` and protocol-4 routes and
+removes the last moment at which a live coefficient is writeable.
+
+**And *every* copy is taken before the *first* setter runs**, not one name at a
+time. Interleaving them satisfied the rule for the name being assigned and left
+the names after it still holding the writeable arrays `deepcopy` and protocol 4
+hand back. A setter writing into one of those — `self._C[...] = 3.0` from
+inside `_M`'s setter — wrote into the array restoration had not copied yet, so
+the change was carried into the replacement as though it had arrived that way.
+`OBSERVED` through `copy.deepcopy` of the fixture above built at `C = 2`: the
+copy held `C = 3`, owning and frozen, with its provenance intact and
+`affine_dynamics_verified` returning `True`, and it then differentiated exactly
+— for the coefficient nobody asked for, `[1.1265375, 1.0241250]` against the
+source's `[0.6781500, 0.6165000]`. This is the ordering error in its second
+shape: the first version checked at the wrong moment, and the second read at
+the wrong moment.
+
+**And being at the postcondition is not the same as having been put there by
+the constructor.** A buffer arriving owning and frozen was taken as already
+correct and left alone. But if the subclass produced the state, it decides
+what arrives: `__getstate__` can allocate an array, take a writeable view of
+it, freeze the array, and return both. What restoration is then shown
+satisfies every property it checks, and nothing about the finished object
+disagrees — the flags are right, the alias is reachable from no coefficient,
+and identity confirms itself, because the fabricated array is the only one
+restoration ever saw. `OBSERVED`, same fixture and same displacement, through
+`copy.copy` with nothing patched and nothing unfrozen.
+
+So a buffer at the postcondition is left where it is only when the root can
+**vouch** for it. `AffineDynamics.__getstate__` records, in the state it
+returns and under a key of its own, the array each coefficient name resolved to
+at the moment the state was produced — or `None` for a name the state does not
+carry, which is how a coefficient answered from storage outside the state is
+distinguished from one missing altogether. Restoration lifts that record out
+before anything else reads the state, and leaves a coefficient alone only when
+the array that arrived **is** the array recorded, by identity.
+
+Identity survives the honest routes because `deepcopy` and `pickle` memoise by
+identity: an array referenced from both the state and the record is copied once
+and referenced twice, so the correspondence is carried across rather than
+asserted. A substitution in `state["_M"]` breaks it, and so does taking the
+root's own state and replacing an entry in it.
+
+**But identity says where an array came from, not what was done to it on the
+way**, and the exemption needs both. A copy arrives *writeable* — the flag is
+restored only afterwards — so anything else in the state graph copied during
+that window may take a view of it and keep that view after the owner is frozen
+again. Memoisation, which is what carries the record across, carries the record
+across for the aliased copy too, so identity agrees and the exemption is
+granted. `OBSERVED` on the fixture above at `C = 2` with **no subclass at
+all**: a plain `AffineDynamics` carrying an ordinary attribute that keeps a
+flattened view of `M` and rebuilds it in its own `__deepcopy__` verified before
+and after `copy.deepcopy`, the copy's `_M` owning and frozen, a writeable alias
+sharing that memory, and `0.7552125` against an exact `0.6781500`.
+
+So the exemption is granted only to a state that was **handed on unchanged**.
+The record carries a marker under a key no attribute can collide with:
+`copy.copy` passes the mapping's values through, so it arrives as itself, while
+`deepcopy` and every pickle protocol reconstruct it. Nothing that was not
+copied can have been aliased while it was being copied; a rebuilt state has its
+coefficients replaced, which severs any view the traversal left. That costs
+nothing on a rebuilt state — the state is the traversal's own, so no setter it
+runs can reach the object being copied — and on the ordinary deep routes it
+changes nothing at all, because `deepcopy` and protocol 4 hand back writeable
+arrays and protocol 5 a non-owning one, none of which was ever exempt. It binds
+exactly where something re-froze the array mid-traversal, which is the case
+that needs it.
+
+A coefficient the state does not carry keeps its exemption on either route: it
+was not copied, so no traversal can have aliased it. That is the `None`
+sentinel's second job, and a read-only property answering for a coefficient
+depends on it, since assigning one raises.
+
+**What "does not carry" means is reachability, not membership.** Written as
+"the array is not a value of the instance dictionary" it is a much weaker
+statement, and two supported shapes fall through the gap: a coefficient
+answered from inside an ordinary attribute object, and one held in a
+`__slots__` mapping, which is reported separately by `object.__getstate__` and
+appears in the instance dictionary not at all. Both were recorded as never
+having travelled, kept the exemption on a rebuilt state, and came back with a
+companion holding a writeable view of the frozen coefficient — `OBSERVED` on
+the fixture above at `C = 2` through `copy.deepcopy` of each, and through
+pickle protocols 0 to 4 for the first. So the record asks what a traversal of
+the whole produced state — both halves, through containers and through objects
+— could reach, and a view's owner counts as reachable through the view, since
+freezing a view leaves the owner writeable.
+
+Where that walk cannot see inside something, it reports so and the coefficient
+is treated as reachable: a replacement that may not have been needed, and a
+loud refusal where the replacement cannot be stored.
+
+**An object that redefines its own copying makes the walk inconclusive**, and
+that branch has a witness. The walk predicts a traversal from the graph as it
+stands when the state is produced; an object carrying `__deepcopy__`,
+`__reduce__` or any other traversal hook is not predictable from that graph,
+because the hook may build something the graph does not contain. A companion
+that is *empty* when the state is produced, and whose hook then allocates the
+coefficient from storage outside the state, takes a flattened view while the
+fresh array is still writeable and freezes the array behind it, defeats a walk
+that is correct about the state and silent about the copy. Nothing on the
+problem class is overridden, so the hook checks in verification have nothing
+to object to. `OBSERVED` on the fixture above at `C = 2`: the copy verified,
+its `_M` owning and frozen, and the companion holding a writeable alias of it.
+
+So this branch is a cure with a measurement behind it, not the conservative
+default it was first recorded as. Treating the coefficient as reachable turns
+that case from a quiet wrong answer into a named refusal, which is the correct
+outcome for a shape whose coefficient is manufactured by its own duplication.
+
+The walk's *scope* then has to match the traversal's, and eight corrections
+were needed before it did. Each was measured the same way — the hiding place
+restored one at a time, with the others cured — and each on its own gave a
+verified copy holding a writeable alias of its own frozen `_M`, and the
+displaced `0.7552125` against an exact `0.6781500`:
+
+- A **container subclass** was matched as its builtin and its contents walked,
+  but not its own attributes, so a `dict` subclass holding the companion in an
+  instance attribute was invisible.
+- **Slots were replayed from the `__slots__` declaration**, which for the legal
+  bare-string form `__slots__ = "payload"` iterates seven single characters and
+  finds no slot at all. They are now read from the member descriptors the class
+  actually defines, which is what the names resolve to, and which also handles
+  mangled private names.
+- A class-level **`__getattribute__`** can answer a request for `__deepcopy__`
+  with a hook that appears in no class dictionary. A copying route asks by
+  lookup, so the presence of a lookup hook is itself disqualifying. This is not
+  the excluded instance-bound reducer: the behaviour is on the class, and the
+  coefficient descriptor still answers the same way every time.
+- **Atomicity was decided by `isinstance`.** `int` is copied by returning it,
+  but a subclass of `int` carries an instance dictionary that an ordinary copy
+  reconstructs. Atomicity is a property of the exact type.
+- A **subclass of any modelled type that declares anything of its own** need
+  define no listed hook at all. NumPy calls an `ndarray` subclass's
+  `__array_finalize__` while building the new array; a `dict` subclass is not
+  handed its storage whole but rebuilt blank and repopulated item by item, so
+  its `__setitem__` runs on the copy. Either is enough to allocate a
+  coefficient and keep a writeable view of it, and neither name appears in
+  any list of copy-protocol hooks. So the question asked is not *which* names
+  a subclass defines — asking by name is what failed repeatedly above — but
+  whether it defines any, since a subclass declaring nothing is rebuilt
+  exactly as its base is and can materialise nothing the walk cannot already
+  see. Both halves are load-bearing: restricting the rule to `ndarray` leaves
+  the `__setitem__` witness undetected, and removing it leaves both.
+
+  Exactness alone was tried first and was too wide in the costly direction. A
+  problem answering `_M` from a read-only module-level buffer cannot have that
+  coefficient replaced at all, so withholding its exemption is a refusal
+  rather than a copy — and an inert `list`, `dict` or `ndarray` subclass held
+  as incidental metadata was enough to trigger it. `OBSERVED` on the fixture
+  above: each of the three lost every rebuilding route to
+  `MutableCoefficients` naming `_M`, while the same problem without the
+  metadata answered exactly.
+- **`__new__` runs on every rebuilding route** — `copy` and `pickle` alike make
+  the object by calling it before they put any state in — so a companion
+  defining one of its own materialises with nothing else overridden. What it
+  builds has to be held off the instance to witness this, since the state
+  applied afterwards would overwrite it; that detail cost one iteration of the
+  witness, which passed for the wrong reason until it was found.
+- An **object-dtype array** is an exact `ndarray`, so no subclass rule reaches
+  it, and it is a container of Python objects that NumPy copies one by one.
+  Nothing about its shape or dtype says what they are, so it is reported
+  inconclusive rather than walked element by element: the elements of a
+  structured dtype are reached only through its fields, and guessing a
+  traversal is the error the entries above record. A coefficient is refused an
+  object dtype outright, so only a companion reaches this.
+- A **mapping's own `keys` and `values`** describe whatever view of itself it
+  likes; the storage a reducer copies is the one underneath. Contents are read
+  through `dict.keys` and `dict.values` for that reason. This one is now
+  subsumed: any inexact `dict` subclass is inconclusive before its contents
+  are read, and for an exact `dict` the two spellings agree, so the rule is
+  retained as defence in depth with no injection able to witness it.
+
+A class namespace turned out not to be a fixed property of the class, which
+is this clause's recurring error in its sharpest form. `copyreg` caches
+`__slotnames__` **into the class** the first time an instance of it is copied
+or pickled, so a rule reading a namespace answers differently before and
+after the first duplication. `OBSERVED` on the fixture above: the first
+round trip of a problem carrying inert metadata answered exactly and every
+later one raised `MutableCoefficients`, the metadata's class having acquired
+a name in between. Names written by something other than the class's author
+are therefore excluded by name, and the assertion held is that the answer
+does not depend on the round trip's ordinal — which nothing weaker than
+repeating the round trip can check.
+
+The first two are what made the earlier disposition wrong. It had been argued
+that neither was separately observable, on the grounds that the aliasing holder
+must hold the array or a view of it and so is reachable anyway. That is true of
+the *array* and false of the *companion*: the companion can be empty, and it is
+the companion's presence that decides whether the walk is conclusive. Putting
+the companion behind the omitted path — and, for the slot case, giving its
+holder an inherited empty `__dict__` so the walk believes it has something to
+look inside — makes each decide the outcome alone. The lesson is the session's
+recurring one in yet another form: reasoning about what the walk would find,
+rather than running it.
+
+The inconclusive branch must cost a *copy* and never an *answer*, and that
+direction is asserted rather than assumed. The list of things the walk cannot
+predict grew once per finding above, and an over-broad entry is silent: it
+refuses nothing and breaks no test, it merely stops the exemption ever being
+granted. One such widening was made here — every class with instance
+attributes carries a `__dict__` getset descriptor, so treating `__dict__` as a
+lookup hook disqualified almost everything — and it went unnoticed until it
+masked the `__array_finalize__` cure, whose reverted-cure run still refused. A
+supported problem carrying ordinary incidental state of each awkward kind is
+therefore required to verify, own a frozen coefficient and give the closed-form
+gradient through every duplication route.
+
+A class namespace is read through `type.__dict__["__dict__"]` rather than as
+`klass.__dict__`, so a metaclass cannot answer the question with something
+other than the class's own namespace, and the MRO likewise. A `__dict__` that
+is not the ordinary getset descriptor is disqualifying for the same reason as a
+lookup hook, since it decides what the walk gets to read; no witness is known
+for that one, and it is recorded here as a conservative default rather than a
+measured cure.
+
+Two cheaper rules were tried first, and both asked about the wrong thing. Each
+attempted to infer from the class whether the subclass had produced the state,
+by asking which copy-protocol hooks it overrides — `__setstate__`,
+`__getstate__`, `__deepcopy__`, `__copy__`, `__replace__`, `__reduce__`,
+`__reduce_ex__`.
+
+The list was too narrow, twice. First it omitted `__copy__` and `__deepcopy__`,
+on the reasoning that they bypass `__setstate__` altogether; then it omitted
+`__replace__`. They bypass only the reconstruction the protocol would otherwise
+perform; any of them may reconstruct with `__new__` and call the inherited
+`__setstate__` with a state it chose. So may an overridden `__setstate__`
+delegating to `super()`, and so may a class overriding none of them: `copy`
+obtains `__reduce_ex__` with `getattr`, which a class-level `__getattribute__`
+answers. `OBSERVED`, same fixture and same displacement, through five such
+routes.
+
+And the list was also too **wide**, which is the direction that has no repair.
+A class defining only `__replace__` — a hook `copy.copy` never calls — was
+judged to have produced a state it had no part in, so its coefficients were
+replaced and its setter ran. Under `copy.copy` the state objects are *shared
+with the source*: the setter followed a reference `copy.copy` had carried
+across and rewrote the source's own `_C`. `OBSERVED` on the fixture above,
+nothing patched and nothing fabricated: copying the problem moved the gradient
+of the object that was copied from `[0.6781500, 0.6165000]` to
+`[1.1265375, 1.0241250]`.
+
+No list can be right in both directions, because which hooks a route consults
+is a property of the *route*, not of the class, and the class is all a static
+list can see. A record written by the root at the moment the state is produced
+is not a guess about either.
+
+##### A coefficient is vouched for, not inspected
+
+Everything above concerns what restoration does when it runs. A duplication
+hook that never reaches restoration is not covered by any of it, and being
+refused the *affine* route is not the same as being safe: `F` and `G` return
+`_M` and `_C` by identity, the forward solve retains what they return, and the
+general route reads them the same way. Ineligibility changes which solver runs,
+not which array it reads.
+
+So a hook of one's own, doing the plausible thing — deep-copy the state, keep a
+handle on the matrix, freeze the buffers, put them on a fresh object — hands
+back a clone whose `_M` is owning and frozen and whose retained handle is
+writeable, because the clone's coefficients arrive writeable and the flag is
+not something a copy carries. `OBSERVED` on the fixture above at `C = 2`: the
+clone was refused the affine route, passed every check the arrays themselves
+can answer, and gave `0.7552125` against an exact `0.6781500`.
+
+Nothing about the clone's final state distinguishes it from an honest one. The
+arrays are indistinguishable by construction, so validity stops asking them.
+The root records, at the end of its own initialisation and again at the end of
+its own restoration, the exact arrays it established; validity requires that
+the coefficients presented are those arrays, by identity. A clone assembled by
+a route that skipped both cannot produce that evidence and is refused aloud.
+
+Three properties of the register are load-bearing:
+
+- It is **module-level**, so no state carries it, no copy brings it along, and
+  nothing written into a state can forge an entry.
+- It is keyed by the **array**, not by the problem reading it, for the reason
+  given below.
+- It is checked **last**, after the flag checks. Those name a specific defect
+  in a specific buffer; this one reports the absence of evidence, which is a
+  weaker diagnosis and must not mask a precise one. Ordered first, it did.
+- It applies **only to rooted instances**. A subclass that legitimately reads
+  none of the root's buffers never enters the mechanism, and refusing it for
+  not having used something it never touches costs an answer rather than a
+  copy — the direction this clause is most careful about.
+
+The evidence is held against the **array**, not against the problem that was
+holding it. A frozen owning array cannot acquire a writeable alias afterwards
+— a view of it is read-only, and cannot be made otherwise — so reading it from
+a second object is exactly as sound as reading it from the first. Recording
+the pair instead refuses a duplication hook that hands the clone the root's
+own buffers, which manufactures nothing; `OBSERVED` on the fixture above,
+`copy.copy` and `copy.deepcopy` of such a class raised `MutableCoefficients`
+although `clone._M is source._M`, so a supported gradient could not be
+computed at all. Pair evidence would also be lost the moment the original were
+collected while the array it established was still in use. The distinction
+that matters survives: a hook that *rebuilds* the arrays presents ones the
+root never established and is still refused.
+
+Entries are keyed by address, and each carries a weak reference used to
+confirm identity before the record is trusted. That guard is against address
+reuse and has no injection witness, being a race no test can schedule; it is
+recorded here as a defensive check rather than a measured cure.
+
+The alternative was to refuse any duplication override outright, which is
+sound but coarse, or to record the shape as outside the envelope. Positive
+evidence was preferred because it refuses exactly the objects that cannot
+account for themselves, and it was adopted with the coarse refusal as the
+declared fallback.
+
+There is still nothing to establish for a vouched coefficient: those arrays are
+the ones the constructor froze and already checked the provenance of, and
+replacing one means assigning it. The rule was briefly written the other way,
+replacing at the postcondition unconditionally, and that is what the
+`copy.copy` measurement above was taken against. Note
+what it does *not* turn on: whether the attribute happens to be settable.
+Deciding by trying the assignment and excusing an `AttributeError` reopens the
+fabrication hole in another shape — a read-only property over a fabricated
+array — so a subclass with a read-only coefficient property *and* a state hook
+is now refused aloud instead.
+
+Leaving a coefficient alone is why an expectation is recorded for every name
+rather than only the replaced ones: a coefficient left where it is, is one
+another coefficient's setter can still substitute without restoration having
+assigned it.
+
 The cost is narrow and loud. A setter may **relocate** what it is handed — into
 another key, a slot, under any name — and several supported subclasses do. It
 may not store a **substitute**. Two subclasses this clause previously called
@@ -1672,7 +2106,25 @@ that unfreezes the array it is handed, derives a handle from it and freezes it
 again before storing it (`OBSERVED`: on the fixture above at `C = 2`, verified,
 frozen and owning, with a writeable alias sharing its memory, `0.7552125`), or
 a subclass that never calls `super().__init__` and aliases coefficient storage
-it built itself.
+it built itself, or a **reducer bound on the instance** — `self.__reduce_ex__ =
+...`, which `copy` honours because it fetches that hook with `getattr` rather
+than invoking it implicitly. The last cannot be answered where the question
+arises: restoration runs *on the object the state describes*, whose instance
+dictionary holds whatever the arriving state put there, and a reducer that
+fabricates a coefficient omits itself from the state it builds. Rebinding the
+duplication protocol per instance is the same act as rebinding the coefficient
+per instance, and is excluded on the same grounds. Overriding those hooks on
+the **class** is ordinary and is covered above.
+
+Nor does it reach a subclass that **forges the record itself**, writing the
+provenance key into the state it builds so that the array it substituted is the
+array it claims the root resolved. The record is a private key, not a
+signature, and it is kept honest by the same thing that keeps a frozen flag
+honest — nothing intending to be checked defeats it by accident. Nor does it
+reach a coefficient that never travels in the state *and* is manufactured by
+the class each time it is read; that is the inconsistently-answering descriptor
+already excluded above, seen from the restoration side.
+
 These are not separate defects to be closed one at a time. They are the same
 fact about Python, and chasing them costs more than it buys: the only
 construction that would close the first is copying `F` and `G`'s result at
@@ -1704,17 +2156,17 @@ eligible.
 
 #### Injection evidence — `OBSERVED`
 
-Under [R-11](#r-11) against a 722-test baseline with 0 failures, 56 of 56
+Under [R-11](#r-11) against a 793-test baseline with 0 failures, 90 of 90
 injected defects detected. Counts are as emitted by the campaign:
 
 | Injected defect | Failing tests |
 |---|---|
-| `__setstate__` removed entirely | 38 |
-| `__setstate__` restores state but does not re-freeze | 35 |
-| `__setstate__` leaves the buffers writeable outright | 35 |
-| Only `_M` is re-frozen; `_C` and `_b` are missed | 20 |
-| `__setstate__` assumes a plain dict, breaking `__slots__` subclasses | 7 |
-| `__setstate__` freezes without restoring ownership | 24 |
+| `__setstate__` removed entirely | 72 |
+| `__setstate__` restores state but does not re-freeze | 71 |
+| `__setstate__` leaves the buffers writeable outright | 91 |
+| Only `_M` is re-frozen; `_C` and `_b` are missed | 66 |
+| `__setstate__` assumes a plain dict, breaking `__slots__` subclasses | 8 |
+| `__setstate__` freezes without restoring ownership | 46 |
 | Verification stops checking the copy-protocol hooks | 8 |
 | `__setstate__` dropped from the guarded copy hooks | 2 |
 | `__deepcopy__` dropped from the guarded copy hooks | 1 |
@@ -1722,7 +2174,7 @@ injected defects detected. Counts are as emitted by the campaign:
 | The refusal returns `False` instead of raising | 24 |
 | The refusal checks `writeable` but not `owndata` | 1 |
 | `b` is reshaped into a view rather than an owning copy | 64 |
-| The freeze is dropped from the constructor as well | 120 |
+| The freeze is dropped from the constructor as well | 140 |
 | The refusal is ordered last again, behind the quiet checks | 17 |
 | Unreadable storage is skipped rather than refused | 10 |
 | `GLMOptimizer` stops enforcing validity at construction | 2 |
@@ -1733,10 +2185,10 @@ injected defects detected. Counts are as emitted by the campaign:
 | Both widenings are dropped, leaving the flag alone | 17 |
 | Any inherited reader obliges all three buffers | 3 |
 | `F` is dropped from the readers that oblige a buffer | 2 |
-| The presence widening is dropped, leaving reader identity alone | 7 |
-| Presence obliges only a name holding an `ndarray` | 4 |
-| Presence replaces reader identity rather than widening it | 4 |
 | `_defined_as` reads the MRO through the metaclass | 1 |
+| The presence widening is dropped, leaving reader identity alone | 7 |
+| Presence obliges only names holding an ndarray | 4 |
+| Presence replaces reader identity rather than widening it | 4 |
 | The `ndarray`-subclass refusal is removed | 2 |
 | The root initialiser converts an `ndarray` subclass silently | 1 |
 | The object-dtype refusal is removed | 1 |
@@ -1744,27 +2196,61 @@ injected defects detected. Counts are as emitted by the campaign:
 | The defensive copy dispatches to the buffer's own `copy()` | 2 |
 | `MissingCoefficients` always claims the initialiser ran | 3 |
 | The class gate is dropped, catching unrelated problems | 305 |
-| Buffers are read from the instance dict rather than by attribute | 14 |
-| The root-initialised flag is never recorded | 5 |
-| The root-initialised flag is written where it is not read | 1 |
-| Restoration reads coefficients from the instance dict | 14 |
-| Restoration freezes names the instance does not hold | 13 |
-| Restoration trusts the restored flag alone | 21 |
-| Restoration reads the restored keys rather than the object | 11 |
+| Buffers are read from the instance dict, not by attribute | 60 |
+| The root-initialised flag is never recorded | 4 |
+| The marker is written where it is not read | 1 |
+| Restoration reads coefficients from the instance dict | 46 |
+| Restoration freezes names the instance does not hold | 39 |
+| Restoration trusts the restored marker alone | 20 |
+| Restoration reads the restored keys, not the object | 10 |
 | Restoration does not record what it concluded | 1 |
 | The guard restates the resolution rule as a bare `getattr` | 1 |
 | A failed replacement always reports the buffer as writeable | 1 |
 | Restoration absorbs only `AttributeError` from a descriptor | 4 |
-| Restoration replaces a buffer already at the postcondition | 3 |
+| Restoration replaces a postcondition buffer whatever the record says | 33 |
+| Restoration takes a buffer at the postcondition on trust | 23 |
 | Restoration lets a failed `setattr` out as it comes | 2 |
-| The replacement is frozen in one pass, before setters finish | 14 |
-| The replacement is handed to the setter writeable | 1 |
-| An unmarked buffer is frozen in place, reaching into the source | 3 |
+| Each coefficient is copied only when its turn comes | 3 |
+| The record is trusted by name rather than by array identity | 3 |
+| Restoration does not ask about a delegating `__setstate__` | 2 |
+| The record is written into the live instance dictionary | 3 |
+| A coefficient the state does not carry is left out of the record | 29 |
+| What travelled is decided by dictionary membership | 13 |
+| The slot mapping is left out of the reachability walk | 1 |
+| A rebuilt state is vouched for by identity alone | 10 |
+| The untravelled marker is never recorded | 4 |
+| The provenance record is never attached to the produced state | 33 |
+| The replacement is frozen in one pass, before setters finish | 3 |
+| The replacement is handed to the setter writeable | 4 |
 | The constructor stops checking what the setter stored | 5 |
-| Restoration stops checking what the setter stored | 2 |
-| The provenance rule compares by value, not identity | 7 |
+| Restoration stops checking what the setter stored | 14 |
+| Restoration records an expectation only where it replaced | 4 |
+| A replaced coefficient is reported as one that was not assigned | 1 |
+| Restoration blames a name's own setter for a later one's doing | 1 |
+| The constructor blames a name's own setter regardless | 1 |
+| Restoration skips a rooted buffer that still owns its data | 26 |
+| Restoration does not re-enumerate the names afterwards | 1 |
+| Restoration checks each coefficient before the next is set | 3 |
+| The provenance rule compares by value, not identity | 18 |
 | The constructor checks each coefficient before the next is set | 1 |
-| Restoration checks each coefficient before the next is set | 1 |
+| An unmarked buffer is frozen in place, reaching into the source | 29 |
+| A copy hook does not make the walk inconclusive | 9 |
+| A container subclass's own attributes are not walked | 2 |
+| Slots are replayed from the declaration, not the descriptors | 1 |
+| A hook supplied by attribute lookup is not noticed | 1 |
+| Atomicity is decided by isinstance, so subclasses inherit it | 1 |
+| A subclass of a modelled type is assumed to copy like it | 2 |
+| An object array is walked as though it held no objects | 1 |
+| An inconclusive walk refuses rather than replacing | 25 |
+| Only an ndarray subclass copies by rules of its own | 1 |
+| __new__ is not treated as a reconstruction hook | 1 |
+| A subclass __new__ does not withhold the exemption | 1 |
+| Validity asks the arrays alone, not what established them | 1 |
+| Restoration does not record what it established | 40 |
+| A hook no rebuilding route calls makes the walk inconclusive | 1 |
+| Being an inexact subclass is disqualifying on its own | 22 |
+| A name the copy protocol itself writes is read as a declaration | 13 |
+| Establishment is recorded against the problem, not the array | 166 |
 
 Several of these are detected only because their fixtures were changed, and
 the change is the same each time. A guard reached by three mechanisms cannot

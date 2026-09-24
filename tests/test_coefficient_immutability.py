@@ -54,9 +54,11 @@ in closed form rather than merely observed to differ, per C-14.1.
 from __future__ import annotations
 
 import copy
+import functools
 import pickle
+import weakref
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Self, cast
 from unittest import mock
 
 import numpy as np
@@ -1733,6 +1735,11 @@ class DerivesASecondHandleInItsSetter(AffineDynamics):
     def _M(self, value: NDArray) -> None:
         self._stored_M = value
         self.matrix_view = value.view()
+        # Counted so that "the setter ran" can be asserted rather than
+        # inferred. Inferring it from the view no longer sharing the
+        # source's memory would also be satisfied by a route that merely
+        # copied the view, which is a different claim.
+        self.assignments = self.__dict__.get("assignments", 0) + 1
 
 
 class WritesThroughTheDerivedView(OverwritesCoefficientMidSolve):
@@ -1798,33 +1805,48 @@ def test_no_duplication_route_leaves_a_writeable_alias_of_a_coefficient(
         assert gradient == pytest.approx(exact, abs=EXACT_TOL)
 
 
-def test_only_a_non_owning_restoration_reaches_the_replacement() -> None:
-    """Why the routes divide, measured rather than assumed.
+def test_which_routes_run_a_coefficient_setter_during_restoration() -> None:
+    """Which routes exercise the freeze, measured rather than assumed.
 
-    Restoration leaves a rooted instance alone when what it resolves to
-    already owns its data, so the setter never runs and the derived view is
-    whatever duplication produced -- for ``deepcopy`` and protocol 4, an
-    independent array that shares no memory with the coefficient. NumPy
-    reconstructs an array from a default-protocol (5) pickle as a view over
-    the pickle buffer instead, which does not own its data, so restoration
-    replaces it and the setter does run. That is the one route that reached
-    the writeable replacement, and it is the route this fixture must keep
-    exercising if the freeze is to stay tested.
+    Restoration replaces every coefficient not already at the postcondition,
+    and can replace one only by assigning it, so the subclass's setter runs
+    and is handed the frozen replacement. ``deepcopy`` and protocol 4 rebuild
+    a coefficient as an owning but *writeable* array and the default protocol
+    (5) as a view over the pickle buffer, so all three replace.
+
+    ``copy.copy`` passes the state objects straight through, so a verified
+    instance's coefficients arrive owning and frozen and are left where they
+    are -- and left deliberately, since assigning them would run this setter
+    against state shared with the source. A buffer at the postcondition is
+    replaced only when the subclass produced the state itself and could
+    therefore have fabricated it; see
+    ``test_restoration_does_not_take_a_fabricated_coefficient_on_trust``.
+
+    Counted at the setter rather than inferred from the object afterwards.
+    The earlier form of this test asked whether the restored view still
+    shared the source's memory, which ``deepcopy`` and pickle also make false
+    by copying the view itself -- so it would have reported the right answer
+    for the wrong reason, and gone on reporting it if the setter stopped
+    being called.
     """
-    reaches_the_setter = {
+    routes = {
+        "copy": copy.copy,
         "deepcopy": copy.deepcopy,
         "pickle-4": lambda p: pickle.loads(pickle.dumps(p, 4)),
         "pickle-default": lambda p: pickle.loads(pickle.dumps(p)),
     }
-    shares = {
-        route: np.shares_memory(
-            (restored := duplicate(DerivesASecondHandleInItsSetter(M_CONST, C_DOUBLED)))
-            .matrix_view,
-            restored._M,
-        )
-        for route, duplicate in reaches_the_setter.items()
+    ran = {}
+    for route, duplicate in routes.items():
+        source = DerivesASecondHandleInItsSetter(M_CONST, C_DOUBLED)
+        restored = duplicate(source)
+        ran[route] = restored.assignments - source.assignments
+
+    assert ran == {
+        "copy": 0,
+        "deepcopy": 1,
+        "pickle-4": 1,
+        "pickle-default": 1,
     }
-    assert shares == {"deepcopy": False, "pickle-4": False, "pickle-default": True}
 
 
 def test_a_subclass_reading_none_of_the_root_buffers_is_left_alone() -> None:
@@ -2156,15 +2178,27 @@ class CopiesDerivesThenMatchesTheFlag(AffineDynamics):
 
 
 @pytest.mark.parametrize(
-    "factory",
+    ("factory", "blamed"),
     [
-        pytest.param(CopiesIntoItsOwnStorage, id="stores-a-copy"),
-        pytest.param(RebuildsAnotherCoefficient, id="rebuilds-another"),
-        pytest.param(CopiesDerivesThenMatchesTheFlag, id="stores-a-copy-it-aliases"),
+        pytest.param(
+            CopiesIntoItsOwnStorage,
+            "does not store the array it is handed",
+            id="stores-a-copy",
+        ),
+        pytest.param(
+            RebuildsAnotherCoefficient,
+            "its own setter stored what it was given",
+            id="rebuilds-another",
+        ),
+        pytest.param(
+            CopiesDerivesThenMatchesTheFlag,
+            "does not store the array it is handed",
+            id="stores-a-copy-it-aliases",
+        ),
     ],
 )
 def test_a_setter_that_substitutes_its_own_storage_is_refused(
-    factory: type[AffineDynamics],
+    factory: type[AffineDynamics], blamed: str
 ) -> None:
     """The provenance rule, and why freezing alone could not replace it.
 
@@ -2188,7 +2222,12 @@ def test_a_setter_that_substitutes_its_own_storage_is_refused(
     with pytest.raises(SubstitutedCoefficients) as refusal:
         factory(M_CONST, C_CONST)
 
-    assert "does not store the array it is handed" in str(refusal.value)
+    # Per fixture, because the three do not fail the same way and a refusal
+    # that named the wrong setter would send the caller to one behaving
+    # perfectly. ``RebuildsAnotherCoefficient`` stores ``_M`` faithfully and
+    # loses it to ``_C``'s setter afterwards; blaming ``_M``'s own setter
+    # there was wrong.
+    assert blamed in str(refusal.value)
     assert "before calling super().__init__" in str(refusal.value)
 
 
@@ -2236,22 +2275,39 @@ def test_restoration_refuses_a_substitution_the_constructor_never_saw() -> None:
     ``__setstate__``, so the constructor's refusal never runs and only
     restoration's does.
 
-    ``copy`` and ``deepcopy`` are absent here deliberately, and their absence
-    is asserted rather than assumed: both hand back an array that already
-    owns its data, which a rooted restoration leaves in place without calling
-    any setter. Nothing is substituted because nothing is assigned.
+    ``deepcopy`` refuses it too and ``copy.copy`` does not, and both are
+    asserted rather than assumed. ``deepcopy`` rebuilds the coefficient
+    owning but writeable, which is not the postcondition, so restoration
+    replaces it and the setter runs. ``copy.copy`` hands back the source's
+    own frozen, owning array: nothing is assigned, so nothing is
+    substituted, and the class this instance acquired never gets to act.
     """
     problem = AffineDynamics(M_CONST, C_CONST)
     problem.__dict__["_store"] = problem.__dict__["_M"]
     problem.__class__ = CopiesIntoItsOwnStorage
 
-    with pytest.raises(SubstitutedCoefficients, match="'_M'"):
+    with pytest.raises(SubstitutedCoefficients, match="'_M'") as refusal:
         pickle.loads(pickle.dumps(problem))
 
-    for untouched in (copy.copy, copy.deepcopy):
-        duplicate = untouched(problem)
-        assert duplicate.__dict__["_store"] is duplicate.__dict__["_M"]
-        assert not duplicate._M.flags.writeable
+    # Restoration assigned this one, so the remedy belongs to its own setter.
+    # The wording is asserted because the companion case -- a coefficient
+    # replaced by *another* setter, which restoration never assigned -- reads
+    # the opposite way, and reporting either as the other sends the caller to
+    # a setter that is behaving correctly.
+    assert "does not store the array it is handed" in str(refusal.value)
+    assert "was not assigned" not in str(refusal.value)
+
+    with pytest.raises(SubstitutedCoefficients, match="'_M'"):
+        copy.deepcopy(problem)
+
+    shallow = copy.copy(problem)
+    assert shallow.__dict__["_store"] is shallow.__dict__["_M"]
+    assert not shallow._M.flags.writeable
+
+    # And the source is left as the caller had it, which is the thing a
+    # refusal during duplication must not quietly change.
+    assert problem.__dict__["_store"] is problem.__dict__["_M"]
+    assert not problem._M.flags.writeable
 
 
 def test_restoration_also_checks_provenance_after_every_setter() -> None:
@@ -2276,6 +2332,1684 @@ def test_restoration_also_checks_provenance_after_every_setter() -> None:
         pickle.loads(pickle.dumps(problem))
 
 
+class RebuildsACoefficientRestorationLeftAlone(AffineDynamics):
+    """Substitutes the one coefficient restoration does not assign.
+
+    Restoration leaves a coefficient where it is when it already owns its
+    storage, is already frozen, and the arriving state is the instance's own
+    -- there is nothing to establish and assigning it would run this setter
+    against state ``copy.copy`` shares with the source. ``_M`` is exactly
+    that. ``_C`` is held as a frozen *view*, so it is not at the
+    postcondition and must be replaced, and its setter then rebuilds ``_M``
+    and keeps a view of the rebuild.
+
+    So the substituted coefficient is the one nothing assigned, which is why
+    an expectation is recorded for every name rather than only the replaced
+    ones. Built without the root initialiser so that ``_C`` can be a view at
+    construction: the guard refuses such an instance, but nothing obliges a
+    caller to run the guard before duplicating it, and duplication must not
+    turn an instance the guard refuses into one that passes.
+    """
+
+    def __init__(self, M: NDArray, C: NDArray) -> None:
+        m = np.array(M, dtype=float)
+        base = np.array(C, dtype=float)
+        b = np.zeros(m.shape[0])
+        for arr in (m, base, b):
+            arr.flags.writeable = False
+        self.__dict__["_M"] = m
+        self._C = base[...]
+        self._b = b
+        self._nu = int(base.shape[1])
+
+    @property
+    def _C(self) -> NDArray:  # type: ignore[override]
+        return self._cstore  # type: ignore[no-any-return]
+
+    @_C.setter
+    def _C(self, value: NDArray) -> None:
+        replacing = "_cstore" in self.__dict__
+        self.__dict__["_cstore"] = value
+        if replacing:
+            rebuilt = np.array(self.__dict__["_M"], dtype=float)
+            self.matrix_view = rebuilt.view()
+            rebuilt.flags.writeable = False
+            self.__dict__["_M"] = rebuilt
+
+
+def test_restoration_checks_the_coefficient_it_left_alone() -> None:
+    """A coefficient left where it is, is still one another setter can rebuild.
+
+    Restoration recorded an expected identity only for the names it replaced,
+    so a coefficient it left alone was never examined afterwards and any
+    other coefficient's setter could substitute it freely -- here ``_C``'s,
+    which rebuilds ``_M`` and keeps a writeable view of the rebuild. What a
+    surviving alias then costs is measured in the sibling tests above; what
+    is asserted here is that restoration refuses, and names the coefficient
+    nothing assigned.
+
+    Every name's identity is now recorded before any setter runs, whether or
+    not restoration is going to replace it. The refusal names ``_M`` and says
+    it was not assigned but replaced -- the remedy belongs to ``_C``'s setter,
+    and pointing at ``_M``'s would point at a setter that does not exist.
+    """
+    source = RebuildsACoefficientRestorationLeftAlone(M_CONST, C_DOUBLED)
+    held = source.__dict__["_M"]
+
+    with pytest.raises(SubstitutedCoefficients, match="'_M'") as refusal:
+        copy.copy(source)
+
+    assert "was not assigned" in str(refusal.value)
+    assert "another coefficient's setter replaced it" in str(refusal.value)
+
+    # And the refusal left the source as the caller had it: a duplication
+    # that refuses must not have rewritten the object being duplicated.
+    assert source.__dict__["_M"] is held
+
+
+class AliasesACoefficientRestorationSkipped(AffineDynamics):
+    """Takes a view of ``_M`` while ``_M`` is still writeable.
+
+    ``__getstate__`` is what arranges the two different arrivals this needs.
+    ``_M`` is serialised as an ordinary array, so it comes back owning but
+    *writeable*; ``_cstore`` is serialised as a view, so it comes back owning
+    nothing and must be replaced. Restoration therefore runs ``_C``'s setter
+    at a moment when ``_M`` is a writeable array, and the setter takes a view
+    of it.
+
+    Nothing about the finished object records that. ``_M`` is the array
+    restoration resolved, so its provenance is intact; the freezing pass
+    makes it read-only, so its flags are right; and the view is reachable
+    from no coefficient. Only the ordering was wrong.
+    """
+
+    @property
+    def _C(self) -> NDArray:
+        return self._cstore  # type: ignore[no-any-return]
+
+    @_C.setter
+    def _C(self, value: NDArray) -> None:
+        replacing = "_cstore" in self.__dict__
+        self._cstore = value
+        if replacing:
+            self.matrix_view = self.__dict__["_M"].view()
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_M"] = np.array(state["_M"], dtype=float)
+        state["_cstore"] = state["_cstore"].view()
+        return state
+
+
+def test_restoration_leaves_no_coefficient_writeable_while_setters_run() -> None:
+    """Freezing at the end is not the same as freezing before, C-15.7.
+
+    Restoration skipped a rooted instance's buffer whenever it owned its
+    data, on the reasoning that a rooted instance's arrays were frozen
+    already. They are not: ``deepcopy`` and protocol 4 rebuild them owning
+    and writeable, and the freezing pass that fixes that runs *after* every
+    setter. So the buffer stayed writeable for exactly as long as the other
+    coefficients' setters were running, and one of them took a view of it.
+
+    The guard saw nothing wrong, because by then there was nothing wrong to
+    see -- the owner was frozen and was the array restoration resolved. On
+    the C-15.7 fixture at ``C = 2`` the optimizer returned the closed form
+    displaced by ``h^2 C y2 (M' - M)``.
+
+    Anything not already at the postcondition is now replaced by a frozen
+    copy before any setter runs, so the view the setter takes is a view of a
+    read-only array and the write is refused where it is made.
+    """
+    restored = copy.copy(AliasesACoefficientRestorationSkipped(M_CONST, C_DOUBLED))
+    require_immutable_coefficients(restored)
+
+    view = restored.matrix_view
+    assert np.shares_memory(view, restored._M)
+    assert not view.flags.writeable
+
+    exact, displacement = _closed_form(2.0)
+    assert displacement == pytest.approx(0.0770625, abs=EXACT_TOL)
+    with pytest.raises(ValueError, match="read-only"):
+        _gradient(restored, WritesThroughTheSubstitutedView(restored))
+
+    # And with the write removed the gradient is the closed form, so the
+    # refusal above is the write being stopped rather than the solve failing.
+    assert np.asarray(
+        _gradient(restored, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+class BuildsACoefficientDuringRestoration(AffineDynamics):
+    """Arrives without ``_M`` and reconstructs it from a setter.
+
+    ``__getstate__`` drops ``_M`` and the root's marker and carries a seed in
+    their place, so restoration begins on an instance that resolves no ``_M``
+    at all and is not recognisably rooted. ``_C``'s setter then builds ``_M``
+    from the seed, freezes it, and keeps a view taken before the freeze.
+
+    The names to check were settled before the first setter ran, and ``_M``
+    was not among them, so nothing ever looked at it. It is the absence that
+    has to be recorded for the refusal to be true.
+    """
+
+    @property
+    def _C(self) -> NDArray:
+        return self._cstore  # type: ignore[no-any-return]
+
+    @_C.setter
+    def _C(self, value: NDArray) -> None:
+        replacing = "_cstore" in self.__dict__
+        self._cstore = value
+        if replacing:
+            rebuilt = np.array(self.__dict__["_seed"], dtype=float)
+            self.matrix_view = rebuilt.view()
+            rebuilt.flags.writeable = False
+            self.__dict__["_M"] = rebuilt
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_seed"] = np.array(state["_M"], dtype=float)
+        del state["_M"]
+        state.pop("_affine_root_initialised", None)
+        state["_cstore"] = state["_cstore"].view()
+        return state
+
+
+class MutatesThePendingCoefficient(AffineDynamics):
+    """Writes into a coefficient restoration has not copied yet.
+
+    ``_M``'s setter reaches for ``_C`` and writes into it if it is still
+    writeable. On an instance this class constructed it never is, so ordinary
+    construction is unaffected. During restoration it is: ``deepcopy`` and
+    protocol 4 hand back writeable arrays, and a coefficient later in the
+    order was still one of them while an earlier name's setter ran.
+    """
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        return self.__dict__["_mstore"]  # type: ignore[no-any-return]
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        pending = self.__dict__.get("_C")
+        if pending is not None and pending.flags.writeable:
+            pending[...] = 3.0
+        self.__dict__["_mstore"] = value
+
+
+def test_restoration_copies_every_coefficient_before_any_setter_runs() -> None:
+    """A setter must not be able to write into a coefficient not yet copied.
+
+    Restoration copied, froze and assigned one name at a time, so while the
+    first name's setter ran, the coefficients after it were still the
+    writeable arrays ``deepcopy`` and protocol 4 produce. A setter writing
+    into one of those wrote into the array the loop was about to copy, and
+    the change was carried into the replacement as though it had arrived that
+    way. `OBSERVED` on the C-15.7 fixture built at ``C = 2`` and duplicated
+    with ``copy.deepcopy``: the copy held ``C = 3``, owning, frozen, with its
+    provenance intact, and ``affine_dynamics_verified`` returned ``True``. It
+    then differentiated exactly -- for the coefficient nobody asked for,
+    returning ``[1.1265375, 1.0241250]`` where the source gives
+    ``[0.6781500, 0.6165000]``.
+
+    Every copy is now taken and frozen before the first setter runs, so what
+    the setters are handed is the state as it arrived.
+    """
+    source = MutatesThePendingCoefficient(M_CONST, C_DOUBLED)
+    exact, _ = _closed_form(2.0)
+    substituted, _ = _closed_form(3.0)
+    assert np.asarray(substituted) != pytest.approx(exact, abs=EXACT_TOL)
+
+    for route in (copy.deepcopy, lambda p: pickle.loads(pickle.dumps(p, 4))):
+        restored = route(source)
+        require_immutable_coefficients(restored)
+        assert restored._C == pytest.approx(C_DOUBLED, abs=EXACT_TOL)
+        assert np.asarray(
+            _gradient(restored, OverwritesCoefficientMidSolve(None))
+        ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def _restore_a_fabrication(problem: AffineDynamics) -> Any:
+    """Reconstruct with ``__new__`` and restore from a fabricated state."""
+    fresh = type(problem).__new__(type(problem))
+    fresh.__setstate__(_fabricated_state(problem))
+    return fresh
+
+
+class CopiesItselfWithAFabrication(AffineDynamics):
+    """Reconstructs and restores itself, supplying a fabricated coefficient.
+
+    ``__copy__`` replaces what ``copy.copy`` *does*, which is not the same as
+    bypassing restoration: this one reconstructs with ``__new__`` and calls
+    the inherited ``__setstate__`` itself, with a state it chose.
+    """
+
+    def __copy__(self) -> Any:
+        return _restore_a_fabrication(self)
+
+
+class DeepCopiesItselfWithAFabrication(AffineDynamics):
+    """The same, through ``__deepcopy__``."""
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Any:
+        return _restore_a_fabrication(self)
+
+
+class ReplacesItselfWithAFabrication(AffineDynamics):
+    """The same, through ``__replace__`` -- the hook ``copy.replace`` calls."""
+
+    def __replace__(self, **changes: Any) -> Any:
+        return _restore_a_fabrication(self)
+
+
+class DelegatesAFabricatedState(AffineDynamics):
+    """The same, from an overridden ``__setstate__`` delegating to ``super``.
+
+    No duplication hook is overridden at all here. The subclass simply
+    rewrites the state on its way to the root's restoration, which is the
+    same act by the shortest possible route.
+    """
+
+    def __setstate__(self, state: Any) -> None:
+        fabricated = dict(state)
+        owner = np.array(fabricated["_M"], dtype=float)
+        fabricated["matrix_view"] = owner.view()
+        owner.flags.writeable = False
+        fabricated["_M"] = owner
+        super().__setstate__(fabricated)
+
+
+@pytest.mark.parametrize(
+    ("subclass", "route"),
+    (
+        (CopiesItselfWithAFabrication, copy.copy),
+        (DeepCopiesItselfWithAFabrication, copy.deepcopy),
+        (ReplacesItselfWithAFabrication, copy.replace),
+        (DelegatesAFabricatedState, copy.copy),
+    ),
+    ids=("copy", "deepcopy", "replace", "setstate"),
+)
+def test_restoration_refuses_a_coefficient_the_record_does_not_vouch_for(
+    subclass: type[AffineDynamics],
+    route: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """Replacing what a route does is not bypassing the route's restoration.
+
+    Each of these reconstructs and restores itself, or rewrites the state on
+    its way to ``super()``, handing restoration a coefficient the root never
+    made together with a writeable alias of it. `OBSERVED` on the C-15.7
+    fixture at ``C = 2``, each through its own route with nothing patched:
+    the fabricated ``_M`` was left where it lay, its alias still addressed
+    the coefficient the solve reads, and the optimizer returned the closed
+    form displaced by ``h^2 C y2 (M' - M)``.
+
+    None of the four is visible as "the subclass produced the state" without
+    guessing, which is why nothing guesses: the root's own ``__getstate__``
+    records the array each coefficient resolved to, and a coefficient is left
+    where it is only when the array that arrived is the one recorded. Each of
+    these substitutes that array, so none is vouched for.
+    """
+    restored = route(subclass(M_CONST, C_DOUBLED))
+    require_immutable_coefficients(restored)
+
+    assert not np.shares_memory(restored.matrix_view, restored._M)
+
+    exact, displacement = _closed_form(2.0)
+    assert displacement == pytest.approx(0.0770625, abs=EXACT_TOL)
+    assert np.asarray(
+        _gradient(restored, WritesThroughTheSubstitutedView(restored))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+@pytest.mark.parametrize(
+    "route",
+    (
+        copy.copy,
+        copy.deepcopy,
+        lambda problem: pickle.loads(pickle.dumps(problem)),
+    ),
+    ids=("copy", "deepcopy", "pickle"),
+)
+def test_the_provenance_record_is_a_message_and_not_part_of_the_state(
+    route: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """It travels from ``__getstate__`` to ``__setstate__`` and stops there.
+
+    The record exists so that restoration can tell an array the root resolved
+    from one a subclass substituted. It is not a property of the problem, and
+    two ways of writing it would make it one: attaching it to the mapping
+    ``object.__getstate__`` returns, which without ``__slots__`` *is* the live
+    instance dictionary, and lifting it after the state has been merged rather
+    than before.
+
+    Either leaves a private key holding strong references to the coefficients
+    on an object the caller owns, where it is visible to introspection, is
+    carried into the next state as ordinary data, and is deep-copied as
+    though it were a coefficient. Neither changes an answer, which is exactly
+    why it is asserted here: ``__getstate__`` does not modify the object it is
+    asked about, and nothing restored carries the record.
+    """
+    source = AffineDynamics(M_CONST, C_DOUBLED)
+    before = set(source.__dict__)
+
+    restored = route(source)
+
+    assert affine._STATE_PROVENANCE not in source.__dict__
+    assert set(source.__dict__) == before
+    assert affine._STATE_PROVENANCE not in restored.__dict__
+    require_immutable_coefficients(restored)
+
+
+class KeepsAFlattenedView:
+    """An ordinary companion object, not a coefficient and not a subclass.
+
+    It holds a flattened view of the matrix and rebuilds that view when it is
+    deep-copied, restoring the flag the original carried. Nothing about it is
+    contrived: rebuilding a derived view after a copy is what such an object
+    has to do, and a copy arrives writeable, so the view is taken while the
+    array still is.
+    """
+
+    def __init__(self, matrix: NDArray) -> None:
+        self.matrix = matrix
+        self.flat = matrix.reshape(-1)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> KeepsAFlattenedView:
+        was = self.matrix.flags.writeable
+        matrix = copy.deepcopy(self.matrix, memo)
+        matrix.flags.writeable = True
+        clone = KeepsAFlattenedView.__new__(KeepsAFlattenedView)
+        memo[id(self)] = clone
+        clone.matrix = matrix
+        clone.flat = matrix.reshape(-1)
+        matrix.flags.writeable = was
+        return clone
+
+
+_EXTERNALLY_HELD: list[NDArray] = []
+
+
+class MaterialisesTheCoefficientWhenCopied:
+    """A companion that builds a coefficient the state never carried.
+
+    It is empty until it is copied. Its hook then allocates the matrix from
+    storage held outside the state, takes a flattened view while the fresh
+    array is still writeable, and freezes the array behind the view. Nothing
+    on the problem class is overridden, so verification has no hook of its
+    own to object to.
+    """
+
+    def __init__(self) -> None:
+        self.matrix: NDArray | None = None
+        self.flat: NDArray | None = None
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> MaterialisesTheCoefficientWhenCopied:
+        clone = MaterialisesTheCoefficientWhenCopied.__new__(
+            MaterialisesTheCoefficientWhenCopied
+        )
+        memo[id(self)] = clone
+        matrix = copy.deepcopy(_EXTERNALLY_HELD[0], memo)
+        matrix.flags.writeable = True
+        clone.matrix = matrix
+        clone.flat = matrix.reshape(-1)
+        matrix.flags.writeable = False
+        return clone
+
+
+class AnswersFromStorageOutsideTheState(AffineDynamics):
+    """``_M`` is answered from storage the state genuinely does not carry."""
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        held = self.__dict__.get("_mat")
+        if held is not None and held.matrix is not None:
+            return held.matrix  # type: ignore[no-any-return]
+        return _EXTERNALLY_HELD[0]
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        self.__dict__.setdefault("_mat", MaterialisesTheCoefficientWhenCopied())
+        if _EXTERNALLY_HELD:
+            _EXTERNALLY_HELD[0] = value
+        else:
+            _EXTERNALLY_HELD.append(value)
+
+
+def test_a_walk_cannot_vouch_for_a_graph_a_copy_hook_will_build() -> None:
+    """The walk predicts the traversal from the graph as it stands.
+
+    An object that redefines how it is copied is not predictable from that
+    graph. This companion is *empty* when the state is produced, so the
+    coefficient really is unreachable and really was recorded ``None`` -- and
+    the record was right about the state and wrong about the copy, because
+    the hook then built both a coefficient and a writeable view of it that
+    the walk could not have seen.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2`` with no hook overridden on
+    the problem class: the copy verified, its ``_M`` owning and frozen, and
+    ``_mat.flat`` a writeable alias sharing that memory.
+
+    So an object defining a traversal hook makes the walk inconclusive, and
+    an inconclusive walk treats every coefficient as reachable. Here that
+    turns the quiet result into a loud one: the replacement is attempted, the
+    setter cannot store it where ``_M`` will be read from, and the
+    substitution is named. A refusal is the correct outcome for a shape whose
+    coefficient is manufactured by its own duplication.
+    """
+    _EXTERNALLY_HELD.clear()
+    source = AnswersFromStorageOutsideTheState(M_CONST, C_DOUBLED)
+    assert affine_dynamics_verified(source)
+    assert source._M is _EXTERNALLY_HELD[0], "the state must not carry it"
+
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    with pytest.raises(SubstitutedCoefficients, match="_M"):
+        copy.deepcopy(source)
+
+
+def _answer_from_outside(held: Any) -> NDArray:
+    """``_M`` as answered by every fixture below.
+
+    The coefficient lives in storage the produced state genuinely does not
+    carry, until a companion materialises one of its own.
+    """
+    if held is not None and held.matrix is not None:
+        return held.matrix  # type: ignore[no-any-return]
+    return _EXTERNALLY_HELD[0]
+
+
+def _hold_outside(value: NDArray) -> None:
+    if _EXTERNALLY_HELD:
+        _EXTERNALLY_HELD[0] = value
+    else:
+        _EXTERNALLY_HELD.append(value)
+
+
+class BoxDict(dict[str, Any]):
+    """A container subclass carrying the companion as an attribute.
+
+    Its *contents* are empty. Walking only what iterating it yields reaches
+    nothing, so the companion is reachable through the subclass's own
+    instance dictionary and through nothing else.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.payload = MaterialisesTheCoefficientWhenCopied()
+
+
+class HasAnInstanceDictionary:
+    """A base declaring no slots, so its subclasses get a ``__dict__``."""
+
+
+class BoxSlot(HasAnInstanceDictionary):
+    """A companion holder declaring its slot as a bare string.
+
+    ``__slots__ = "payload"`` is legal and declares one slot named
+    ``payload``; iterating the declaration yields seven single characters and
+    finds no slot at all. The inherited instance dictionary is what makes
+    this case sharp: it is empty, but its presence means the walk believes it
+    has something to look inside and does not fall back on reporting that it
+    could not see. So the companion is reachable through the slot and through
+    nothing else, and the walk concludes, wrongly, that it is not reachable.
+    """
+
+    # Deliberately the bare-string form this test exists to cover.
+    __slots__ = "payload"  # noqa: PLC0205
+
+    def __init__(self) -> None:
+        self.payload = MaterialisesTheCoefficientWhenCopied()
+
+
+class SuppliesItsCopyHookOnDemand:
+    """A companion whose ``__deepcopy__`` is written down in no class.
+
+    ``copy.deepcopy`` asks for the hook by attribute lookup, so a class-level
+    ``__getattribute__`` can answer with one that appears in no class
+    dictionary. The behaviour is defined on the class, not bound to the
+    instance, and every read answers the same way.
+    """
+
+    def __init__(self) -> None:
+        self.matrix: NDArray | None = None
+        self.flat: NDArray | None = None
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "__deepcopy__":
+            return lambda memo: copy.deepcopy(
+                MaterialisesTheCoefficientWhenCopied(), memo
+            )
+        return object.__getattribute__(self, name)
+
+
+class IntBox(int):
+    """A subclass of an atomic type, which is therefore not atomic.
+
+    ``int`` is copied by returning it, and a walk that treats every
+    ``isinstance`` of it the same way stops here. A subclass carries an
+    instance dictionary that an ordinary copy reconstructs.
+    """
+
+
+class FinalisingArray(np.ndarray):
+    """An ``ndarray`` companion that materialises through NumPy's own hook.
+
+    It defines no hook of its own at all -- not a copy hook, and
+    deliberately not ``__new__`` either, so that nothing but its being an
+    inexact subclass of a modelled type can tell the walk to expect
+    something it cannot see. NumPy calls ``__array_finalize__`` while
+    building the new array, which is enough to allocate a coefficient and
+    keep a writeable view of it.
+    """
+
+    def __array_finalize__(self, parent: Any) -> None:
+        if parent is None:
+            return
+        self.matrix = None
+        self.flat_alias = None
+        if _EXTERNALLY_HELD and isinstance(parent, FinalisingArray):
+            matrix = np.array(_EXTERNALLY_HELD[0], copy=True)
+            self.matrix = matrix
+            self.flat_alias = matrix.reshape(-1)
+            matrix.flags.writeable = False
+
+
+def _blank_finalising_array() -> FinalisingArray:
+    """Built by viewing, so the subclass need define no ``__new__``."""
+    blank = np.zeros(1).view(FinalisingArray)
+    blank.matrix = None
+    blank.flat_alias = None
+    return blank
+
+
+def _round_trip_through_pickle(
+    protocol: int, problem: AffineDynamics
+) -> AffineDynamics:
+    """The protocols differ in what they hand back, so each is exercised."""
+    return cast(
+        "AffineDynamics", pickle.loads(pickle.dumps(problem, protocol))
+    )
+
+
+class CarriesOrdinaryMetadata(AffineDynamics):
+    """A supported problem carrying incidental state of every awkward kind.
+
+    Nothing here is a companion: the object array holds labels, the nested
+    mapping holds notes. Each is a shape the reachability walk now treats as
+    inconclusive, and an inconclusive walk withholds the ``None`` exemption
+    and replaces the coefficient -- which for an ordinary problem is simply a
+    copy it did not need, and must not be a refusal.
+    """
+
+    def __init__(self, matrix: NDArray, control: NDArray) -> None:
+        super().__init__(matrix, control)
+        self.labels = np.array(["alpha", None], dtype=object)
+        self.notes = {"counts": [1, (2, 3)], "scratch": np.zeros(2)}
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param(lambda p: p, id="as-constructed"),
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        *[
+            pytest.param(
+                functools.partial(_round_trip_through_pickle, protocol),
+                id=f"pickle-p{protocol}",
+            )
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        ],
+    ],
+)
+def test_incidental_state_does_not_cost_a_supported_problem_its_answer(
+    duplicate: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """The inconclusive branch must cost a copy, never an answer.
+
+    The walk reports inconclusive for anything it cannot predict, and the
+    list of such things grew each time a companion was found hiding behind
+    one. That list has to stay on the right side of the ordinary case, and
+    the danger is silent: an over-broad rule refuses nothing and breaks no
+    test, it just stops the exemption ever being granted. One such widening
+    was made here and went unnoticed until it masked an unrelated cure, so
+    the ordinary direction is asserted rather than assumed.
+
+    Every supported duplication route must return a problem that verifies,
+    owns a frozen ``_M``, and gives the closed-form gradient exactly.
+    """
+    problem = duplicate(CarriesOrdinaryMetadata(M_CONST, C_DOUBLED))
+
+    assert affine_dynamics_verified(problem)
+    assert problem._M.flags.owndata
+    assert not problem._M.flags.writeable
+
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        _gradient(problem, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+class FiltersItsOwnContents(dict[str, Any]):
+    """A mapping whose ``keys`` and ``values`` describe a view of its own.
+
+    The storage a reducer copies is the one underneath, reached through
+    ``dict.keys`` and ``dict.values``. Asking the subclass instead lets it
+    answer for a mapping that is not the one being duplicated.
+    """
+
+    def keys(self) -> Any:
+        return ()
+
+    def values(self) -> Any:
+        return ()
+
+
+class HidesTheCompanionBehindAFilteringMapping(AffineDynamics):
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        box = self.__dict__.get("box")
+        if box is None:
+            return _EXTERNALLY_HELD[0]
+        return _answer_from_outside(dict.__getitem__(box, "payload"))
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        if "box" not in self.__dict__:
+            box = FiltersItsOwnContents()
+            dict.__setitem__(
+                box, "payload", MaterialisesTheCoefficientWhenCopied()
+            )
+            self.__dict__["box"] = box
+        _hold_outside(value)
+
+
+#: Coefficients manufactured by :class:`ManufacturesItselfOnConstruction`,
+#: keyed by the instance they belong to, which is storage no state carries.
+_MANUFACTURED: dict[int, tuple[NDArray, NDArray | None]] = {}
+_TEMPLATE: list[NDArray] = []
+
+
+class ManufacturesItselfOnConstruction(AffineDynamics):
+    """A subclass whose own ``__new__`` builds the object restoration gets.
+
+    ``__new__`` runs before ``__setstate__`` on every rebuilding route, and
+    nothing about the state says what it did. Here it allocates a frozen
+    coefficient and keeps a writeable view of it, so a restoration that
+    trusted the state's account of what travelled would find the
+    manufactured buffer already at the postcondition and leave it alone.
+    """
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Self:
+        blank = super().__new__(cls)
+        if _TEMPLATE:
+            owner = np.array(_TEMPLATE[0], copy=True)
+            alias = owner.reshape(-1)
+            owner.flags.writeable = False
+            _MANUFACTURED[id(blank)] = (owner, alias)
+        return blank
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        return _MANUFACTURED[id(self)][0]
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        _MANUFACTURED[id(self)] = (value, None)
+        if _TEMPLATE:
+            _TEMPLATE[0] = value
+        else:
+            _TEMPLATE.append(value)
+
+
+def test_a_subclass_new_manufactures_the_object_restoration_is_handed() -> None:
+    """``__new__`` runs before restoration and is not described by the state.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2`` before the cure, through
+    ``copy.copy`` and pickle protocols 2 to 5: the copy verified, its ``_M``
+    owning and frozen, a writeable view of it retained by the ``__new__``
+    that built it, and the displaced first component.
+
+    The state carries no coefficient here, so it was recorded as never
+    having travelled and kept its exemption. What the record says is true of
+    the state and silent about the object, so a subclass ``__new__``
+    withholds the exemption and the coefficient is replaced, severing the
+    view.
+    """
+    _MANUFACTURED.clear()
+    _TEMPLATE.clear()
+    source = ManufacturesItselfOnConstruction(M_CONST, C_DOUBLED)
+    assert affine_dynamics_verified(source)
+
+    restored = copy.copy(source)
+    assert affine_dynamics_verified(restored)
+    _, alias = _MANUFACTURED[id(restored)]
+    assert alias is None or not np.shares_memory(alias, restored._M)
+
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        _gradient(restored, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+class DuplicatesItselfWithoutRestoring(AffineDynamics):
+    """A subclass whose ``__deepcopy__`` never reaches the root's restoration.
+
+    It does what a hand-written duplication hook plausibly does: deep-copy
+    the state, keep a handle on the matrix, put the state on a fresh object.
+    The coefficient arrives *writeable*, because the flag is not part of what
+    a copy carries, so the handle it keeps is writeable too; re-freezing the
+    owner afterwards does not reach a view already taken of it.
+
+    The clone's buffers are owning and frozen, which is all an inspection of
+    the arrays can see.
+    """
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> DuplicatesItselfWithoutRestoring:
+        clone = object.__new__(type(self))
+        memo[id(self)] = clone
+        state = copy.deepcopy(self.__dict__, memo)
+        clone.matrix_view = state["_M"].reshape(-1)
+        for name in _COEFFICIENT_BUFFERS:
+            state[name].flags.writeable = False
+        clone.__dict__.update(state)
+        return clone
+
+
+def test_a_duplicate_that_skipped_restoration_cannot_be_used() -> None:
+    """Being refused the affine route is not the same as being safe.
+
+    The general route reads ``F`` by identity exactly as the affine route
+    does, so a clone holding a writeable alias of its own frozen coefficient
+    displaces the gradient whichever route runs. Overriding a duplication
+    hook costs this class its eligibility, and that is measurably not
+    enough.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2`` before the cure: the clone
+    was refused the affine route, passed the coefficient-validity check with
+    ``_M`` owning and frozen, and returned ``0.7552125`` against an exact
+    ``0.6781500`` when the retained view was written through.
+
+    Inspecting the arrays cannot distinguish this clone from an honest one,
+    so validity asks instead for positive evidence that the root established
+    what the object is reading. A hook that bypasses restoration cannot
+    produce it, and the refusal is loud and names the reason.
+    """
+    source = DuplicatesItselfWithoutRestoring(M_CONST, C_DOUBLED)
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL), "the source itself is sound"
+
+    clone = copy.deepcopy(source)
+    assert clone._M.flags.owndata and not clone._M.flags.writeable
+    assert clone.matrix_view.flags.writeable
+    assert np.shares_memory(clone.matrix_view, clone._M)
+
+    with pytest.raises(MutableCoefficients, match="the root established"):
+        require_immutable_coefficients(clone)
+
+
+class SharesTheRootsOwnBuffers(AffineDynamics):
+    """A duplication hook that hands the clone the root's own coefficients.
+
+    It overrides copying, but it manufactures nothing: the clone reads the
+    very arrays the root froze. A frozen owning array cannot acquire a
+    writeable alias afterwards -- a view of it is read-only and cannot be
+    made otherwise -- so reading it from a second object is exactly as sound
+    as reading it from the first.
+    """
+
+    def __copy__(self) -> SharesTheRootsOwnBuffers:
+        clone = object.__new__(type(self))
+        clone.__dict__.update(self.__dict__)
+        return clone
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> SharesTheRootsOwnBuffers:
+        clone = object.__new__(type(self))
+        memo[id(self)] = clone
+        clone.__dict__.update(self.__dict__)
+        return clone
+
+
+def test_sharing_the_roots_own_buffers_keeps_the_answer() -> None:
+    """Evidence is held against the array, not against the object holding it.
+
+    Recording the pair instead refuses this clone for the accident of being
+    a different object, though every array it reads is one the root froze
+    and no writeable alias of them exists. It would also lose the evidence
+    the moment the original were collected while the array it established
+    was still in use.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2`` while the register held
+    pairs: ``copy.copy`` and ``copy.deepcopy`` of this class raised
+    ``MutableCoefficients`` although ``clone._M is source._M``, so the
+    supported gradient could not be computed at all. The distinction that
+    matters is still enforced -- a hook rebuilding the arrays is refused,
+    which is the neighbouring test.
+    """
+    source = SharesTheRootsOwnBuffers(M_CONST, C_DOUBLED)
+    exact, _ = _closed_form(2.0)
+
+    for clone in (copy.copy(source), copy.deepcopy(source)):
+        assert clone._M is source._M and clone._C is source._C
+        require_immutable_coefficients(clone)
+        assert np.asarray(
+            _gradient(clone, OverwritesCoefficientMidSolve(None))
+        ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+class InertList(list):
+    """A subclass declaring nothing at all, used only as metadata."""
+
+
+class InertDict(dict):  # type: ignore[type-arg]
+    """A mapping subclass declaring nothing at all, used only as metadata."""
+
+
+class InertArray(np.ndarray):
+    """An array subclass declaring nothing at all, used only as metadata."""
+
+
+class AnswersWithAFrozenBufferAndCarriesInertMetadata(AnswersWithAFrozenBuffer):
+    """The unassignable coefficient, beside metadata of a subclassed type.
+
+    The coefficient is a module-level frozen array behind a read-only
+    property, so an unnecessary replacement cannot merely cost a copy here:
+    there is nowhere to put it, and the problem loses its answer outright.
+    """
+
+    def __init__(self, metadata: Any) -> None:
+        super().__init__()
+        self.metadata = metadata
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        lambda: InertList(["ordinary metadata"]),
+        lambda: InertDict(note="ordinary metadata"),
+        lambda: np.zeros(1).view(InertArray),
+    ],
+    ids=["inert-list", "inert-dict", "inert-ndarray"],
+)
+@pytest.mark.parametrize(
+    "route",
+    [
+        pytest.param(lambda p: p, id="as-constructed"),
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        *[
+            pytest.param(
+                functools.partial(_round_trip_through_pickle, protocol),
+                id=f"pickle-p{protocol}",
+            )
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        ],
+    ],
+)
+def test_metadata_of_a_subclassed_type_costs_no_answer(
+    metadata: Callable[[], Any],
+    route: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """Being an inexact subclass is not by itself something the walk fears.
+
+    A subclass that declares *nothing* is rebuilt exactly as its base is, so
+    it can materialise nothing the walk cannot already see, and treating it
+    as inconclusive costs this problem its answer rather than a copy.
+
+    This shape is ineligible for the affine route in any case; what is at
+    stake is whether it can be duplicated at all.
+
+    `OBSERVED` on the C-15.7 fixture while exactness alone was the test:
+    each of the three metadata types gave ``MutableCoefficients`` under
+    ``deepcopy`` and every pickle protocol, naming ``_M`` -- which is the
+    module-level frozen array the property returns and nothing can replace.
+    """
+    source = AnswersWithAFrozenBufferAndCarriesInertMetadata(metadata())
+    exact, _ = _closed_form(1.0)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL), "the source itself answers"
+
+    duplicate = route(source)
+    require_immutable_coefficients(duplicate)
+    assert np.asarray(
+        _gradient(duplicate, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def test_a_class_answers_the_same_after_it_has_been_copied_once() -> None:
+    """A class namespace is not a fixed property of the class.
+
+    ``copyreg`` caches ``__slotnames__`` *into the class* the first time an
+    instance of it is copied or pickled, so any rule that reads a namespace
+    is reading something the copy protocol itself writes to.
+
+    `OBSERVED` on the C-15.7 fixture: the first round trip of a problem
+    carrying inert metadata answered exactly and every later one raised
+    ``MutableCoefficients``, because the metadata's class had acquired a
+    name between them. This is the clause's recurring error
+    in its sharpest form -- reading at a moment other than the one the
+    answer has to hold for -- and the assertion is that the answer does not
+    depend on the round trip's ordinal.
+    """
+    exact, _ = _closed_form(1.0)
+    for attempt in range(3):
+        source = AnswersWithAFrozenBufferAndCarriesInertMetadata(
+            InertList(["ordinary metadata"])
+        )
+        duplicate = _round_trip_through_pickle(pickle.HIGHEST_PROTOCOL, source)
+        assert np.asarray(
+            _gradient(duplicate, OverwritesCoefficientMidSolve(None))
+        ) == pytest.approx(exact, abs=EXACT_TOL), f"round trip {attempt}"
+    assert "__slotnames__" in vars(InertList), (
+        "the test is only sharp once the copy protocol has written the name"
+    )
+
+
+class CarriesMetadataNoRouteWouldCopy:
+    """Incidental metadata defining a hook no rebuilding route invokes."""
+
+    def __copy__(self) -> Self:
+        return type(self)()
+
+
+class AnswersWithAFrozenBufferAndCarriesMetadata(AnswersWithAFrozenBuffer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.metadata = CarriesMetadataNoRouteWouldCopy()
+
+
+def test_a_hook_no_rebuilding_route_calls_does_not_cost_an_answer() -> None:
+    """The inconclusive list must hold only hooks a route can reach.
+
+    This problem answers ``_M`` from a read-only module-level buffer, so its
+    coefficient cannot be replaced: withholding the exemption is not a copy
+    it does not need, it is a refusal. ``__copy__`` is never invoked on
+    anything inside a state being rebuilt -- ``copy.copy`` does not descend,
+    and ``deepcopy`` and pickle ask for ``__deepcopy__`` or a reducer -- so
+    listing it cost this problem its round trip and nothing was gained.
+
+    `OBSERVED` before the cure: ``copy.deepcopy`` raised
+    ``MutableCoefficients`` while the source computed the closed-form
+    gradient exactly.
+
+    This problem is ineligible for the affine route in any case -- what is
+    at stake is whether it can be duplicated at all, so the claim is that
+    the round trip completes and answers exactly, not that it is eligible.
+    """
+    problem = AnswersWithAFrozenBufferAndCarriesMetadata()
+    exact, _ = _closed_form(1.0)
+    assert np.asarray(
+        _gradient(problem, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    duplicate = copy.deepcopy(problem)
+    assert np.asarray(
+        _gradient(duplicate, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+class HidesTheCompanionInAContainerSubclass(AffineDynamics):
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        box = self.__dict__.get("box")
+        return _answer_from_outside(None if box is None else box.payload)
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        self.__dict__.setdefault("box", BoxDict())
+        _hold_outside(value)
+
+
+class HidesTheCompanionInABareStringSlot(AffineDynamics):
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        box = self.__dict__.get("box")
+        return _answer_from_outside(None if box is None else box.payload)
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        self.__dict__.setdefault("box", BoxSlot())
+        _hold_outside(value)
+
+
+class HidesTheCompanionBehindALookupHook(AffineDynamics):
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        return _answer_from_outside(self.__dict__.get("box"))
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        self.__dict__.setdefault("box", SuppliesItsCopyHookOnDemand())
+        _hold_outside(value)
+
+
+class HidesTheCompanionInsideAnAtomicSubclass(AffineDynamics):
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        box = self.__dict__.get("box")
+        return _answer_from_outside(None if box is None else box.payload)
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        if "box" not in self.__dict__:
+            box = IntBox(0)
+            box.payload = MaterialisesTheCoefficientWhenCopied()
+            self.__dict__["box"] = box
+        _hold_outside(value)
+
+
+class HidesTheCompanionInAnObjectArray(AffineDynamics):
+    """The holder is an *exact* ``ndarray``, so no subclass rule applies.
+
+    Its dtype is ``object``, which makes it a container of Python objects
+    that NumPy copies one by one. Nothing about the array's shape or dtype
+    says what they are.
+    """
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        box = self.__dict__.get("box")
+        return _answer_from_outside(None if box is None else box[0])
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        if "box" not in self.__dict__:
+            box = np.empty(1, dtype=object)
+            box[0] = MaterialisesTheCoefficientWhenCopied()
+            self.__dict__["box"] = box
+        _hold_outside(value)
+
+
+class HidesTheCompanionInAnArraySubclass(AffineDynamics):
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        box = self.__dict__.get("box")
+        return _answer_from_outside(box)
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        self.__dict__.setdefault("box", _blank_finalising_array())
+        _hold_outside(value)
+
+
+class MaterialisesOnItemAssignment(dict[str, Any]):
+    """A mapping that allocates while a rebuilding route repopulates it.
+
+    A ``dict`` subclass is not rebuilt by handing its storage over whole:
+    the route makes a blank instance and assigns the items back one at a
+    time, so ``__setitem__`` runs on the copy. Nothing in the source says
+    so -- its only content is a plain string -- and ``__setitem__`` is not
+    a hook any model of the traversal names.
+
+    Being an inexact subclass of a modelled type is the whole of what can
+    be known here, and it is enough to stop the walk claiming completeness.
+    """
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        dict.__setitem__(self, key, value)
+        if _EXTERNALLY_HELD and "payload" not in dict.keys(self):
+            payload = MaterialisesTheCoefficientWhenCopied()
+            matrix = np.array(_EXTERNALLY_HELD[0], copy=True)
+            payload.matrix = matrix
+            payload.flat = matrix.reshape(-1)
+            matrix.flags.writeable = False
+            dict.__setitem__(self, "payload", payload)
+
+
+#: What :class:`AllocatesInItsOwnNew` built, held outside the objects
+#: themselves because state applied after ``__new__`` would overwrite it.
+_ALLOCATED_IN_NEW: weakref.WeakKeyDictionary[Any, tuple[NDArray, NDArray]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+class AllocatesInItsOwnNew:
+    """A companion that materialises in ``__new__`` and nowhere else.
+
+    Every rebuilding route makes the new object by calling ``__new__`` on
+    the class before it puts any state into it, so a ``__new__`` of one's
+    own runs on the copy whether or not anything else is overridden. This
+    one defines no copy hook at all, and what it builds is kept off the
+    instance, since the state the route applies afterwards would otherwise
+    overwrite it.
+    """
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Self:
+        blank = super().__new__(cls)
+        if _EXTERNALLY_HELD:
+            matrix = np.array(_EXTERNALLY_HELD[0], copy=True)
+            alias = matrix.reshape(-1)
+            matrix.flags.writeable = False
+            _ALLOCATED_IN_NEW[blank] = (matrix, alias)
+        return blank
+
+    @property
+    def matrix(self) -> NDArray | None:
+        built = _ALLOCATED_IN_NEW.get(self)
+        return None if built is None else built[0]
+
+    @property
+    def flat(self) -> NDArray | None:
+        built = _ALLOCATED_IN_NEW.get(self)
+        return None if built is None else built[1]
+
+
+class HidesTheCompanionBehindItsOwnNew(AffineDynamics):
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        return _answer_from_outside(self.__dict__.get("box"))
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        if "box" not in self.__dict__:
+            held, _EXTERNALLY_HELD[:] = list(_EXTERNALLY_HELD), []
+            self.__dict__["box"] = AllocatesInItsOwnNew()
+            _EXTERNALLY_HELD[:] = held
+        _hold_outside(value)
+
+
+class HidesTheCompanionBehindItemAssignment(AffineDynamics):
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        box = self.__dict__.get("box")
+        if box is None:
+            return _EXTERNALLY_HELD[0]
+        return _answer_from_outside(dict.get(box, "payload"))
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        if "box" not in self.__dict__:
+            box = MaterialisesOnItemAssignment()
+            dict.__setitem__(box, "label", "nothing to see")
+            self.__dict__["box"] = box
+        _hold_outside(value)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        HidesTheCompanionInAContainerSubclass,
+        HidesTheCompanionInABareStringSlot,
+        HidesTheCompanionBehindALookupHook,
+        HidesTheCompanionInsideAnAtomicSubclass,
+        HidesTheCompanionInAnArraySubclass,
+        HidesTheCompanionInAnObjectArray,
+        HidesTheCompanionBehindAFilteringMapping,
+        HidesTheCompanionBehindItemAssignment,
+        HidesTheCompanionBehindItsOwnNew,
+    ],
+    ids=[
+        "container-subclass-attribute",
+        "bare-string-slot",
+        "lookup-supplied-copy-hook",
+        "atomic-subclass-attribute",
+        "ndarray-subclass-finalize",
+        "object-dtype-array-element",
+        "filtering-mapping-contents",
+        "mapping-item-assignment",
+        "companion-own-new",
+    ],
+)
+def test_the_walk_reaches_a_companion_wherever_the_traversal_would(
+    factory: type[AffineDynamics],
+) -> None:
+    """Each hiding place must not decide whether the walk is conclusive.
+
+    All five hold the same materialising companion, differing only in where
+    it sits. In each, the companion is reachable by the real traversal and
+    was invisible to an earlier version of the walk, which then recorded the
+    coefficient as never having travelled and kept its exemption.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2``, with each hiding place
+    restored one at a time: the copy verified, its ``_M`` owning and frozen,
+    and the companion holding a writeable view sharing that memory, giving
+    the displaced first component. The five cures are therefore independent,
+    and none of them is covered by the others.
+
+    The cured outcome is the named refusal of C-15.7: the walk is
+    inconclusive, the replacement is attempted, and the setter cannot store
+    it where ``_M`` will be read from.
+    """
+    _EXTERNALLY_HELD.clear()
+    source = factory(M_CONST, C_DOUBLED)
+    assert affine_dynamics_verified(source)
+    assert source._M is _EXTERNALLY_HELD[0], "the state must not carry it"
+
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    with pytest.raises(SubstitutedCoefficients, match="_M"):
+        copy.deepcopy(source)
+
+
+class HoldsTheMatrixInAnAttributeObject(AffineDynamics):
+    """A supported shape: ``_M`` is answered from inside another object.
+
+    Nothing about this is irregular -- a property over storage the subclass
+    arranges is explicitly within the envelope, and this one stores exactly
+    what it is handed. The coefficient simply is not a *top-level* value of
+    the instance dictionary.
+    """
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        return self.__dict__["_box"].matrix  # type: ignore[no-any-return]
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        box = self.__dict__.get("_box")
+        if box is None:
+            self.__dict__["_box"] = KeepsAFlattenedView(value)
+        else:
+            box.matrix = value
+
+
+class SlottedMWithACompanion(AffineDynamics):
+    """A supported shape: coefficient and companion both held in slots.
+
+    Neither appears in the instance dictionary, so a walk of that dictionary
+    alone reaches nothing -- which is why the produced state's slot mapping
+    is walked as well. ``object.__getstate__`` reports the two halves
+    separately, and a copying traversal rebuilds both.
+    """
+
+    __slots__ = ("_M", "companion")
+
+
+@pytest.mark.parametrize(
+    "build",
+    (
+        lambda: HoldsTheMatrixInAnAttributeObject(M_CONST, C_DOUBLED),
+        lambda: _slotted_with_companion(),
+    ),
+    ids=("nested", "slotted"),
+)
+def test_reachability_decides_what_travelled_not_dictionary_membership(
+    build: Callable[[], AffineDynamics],
+) -> None:
+    """``None`` claims a traversal could not have copied the array.
+
+    That claim was implemented as "the array is not a value of the instance
+    dictionary", which is a different and much weaker statement. Two
+    supported shapes fall through the gap: a coefficient answered from inside
+    an ordinary attribute object, and one held in a ``__slots__`` mapping,
+    which does not appear in the instance dictionary at all. Both were
+    recorded as never having travelled, so both kept the exemption on a
+    rebuilt state -- and a companion copied in the same traversal held a
+    writeable view of the frozen coefficient.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2``, through ``copy.deepcopy``
+    of each shape: verified, ``_M`` owning and frozen, an alias sharing its
+    memory, and ``0.7552125`` against an exact ``0.6781500``.
+
+    The record now asks what a traversal of the whole produced state --
+    dictionary and slots, through containers and through objects -- could
+    reach, which is the property the exemption was always claiming.
+    """
+    source = build()
+    assert affine_dynamics_verified(source)
+
+    restored = copy.deepcopy(source)
+    require_immutable_coefficients(restored)
+    assert restored._M.flags.owndata and not restored._M.flags.writeable
+
+    companion = getattr(restored, "_box", None) or restored.companion  # type: ignore[attr-defined]
+    assert not np.shares_memory(restored._M, companion.flat)
+
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        _gradient(restored, WritesThroughACompanion(companion.flat))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def _slotted_with_companion() -> AffineDynamics:
+    problem = SlottedMWithACompanion(M_CONST, C_DOUBLED)
+    problem.companion = KeepsAFlattenedView(problem._M)  # type: ignore[attr-defined]
+    return problem
+
+
+def test_a_rebuilt_state_is_not_vouched_for_by_identity_alone() -> None:
+    """Identity says where an array came from, not what was done to it.
+
+    ``deepcopy`` and ``pickle`` memoise, so an array referenced from both the
+    state and the record is copied once and referenced twice: identity agrees
+    on the far side. That is what makes the record work across those routes,
+    and it is also why the record alone is not enough. The traversal that
+    produced the copy produced it *writeable* -- the flag is restored only
+    afterwards -- and anything else in the state graph copied during that
+    window may take a view of it and keep it.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2``, with no subclass at all: a
+    plain ``AffineDynamics`` carrying the companion object above verified
+    before and after ``copy.deepcopy``, the copy's ``_M`` owning and frozen,
+    and a writeable alias sharing its memory. Writing ``0.9`` through that
+    alias in the terminal derivative callback returned ``0.7552125`` against
+    an exact ``0.6781500``.
+
+    So the exemption is granted only to a state that was handed on unchanged.
+    ``copy.copy`` passes the mapping's values through, and nothing that was
+    not copied can have been aliased while it was being copied; a rebuilt
+    state has its coefficients replaced, which severs any view the traversal
+    left behind. Replacing costs nothing there: the state belongs to the
+    traversal, so no setter it runs can reach the object being copied.
+    """
+    source = AffineDynamics(M_CONST, C_DOUBLED)
+    source.cache = KeepsAFlattenedView(source._M)  # type: ignore[attr-defined]
+    assert affine_dynamics_verified(source)
+    assert not source.cache.flat.flags.writeable  # type: ignore[attr-defined]
+
+    restored = copy.deepcopy(source)
+    require_immutable_coefficients(restored)
+    assert restored._M.flags.owndata and not restored._M.flags.writeable
+    assert not np.shares_memory(
+        restored._M,
+        restored.cache.flat,  # type: ignore[attr-defined]
+    )
+
+    exact, displacement = _closed_form(2.0)
+    assert displacement == pytest.approx(0.0770625, abs=EXACT_TOL)
+    assert np.asarray(
+        _gradient(restored, WritesThroughTheCompanionView(restored))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+class OnlyDefinesReplace(AffineDynamics):
+    """Defines a duplication hook ``copy.copy`` never calls, and counts setters.
+
+    ``__replace__`` is a copy-protocol hook, so a rule that asked which hooks
+    the subclass overrides concluded this class had produced the state under
+    ``copy.copy`` -- a route that does not consult ``__replace__`` at all --
+    and replaced its coefficients, running this setter.
+    """
+
+    assignments = 0
+
+    def __replace__(self, **changes: Any) -> Any:
+        return self
+
+    @property
+    def _C(self) -> NDArray:  # type: ignore[override]
+        return self.__dict__["_cstore"]  # type: ignore[no-any-return]
+
+    @_C.setter
+    def _C(self, value: NDArray) -> None:
+        type(self).assignments += 1
+        origin = self.__dict__.get("_origin")
+        if origin is not None and origin is not self:
+            substitute = np.full_like(value, 3.0)
+            substitute.flags.writeable = False
+            origin.__dict__["_cstore"] = substitute
+        self.__dict__["_cstore"] = value
+
+
+def test_a_hook_the_route_never_calls_does_not_cost_the_exemption() -> None:
+    """Running a setter is not free, so it is not done on a guess.
+
+    A coefficient already at the postcondition is left where it is precisely
+    to avoid assigning it, because assigning it runs the subclass's setter
+    and under ``copy.copy`` the state objects are shared with the source. A
+    rule that decided by asking which copy-protocol hooks the subclass
+    overrides answered "produced" for a class defining only ``__replace__``,
+    which ``copy.copy`` never calls.
+
+    `OBSERVED` on the C-15.7 fixture at ``C = 2``: the setter ran, followed a
+    reference to the source that ``copy.copy`` had carried across, and
+    replaced the source's own ``_C``. Copying the problem moved the gradient
+    of the object that was copied from ``[0.6781500, 0.6165000]`` to
+    ``[1.1265375, 1.0241250]`` -- the closed form for the coefficient nobody
+    asked for. Nothing was fabricated and nothing was unfrozen; the copy was
+    simply made.
+
+    The record answers this directly. ``copy.copy`` passes the state through,
+    so the array that arrives is the one the root recorded, and there is
+    nothing to establish and no setter to run.
+    """
+    source = OnlyDefinesReplace(M_CONST, C_DOUBLED)
+    source.__dict__["_origin"] = source
+    exact, _ = _closed_form(2.0)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    OnlyDefinesReplace.assignments = 0
+    try:
+        copy.copy(source)
+        assert OnlyDefinesReplace.assignments == 0
+    finally:
+        OnlyDefinesReplace.assignments = 0
+
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def _rebuild_uninitialised_from(cls: type) -> Any:
+    """Reconstruct without ``__init__``, for a reducer built outside the root."""
+    return cls.__new__(cls)
+
+
+class SuppliesAReducerThroughLookup(AffineDynamics):
+    """Chooses the state without overriding any hook that names it.
+
+    ``copy`` fetches ``__reduce_ex__`` with ``getattr``, so a class-level
+    ``__getattribute__`` can answer with a reducer of its own. No
+    copy-protocol hook is overridden, so no list of hook names sees this.
+    """
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "__reduce_ex__":
+            mapping = object.__getattribute__(self, "__dict__")
+
+            def reduce_ex(protocol: int) -> tuple[Any, ...]:
+                fabricated = dict(mapping)
+                owner = np.array(fabricated["_M"], dtype=float)
+                fabricated["matrix_view"] = owner.view()
+                owner.flags.writeable = False
+                fabricated["_M"] = owner
+                return (
+                    _rebuild_uninitialised_from,
+                    (type(self),),
+                    fabricated,
+                )
+
+            return reduce_ex
+        return object.__getattribute__(self, name)
+
+
+class LaundersAFabricationThroughSuper(AffineDynamics):
+    """Takes the root's own state and substitutes a coefficient in it.
+
+    This is the case a record of *who* produced the state cannot answer: the
+    root did produce it, and the subclass then changed one entry. Binding the
+    record to the identity of each array rather than to the producer is what
+    makes the substitution visible.
+    """
+
+    def __getstate__(self) -> Any:
+        state = super().__getstate__()
+        owner = np.array(state["_M"], dtype=float)
+        state["matrix_view"] = owner.view()
+        owner.flags.writeable = False
+        state["_M"] = owner
+        return state
+
+
+@pytest.mark.parametrize(
+    "subclass",
+    (SuppliesAReducerThroughLookup, LaundersAFabricationThroughSuper),
+    ids=("getattribute", "launder"),
+)
+def test_restoration_vouches_for_the_array_not_for_its_producer(
+    subclass: type[AffineDynamics],
+) -> None:
+    """Neither of these is reachable by asking which hooks were overridden.
+
+    The first overrides none of them -- it answers the *lookup* of
+    ``__reduce_ex__`` instead, which is how ``copy`` obtains it. The second
+    overrides ``__getstate__`` but delegates to the root's, so a record of
+    which hooks are the subclass's own says "produced by the subclass" for
+    the second and "not produced" for the first, and neither answer is the
+    one that matters.
+
+    What matters is whether the array that arrived is the array the root
+    recorded, and in both cases it is not. `OBSERVED` on the C-15.7 fixture
+    at ``C = 2``: each left a writeable alias sharing the coefficient's
+    memory and returned the closed form displaced by ``h^2 C y2 (M' - M)``.
+    """
+    restored = copy.copy(subclass(M_CONST, C_DOUBLED))
+    require_immutable_coefficients(restored)
+
+    assert not np.shares_memory(restored.matrix_view, restored._M)
+
+    exact, displacement = _closed_form(2.0)
+    assert displacement == pytest.approx(0.0770625, abs=EXACT_TOL)
+    assert np.asarray(
+        _gradient(restored, WritesThroughTheSubstitutedView(restored))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def _fabricated_state(problem: AffineDynamics) -> dict[str, Any]:
+    """A state whose ``_M`` the root never made, with a writeable view beside it.
+
+    Allocates a fresh array, takes a writeable view, freezes the array and
+    returns both. What restoration is handed satisfies the constructor's
+    postcondition exactly -- owning and read-only -- so it used to be left
+    alone, and every check afterwards agreed with it: the array is the only
+    one restoration ever saw, so identity confirms itself, and the view is
+    reachable from no coefficient.
+    """
+    state = dict(problem.__dict__)
+    owner = np.array(state["_M"], dtype=float)
+    state["matrix_view"] = owner.view()
+    owner.flags.writeable = False
+    state["_M"] = owner
+    return state
+
+
+def _rebuild_uninitialised(cls: type) -> Any:
+    """Reconstruct without running ``__init__``, as the default protocol does."""
+    return cls.__new__(cls)
+
+
+class FabricatesACoefficientInItsState(AffineDynamics):
+    """Hands restoration a coefficient the root never made, plus a view of it.
+
+    ``__getstate__`` allocates a fresh array, takes a writeable view, freezes
+    the array and returns both. What arrives satisfies the constructor's
+    postcondition exactly -- owning and read-only -- so restoration used to
+    leave it alone, and every check afterwards agreed with it: the array is
+    the only one restoration ever saw, so identity confirms itself, and the
+    view is reachable from no coefficient.
+    """
+
+    def __getstate__(self) -> dict[str, Any]:
+        return _fabricated_state(self)
+
+
+class FabricatesACoefficientInItsReduce(AffineDynamics):
+    """The same fabrication, reached through ``__reduce__``.
+
+    ``__getstate__`` is not the only hook that decides what restoration is
+    handed. ``__reduce__`` names both the reconstructor and the state, so a
+    subclass overriding it can fabricate a coefficient without ever defining
+    ``__getstate__``.
+    """
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_rebuild_uninitialised, (type(self),), _fabricated_state(self))
+
+
+class FabricatesACoefficientInItsReduceEx(AffineDynamics):
+    """The same fabrication again, reached through ``__reduce_ex__``.
+
+    The hook ``copy`` and ``pickle`` actually call. Overriding it bypasses
+    both ``__reduce__`` and ``__getstate__``.
+    """
+
+    def __reduce_ex__(self, protocol: int) -> tuple[Any, ...]:
+        return (_rebuild_uninitialised, (type(self),), _fabricated_state(self))
+
+
+@pytest.mark.parametrize(
+    "subclass",
+    (
+        FabricatesACoefficientInItsState,
+        FabricatesACoefficientInItsReduce,
+        FabricatesACoefficientInItsReduceEx,
+    ),
+    ids=("getstate", "reduce", "reduce_ex"),
+)
+def test_restoration_does_not_take_a_fabricated_coefficient_on_trust(
+    subclass: type[AffineDynamics],
+) -> None:
+    """Being at the postcondition is not the same as having been put there.
+
+    A state-producing hook can satisfy every property restoration checks --
+    an owning, frozen array -- while keeping a writeable alias of its memory
+    beside it in the same state. Identity cannot see it, because the
+    fabricated array is the only one restoration is ever shown; the flags
+    cannot see it, because they are right; and the alias is reachable from no
+    coefficient. `OBSERVED` on the C-15.7 fixture at ``C = 2`` through
+    ``copy.copy``, with nothing patched and nothing unfrozen: the optimizer
+    returned the closed form displaced by ``h^2 C y2 (M' - M)``.
+
+    So a buffer at the postcondition is replaced too, whenever the subclass
+    produced the state -- by whichever of the three hooks, since each of them
+    decides what restoration is handed. The copy is the root's own, the
+    fabricated alias addresses an array the solve never reads, and the write
+    lands where nothing looks.
+    """
+    restored = copy.copy(subclass(M_CONST, C_DOUBLED))
+    require_immutable_coefficients(restored)
+
+    assert not np.shares_memory(restored.matrix_view, restored._M)
+
+    exact, displacement = _closed_form(2.0)
+    assert displacement == pytest.approx(0.0770625, abs=EXACT_TOL)
+    gradient = np.asarray(
+        _gradient(restored, WritesThroughTheSubstitutedView(restored))
+    )
+    assert gradient == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def test_restoration_refuses_a_coefficient_that_appeared_while_it_ran() -> None:
+    """The names to check are not final until the last setter has run.
+
+    ``_resolving_buffer_names`` is read once, before the assignment loop, and
+    a name absent at that moment was absent from every later check. An
+    unrooted instance can gain one: a setter that reconstructs a coefficient
+    the state did not carry produces a buffer the root never froze, holding
+    whatever handle the setter kept. On the C-15.7 fixture at ``C = 2`` that
+    moved the gradient by ``h^2 C y2 (M' - M)`` with every check quiet.
+
+    Restoration now re-enumerates afterwards and treats a name that was
+    absent as having been expected to stay absent, which is what makes the
+    refusal true rather than merely convenient. The message says the
+    coefficient was gained during restoration; blaming a setter that was
+    never called on it would point at nothing.
+    """
+    source = BuildsACoefficientDuringRestoration(M_CONST, C_DOUBLED)
+    exact, displacement = _closed_form(2.0)
+    assert displacement == pytest.approx(0.0770625, abs=EXACT_TOL)
+    assert np.asarray(
+        _gradient(source, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    with pytest.raises(SubstitutedCoefficients, match="'_M'") as refusal:
+        copy.copy(source)
+
+    assert "did not exist when restoration began" in str(refusal.value)
+    assert "through __getstate__" in str(refusal.value)
+
+
 class WritesThroughTheSubstitutedView(OverwritesCoefficientMidSolve):
     """Rewrites the coefficient through the setter's retained view."""
 
@@ -2283,6 +4017,28 @@ class WritesThroughTheSubstitutedView(OverwritesCoefficientMidSolve):
         if self.target is not None and not self.fired:
             self.fired = True
             self.target.matrix_view[0, 0] = M_OVERWRITTEN  # type: ignore[attr-defined]
+
+
+class WritesThroughACompanion(OverwritesCoefficientMidSolve):
+    """Rewrites the coefficient through an array handed to the constructor."""
+
+    def __init__(self, alias: NDArray) -> None:
+        super().__init__(None)
+        self.alias = alias
+
+    def _fire(self) -> None:
+        if not self.fired:
+            self.fired = True
+            self.alias[0] = M_OVERWRITTEN
+
+
+class WritesThroughTheCompanionView(OverwritesCoefficientMidSolve):
+    """Rewrites the coefficient through a companion object's retained view."""
+
+    def _fire(self) -> None:
+        if self.target is not None and not self.fired:
+            self.fired = True
+            self.target.cache.flat[0] = M_OVERWRITTEN  # type: ignore[attr-defined]
 
 
 def test_the_refused_substitution_is_the_one_that_moves_the_gradient() -> None:

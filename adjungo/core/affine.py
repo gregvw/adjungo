@@ -97,8 +97,10 @@ solve with the wrong operator. The separation here keeps that guard from ever
 being needed, but does not replace it.
 """
 
-from collections.abc import Callable
-from typing import Any, TypeGuard
+import types
+import weakref
+from collections.abc import Callable, Mapping
+from typing import Any, TypeGuard, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -190,25 +192,66 @@ class SubstitutedCoefficients(InvalidCoefficients):
     the caller anywhere useful.
     """
 
-    def __init__(self, cls: type, name: str, stored: object = None) -> None:
+    def __init__(
+        self,
+        cls: type,
+        name: str,
+        stored: object = None,
+        case: str = "own",
+    ) -> None:
         found = (
             "nothing"
             if stored is _MISSING or stored is None
             else f"a different {type(stored).__name__}"
         )
+        # Which setter did it decides which remedy to offer, so the four are
+        # not run together. Naming the wrong one sends the caller to a setter
+        # that is behaving perfectly, and "was it assigned at all" does not
+        # answer it: a setter can store its own argument faithfully and still
+        # be holding a substitute at the end, because a later one replaced it.
+        causes = {
+            "own": f"defines a setter for the coefficient buffer {name!r} "
+            f"that does not store the array it is handed: after assignment, "
+            f"{name!r} resolves to {found}",
+            "later": f"leaves the coefficient buffer {name!r} holding an "
+            f"array the root never handed it: its own setter stored what it "
+            f"was given, but once the remaining coefficients were set "
+            f"{name!r} resolves to {found}, so a later setter replaced it",
+            "unassigned": f"leaves the coefficient buffer {name!r} holding "
+            f"an array it was not given: {name!r} was already established "
+            f"and was not assigned, yet once the other coefficients were set "
+            f"it resolves to {found}, so another coefficient's setter "
+            f"replaced it",
+            "appeared": f"gains the coefficient buffer {name!r} while being "
+            f"restored: {name!r} did not exist when restoration began and "
+            f"now resolves to {found}, so a setter built it, and the root "
+            f"never froze it",
+        }
+        remedies = {
+            "own": "To normalise or reshape it, do so before calling "
+            "super().__init__, where the array is still your own.",
+            "later": "A setter may read another coefficient; it may not "
+            "rebuild one. Derive whatever it needs before calling "
+            "super().__init__.",
+            "unassigned": "A setter may read another coefficient; it may "
+            "not rebuild one. Derive whatever it needs before calling "
+            "super().__init__.",
+            "appeared": "Carry every coefficient through __getstate__ so "
+            "restoration re-establishes it, rather than reconstructing it "
+            "from a setter.",
+        }
+        cause = causes[case]
+        remedy = remedies[case]
         super().__init__(
             name,
-            f"{cls.__name__} defines a setter for the coefficient buffer "
-            f"{name!r} that does not store the array it is handed: after "
-            f"assignment, {name!r} resolves to {found}. AffineDynamics "
+            f"{cls.__name__} {cause}. AffineDynamics "
             f"freezes each coefficient before assigning it, so that the array "
             f"F returns and the backward sweeps hold is one no subclass has "
             f"seen writeable; a setter that stores a copy instead can keep a "
             f"writeable handle onto that copy, and the buffer then changes "
             f"under a tape that verified as immutable (NUMERICS.md C-15.7). "
             f"Relocating the array is fine -- store {name!r} itself under any "
-            f"key or slot you like. To normalise or reshape it, do so before "
-            f"calling super().__init__, where the array is still your own."
+            f"key or slot you like. {remedy}"
         )
 
 
@@ -366,7 +409,469 @@ def _resolving_buffer_names(problem: object) -> tuple[str, ...]:
     )
 
 
-def _require_stored_as_handed(problem: object, name: str, handed: Any) -> None:
+#: Where the root's own ``__getstate__`` records which array each coefficient
+#: resolved to at the moment the state was produced. Restoration leaves a
+#: buffer where it is only when the array that arrived *is* the one recorded
+#: here, so the exemption rests on something the root established rather than
+#: on a guess about who built the state.
+#:
+#: Guessing was tried twice and was wrong in both directions. Asking which
+#: copy-protocol hooks the subclass overrides is too narrow -- ``__new__``
+#: runs before restoration and a class-level ``__getattribute__`` can supply
+#: the reducer, and neither is a hook -- and too wide: a class defining only
+#: ``__replace__`` has produced nothing under ``copy.copy``, which never calls
+#: it, yet lost the exemption, ran its setter against state shared with the
+#: source, and changed the *source's* gradient from ``[0.6781500, 0.6165000]``
+#: to ``[1.1265375, 1.0241250]`` (C-15.7).
+_STATE_PROVENANCE = "_adjungo_coefficients_as_produced"
+
+#: Recorded beside the coefficients, under a key no attribute can collide
+#: with, to tell a state that was *handed on unchanged* from one a copying
+#: traversal rebuilt. ``copy.copy`` passes the mapping's values through, so
+#: this object arrives as itself; ``deepcopy`` and every pickle protocol
+#: reconstruct it, so a different object arrives. The distinction matters
+#: because identity alone cannot see what a traversal did on its way here:
+#: while a coefficient is being copied it is briefly writeable, and anything
+#: else in the state graph copied during that window may take a writeable
+#: view of it and keep it after the owner is frozen again (C-15.7).
+_PASSED_THROUGH = " passed through unchanged"
+_NOT_TRAVELLED = object()
+
+
+#: Types a copying traversal reproduces without descending into them, so
+#: nothing reachable only through one can come back holding a view of a
+#: coefficient. ``deepcopy`` treats each atomically and pickle reconstructs
+#: them by reference or by value without visiting an ``ndarray`` on the way.
+_TRAVERSAL_ATOMIC = (
+    type(None),
+    bool,
+    int,
+    float,
+    complex,
+    str,
+    bytes,
+    bytearray,
+    type,
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.ModuleType,
+)
+
+
+#: Hooks that replace what a copying traversal does with an object. An
+#: object defining one is not described by the graph it currently holds: the
+#: witness for this was a companion whose ``__deepcopy__`` *materialised* a
+#: coefficient answered from storage outside the state, together with a
+#: writeable view of it, so a walk taken before the copy could not have seen
+#: either (C-15.7).
+#:
+#: ``__copy__`` and ``__replace__`` are deliberately absent. Neither is
+#: invoked by any route that *rebuilds* the state: ``copy.copy`` does not
+#: descend into a companion at all, and ``deepcopy`` and pickle ask for
+#: ``__deepcopy__`` or a reducer. Including them refused a supported problem
+#: outright -- one answering from a read-only module-level buffer, which
+#: cannot be replaced -- for carrying incidental metadata with a ``__copy__``
+#: no route would ever call.
+_TRAVERSAL_HOOKS = (
+    "__new__",
+    "__deepcopy__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__getstate__",
+    "__setstate__",
+    "__getnewargs__",
+    "__getnewargs_ex__",
+)
+
+#: Types whose copying this walk models directly, so their own definitions of
+#: the hooks above are expected rather than disqualifying.
+_TRAVERSAL_MODELLED = (
+    object,
+    np.ndarray,
+    dict,
+    list,
+    tuple,
+    set,
+    frozenset,
+    *_TRAVERSAL_ATOMIC,
+)
+
+#: Hooks that decide what an attribute lookup *finds*. A copying route asks
+#: for its hooks by lookup, not by reading the class dictionary, so a class
+#: defining one of these can answer with a ``__deepcopy__`` that is written
+#: down nowhere (C-15.7). This is not the excluded instance-bound reducer:
+#: the behaviour is defined on the class, and the coefficient descriptor
+#: answers the same way every time.
+_TRAVERSAL_LOOKUP = ("__getattribute__", "__getattr__")
+
+
+def _class_dict(klass: type) -> Mapping[str, Any]:
+    """The class's own namespace, read past any metaclass that redefines it."""
+    return cast(
+        "Mapping[str, Any]", type.__dict__["__dict__"].__get__(klass)
+    )
+
+
+def _redefines_its_copying(obj: object) -> bool:
+    """Whether this object replaces the traversal the walk below assumes."""
+    chain = type.__dict__["__mro__"].__get__(type(obj))
+    for klass in chain:
+        if klass in _TRAVERSAL_MODELLED:
+            continue
+        namespace = _class_dict(klass)
+        if any(hook in namespace for hook in _TRAVERSAL_HOOKS):
+            return True
+        if any(hook in namespace for hook in _TRAVERSAL_LOOKUP):
+            return True
+        # Every class with instance attributes carries a ``__dict__`` getset
+        # descriptor, which is the ordinary arrangement and says nothing. A
+        # ``__dict__`` that is anything *else* decides what the walk below
+        # gets to read when it asks, which is a different matter.
+        members = namespace.get("__dict__")
+        if members is not None and not isinstance(
+            members, types.GetSetDescriptorType
+        ):
+            return True
+    # A subclass of a type this walk models can materialise state during a
+    # copy without defining any hook of its own, so exactness is the test.
+    # NumPy calls a subclass's ``__array_finalize__`` while building the new
+    # array. A container subclass is reconstructed by replaying its contents
+    # through its own ``__setitem__`` or ``append``, and the contents are
+    # read back through its own ``keys``, ``values`` or ``__iter__`` -- every
+    # one of them overridable, and none of them a declaration of what the
+    # copy will do.
+    inexact = any(
+        isinstance(obj, modelled) and type(obj) is not modelled
+        for modelled in (np.ndarray, dict, list, tuple, set, frozenset)
+    )
+    return inexact and _adds_behaviour_of_its_own(type(obj))
+
+
+#: Names written into a class namespace by something other than its author,
+#: so that a subclass carrying only these has declared nothing of its own.
+#:
+#: ``__slotnames__`` is the reason this is a set rather than a count, and is
+#: the sharpest instance of this clause's recurring error: ``copyreg`` caches
+#: it *into the class* the first time an instance is copied or pickled. A
+#: namespace is therefore not a fixed property of a class, and a rule that
+#: read one would answer differently before and after the first duplication
+#: -- refusing, on the second round trip, a problem it had just accepted.
+_NAMESPACE_BOILERPLATE = frozenset(
+    {
+        "__doc__",
+        "__module__",
+        "__qualname__",
+        "__firstlineno__",
+        "__static_attributes__",
+        "__dict__",
+        "__weakref__",
+        "__slots__",
+        "__slotnames__",
+    }
+)
+
+
+def _adds_behaviour_of_its_own(klass: type) -> bool:
+    """Whether ``klass`` defines anything beyond what declaring it writes.
+
+    A subclass of a modelled type that defines *nothing* is rebuilt exactly
+    as its base is: the routes make it with ``__new__`` and replay its
+    contents through the base's own methods, so it can materialise nothing
+    the walk cannot already see. One that defines anything at all may take
+    part in that rebuilding, and which names a route consults is a property
+    of the route rather than of the class -- so the question asked is
+    whether anything is defined, not which names are. Asking by name is
+    what failed repeatedly before (C-15.7).
+    """
+    for base in type.__dict__["__mro__"].__get__(klass):
+        if base in _TRAVERSAL_MODELLED:
+            continue
+        for name, value in _class_dict(base).items():
+            if name in _NAMESPACE_BOILERPLATE:
+                continue
+            # A slot declaration adds storage, which the walk reads for
+            # itself, rather than behaviour that could build something.
+            if isinstance(value, types.MemberDescriptorType):
+                continue
+            return True
+    return False
+
+
+def _slot_values(obj: object) -> list[Any]:
+    """Every slot value, found through the descriptors the compiler made.
+
+    Reading ``__slots__`` back off the class replays a *declaration* rather
+    than the result of it, and the two differ: the declaration may be a bare
+    string, which iterates character by character, and a private name is
+    mangled before the descriptor is created. The descriptors are what the
+    names actually resolve to.
+    """
+    values: list[Any] = []
+    for klass in type(obj).__mro__:
+        for member in vars(klass).values():
+            if not isinstance(member, types.MemberDescriptorType):
+                continue
+            try:
+                values.append(member.__get__(obj))
+            except AttributeError:
+                continue
+    return values
+
+
+def _arrays_a_traversal_would_reach(state: Any) -> tuple[set[int], bool]:
+    """Every array a copy of this state could rebuild, and whether that is all.
+
+    The question this answers is not "what is in the state" but "what could a
+    traversal of it have copied", because a copy arrives writeable and is
+    frozen only afterwards, so whatever the same traversal built alongside it
+    may hold a view taken during that window. Reachability is therefore the
+    property that matters, and membership is not a stand-in for it: asking
+    only whether a coefficient was a *top-level value* of the instance
+    dictionary missed one held inside an ordinary attribute object and one
+    held in a ``__slots__`` mapping, and both came back aliased (C-15.7).
+
+    Returns the identities found and whether the walk was conclusive. An
+    object this cannot see into is reported as inconclusive rather than
+    assumed empty: the caller then treats the coefficient as reachable, which
+    costs a replacement it may not have needed and, where the replacement
+    cannot be stored, a loud refusal. The quiet direction is the one that
+    must not be guessed.
+    """
+    found: set[int] = set()
+    seen: set[int] = set()
+    alive: list[Any] = []
+    complete = True
+    pending: list[Any] = [state]
+    while pending:
+        obj = pending.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        # Identity is the whole basis of ``seen`` and ``found``, and an
+        # address is only unique while something holds it.
+        alive.append(obj)
+
+        # Atomicity is a property of the *exact* type. A subclass of ``int``
+        # or ``str`` carries an instance dictionary that an ordinary copy
+        # reconstructs, and one was used to hide a materialising companion
+        # from this walk while the real traversal reached it (C-15.7).
+        if type(obj) in _TRAVERSAL_ATOMIC:
+            continue
+
+        if isinstance(obj, np.ndarray):
+            found.add(id(obj))
+            # A view travels with whatever owns its memory, and freezing the
+            # view leaves the owner writeable, so the owner is reachable too.
+            if obj.base is not None:
+                pending.append(obj.base)
+            if obj.dtype.hasobject:
+                # An object array is a container of Python objects, and NumPy
+                # copies each of them. What they are is not described by the
+                # array's shape or dtype, so this reports that it cannot say
+                # rather than walking element by element -- the elements of a
+                # structured dtype are reached only through its fields, and
+                # guessing that traversal is how the branches above went
+                # wrong (C-15.7). A coefficient is refused an object dtype
+                # outright, so only a companion reaches here.
+                complete = False
+
+        # A container's *contents* are described by iterating it; its own
+        # attributes are not. A ``dict`` subclass carrying the coefficient in
+        # an ordinary instance attribute was skipped entirely by stopping
+        # here, so both are walked and neither short-circuits the other.
+        # Read through the base type's own methods: a subclass's ``keys`` and
+        # ``values`` describe a logical mapping of its choosing, while the
+        # storage the reducer copies is the one underneath.
+        if isinstance(obj, dict):
+            pending.extend(dict.keys(obj))
+            pending.extend(dict.values(obj))
+        elif isinstance(obj, list):
+            pending.extend(list.__iter__(obj))
+        elif isinstance(obj, tuple):
+            pending.extend(tuple.__iter__(obj))
+        elif isinstance(obj, set):
+            pending.extend(set.__iter__(obj))
+        elif isinstance(obj, frozenset):
+            pending.extend(frozenset.__iter__(obj))
+
+        if _redefines_its_copying(obj):
+            # Everything below predicts the traversal from the graph as it
+            # stands. An object that redefines how it is copied is not
+            # predictable from it: its hook may build a coefficient that is
+            # nowhere in this graph and keep a writeable view of it.
+            complete = False
+
+        if isinstance(obj, np.ndarray) and type(obj) is np.ndarray:
+            continue
+
+        members = getattr(obj, "__dict__", None)
+        slotted = _slot_values(obj)
+        if members is not None:
+            pending.append(members)
+        pending.extend(slotted)
+        described = (
+            members is not None
+            or slotted
+            or isinstance(obj, (np.ndarray, dict, list, tuple, set, frozenset))
+        )
+        if not described:
+            # Nothing to look inside and no modelled traversal to fall back
+            # on, so what it may be holding cannot be established here.
+            complete = False
+    return found, complete
+
+
+#: The coefficient buffers the root itself established, per live instance.
+#:
+#: Restoration is what severs a view taken of a coefficient while it was
+#: briefly writeable, and a class defining its own ``__deepcopy__`` can build
+#: a clone without running it: deep-copy the state, keep a view of the
+#: coefficient that arrived writeable, re-freeze the owner, and hand back an
+#: object whose buffers are owning and frozen with a writeable alias beside
+#: them. Refusing such a class the affine route does not help, because the
+#: general route reads ``F`` by identity in the same way (C-15.7).
+#:
+#: So validity asks for *positive evidence* instead of inspecting flags
+#: alone: the root recorded these exact arrays, against this exact object.
+#: The register lives here rather than on the instance, so no state carries
+#: it, copying cannot bring it along and nothing written into a state can
+#: forge it.
+#:
+#: What is recorded is the *array*, not the problem that happened to be
+#: holding it. A frozen owning array cannot acquire a writeable alias later
+#: -- a view of it is read-only, and cannot be made otherwise -- so it stays
+#: safe to read wherever it travels, and a duplicate sharing the root's own
+#: buffers is as sound as the original. Recording the pair instead would
+#: refuse that duplicate for the accident of being a different object, and
+#: would lose the evidence when the original was collected while the array
+#: it established was still in use.
+#:
+#: Entries are keyed by address and hold a weak reference used to confirm
+#: identity, because an address is only unique while something holds it.
+_ESTABLISHED: dict[int, "weakref.ref[NDArray]"] = {}
+
+
+def _record_establishment(problem: object) -> None:
+    """Record the coefficient arrays the root has just established."""
+    for name in _resolving_buffer_names(problem):
+        buffer = _resolve_buffer(problem, name)
+        if not isinstance(buffer, np.ndarray):
+            continue
+        key = id(buffer)
+
+        def forget(_: Any, key: int = key) -> None:
+            _ESTABLISHED.pop(key, None)
+
+        _ESTABLISHED[key] = weakref.ref(buffer, forget)
+
+
+def _not_established_by_the_root(problem: object) -> str | None:
+    """Why the root cannot vouch for what ``problem`` currently reads.
+
+    ``None`` when it can. The buffers are compared by identity: an object
+    assembled around coefficients the root never saw is the case this
+    exists for, and one holding arrays other than those established is the
+    same case arriving a different way.
+    """
+    if not _AFFINE_INSTANCE_DICT.__get__(problem).get(_ROOT_INITIALISED, False):
+        # The root never ran, so it never claimed to have established
+        # anything and has nothing to be missing. Such a subclass builds its
+        # own buffers and is judged on them alone, exactly as before; asking
+        # it for the root's evidence would refuse a supported shape -- one
+        # answering from a frozen module-level buffer among them -- for not
+        # having used a mechanism it never entered.
+        return None
+    for name in _resolving_buffer_names(problem):
+        buffer = _resolve_buffer(problem, name)
+        if not isinstance(buffer, np.ndarray):
+            continue
+        entry = _ESTABLISHED.get(id(buffer))
+        if entry is None or entry() is not buffer:
+            return (
+                f"not an array the root established for '{name}': it was "
+                f"assembled without the root's own initialisation or "
+                f"restoration producing it, and restoration is what severs "
+                f"a view taken of a coefficient while it was writeable"
+            )
+    return None
+
+
+def _coefficient_provenance(problem: object, travelling: Any) -> dict[str, Any]:
+    """What the state carries for each coefficient, read by its own reader.
+
+    A coefficient is recorded as the array itself when a traversal of the
+    state could reach it, and as ``None`` when it could not -- which is the
+    case for one answered by a descriptor reading storage held somewhere
+    else, a module-level array among them. The distinction is the whole
+    point: restoration can insist that an arriving array *is* the one
+    recorded, but only for an array a copy would actually rebuild. Recording
+    the object unconditionally would duplicate it alongside a state that
+    never carried it, and the two copies would then differ by identity for no
+    reason, refusing an ordinary round trip of a subclass the optimizer
+    accepts.
+    """
+    reachable, complete = _arrays_a_traversal_would_reach(travelling)
+    # A ``__new__`` of the subclass's own runs before restoration and builds
+    # the object restoration is handed. It can manufacture a coefficient,
+    # together with a writeable view of it, that no state carried and this
+    # walk therefore recorded as never having travelled. Whether it did so
+    # is not readable from here, so the exemption is withheld and the
+    # coefficient replaced, which severs any such view (C-15.7).
+    if _defined_as(type(problem), "__new__") is not _defined_as(
+        AffineDynamics, "__new__"
+    ):
+        complete = False
+    recorded: dict[str, Any] = {}
+    for name in _resolving_buffer_names(problem):
+        buffer = _resolve_buffer(problem, name)
+        if not isinstance(buffer, np.ndarray):
+            continue
+        carried = not complete or id(buffer) in reachable
+        recorded[name] = buffer if carried else None
+    recorded[_PASSED_THROUGH] = _NOT_TRAVELLED
+    return recorded
+
+
+def _cannot_replace(
+    problem: object, name: str, buffer: NDArray, exc: Exception
+) -> "MutableCoefficients":
+    """Describe a coefficient that could neither be left alone nor replaced.
+
+    The reason is read off the buffer, not assumed. Three different states
+    reach here, and naming the wrong one sends the caller after the wrong
+    remedy: a writeable buffer, a frozen one that does not own its storage,
+    and one already at the postcondition whose setter refused the
+    replacement.
+    """
+    if buffer.flags.writeable:
+        reason = (
+            "writeable, and freezing it where it lies would reach back "
+            "through the sharing a copy leaves and freeze the original"
+        )
+    elif not buffer.flags.owndata:
+        reason = (
+            "frozen but does not own its storage, so it has to be "
+            "replaced by one that does"
+        )
+    else:
+        reason = (
+            "frozen and owning, but that is not by itself evidence that the "
+            "root put it there -- a state hook can hand back an array it "
+            "allocated and kept a writeable view of -- so it is replaced "
+            "with a copy this library made"
+        )
+    return MutableCoefficients(
+        type(problem),
+        name,
+        f"{reason}; and it cannot be replaced with a frozen copy "
+        f"({type(exc).__name__}: {exc}). Give the attribute a "
+        f"setter, or leave the root's buffers as constructed",
+    )
+
+
+def _require_stored_as_handed(
+    problem: object, name: str, handed: Any, case: str = "own"
+) -> None:
     """Refuse a setter that stored something other than what it was handed.
 
     The one rule that makes the freeze mean anything. Everything else in this
@@ -416,7 +921,7 @@ def _require_stored_as_handed(problem: object, name: str, handed: Any) -> None:
     """
     stored = _resolve_buffer(problem, name)
     if stored is not handed:
-        raise SubstitutedCoefficients(type(problem), name, stored)
+        raise SubstitutedCoefficients(type(problem), name, stored, case)
 
 
 class AffineDynamics:
@@ -487,13 +992,25 @@ class AffineDynamics:
         for arr in (M_arr, C_arr, b_arr):
             arr.flags.writeable = False
 
+        # Whether a setter stored its own argument can only be seen straight
+        # after that setter ran; whether the coefficient is still right can
+        # only be seen once they all have. Both are recorded, because a
+        # refusal that names the wrong setter sends the caller to one that is
+        # behaving perfectly. Assigned by name rather than through a loop so
+        # that the attributes stay declared to the type checker.
+        faithful: dict[str, bool] = {}
         self._M = M_arr
+        faithful["_M"] = _resolve_buffer(self, "_M") is M_arr
         self._C = C_arr
+        faithful["_C"] = _resolve_buffer(self, "_C") is C_arr
         self._b = b_arr
+        faithful["_b"] = _resolve_buffer(self, "_b") is b_arr
         # Checked after all three, not after each: one coefficient's setter is
         # free to rewrite another, and a subclass that does exists.
         for name, handed in (("_M", M_arr), ("_C", C_arr), ("_b", b_arr)):
-            _require_stored_as_handed(self, name, handed)
+            _require_stored_as_handed(
+                self, name, handed, "later" if faithful[name] else "own"
+            )
         self._nu = int(C_arr.shape[1])
         #: Set last, so it is present only if every buffer above was
         #: established and frozen. Written through the root's own ``__dict__``
@@ -504,17 +1021,71 @@ class AffineDynamics:
         #: kind of subclass it exists for. Reading defensively and writing
         #: trustingly protects nothing.
         _AFFINE_INSTANCE_DICT.__get__(self)[_ROOT_INITIALISED] = True
+        _record_establishment(self)
+
+    def __getstate__(self) -> Any:
+        """Produce the state, recording which array each coefficient is.
+
+        The state itself is exactly what ``object.__getstate__`` would hand
+        back -- the instance dictionary, or the dictionary and the slots for a
+        subclass that has them -- with one addition: a record of the array
+        every coefficient resolves to *right now*, read by the same reader
+        that will read it later.
+
+        :meth:`__setstate__` leaves a coefficient where it is only when the
+        array that arrived is the one recorded here, which is the only form of
+        the question that has an answer. The record travels with the state and
+        is duplicated alongside it, so an honest route keeps the two in step:
+        ``deepcopy`` and ``pickle`` memoise by identity, and each gives one
+        copy referenced from both places. Anything that substitutes a
+        coefficient breaks the correspondence and is replaced.
+
+        The alternative -- asking which hooks the subclass overrides -- was
+        tried twice and was wrong in both directions, too narrow and too wide.
+        See :data:`_STATE_PROVENANCE`.
+        """
+        produced: Any = object.__getstate__(self)
+        state: Any = produced
+        slots: Any = None
+        if isinstance(produced, tuple) and len(produced) == 2:
+            state, slots = produced
+        # Copied, never mutated in place: without slots ``object.__getstate__``
+        # hands back the live instance dictionary itself, and writing the
+        # record into that would leave it on the source object for good.
+        mapping: dict[str, Any] = dict(state) if state else {}
+        # Both halves: a coefficient held in a slot is reachable to a copying
+        # traversal exactly as one held in the instance dictionary is.
+        mapping[_STATE_PROVENANCE] = _coefficient_provenance(
+            self, (mapping, slots)
+        )
+        return (mapping, slots) if slots is not None else mapping
 
     def __setstate__(self, state: Any) -> None:
         """Restore state and re-freeze the coefficient buffers — C-15.7.
 
-        ``copy.deepcopy`` does not preserve ``writeable=False``: NumPy defines
-        ``ndarray.__deepcopy__``, and it returns a writeable array. Pickle,
-        which goes through ``__reduce__``, does preserve the flag, and
-        ``copy.copy`` shares the original buffers, so for an instance this
-        class constructed, only the deep copy unfreezes. A subclass supplying
-        its own ``__getstate__`` can unfreeze any of the three, which is why
-        the rule below does not depend on which route ran.
+        The four routes each hand this hook something different, measured on
+        an instance this class constructed:
+
+        =====================  ==========  ==========
+        Route                  Owns data   Writeable
+        =====================  ==========  ==========
+        ``copy.copy``          yes         no
+        ``copy.deepcopy``      yes         **yes**
+        pickle, protocol 4     yes         **yes**
+        pickle, protocol 5     **no**      no
+        =====================  ==========  ==========
+
+        ``deepcopy`` and protocol 4 unfreeze, because NumPy's own
+        ``__deepcopy__`` and reconstructor return writeable arrays; protocol 5
+        keeps the flag but hands back a view over the pickle buffer rather
+        than an owning array; ``copy.copy`` passes the source's arrays
+        through unchanged. And a subclass producing the state can hand back
+        anything at all, so the rule below does not read the route. It does
+        read one consequence of it: ``copy.copy`` hands on the mapping's
+        values as they are, while every other route rebuilds them, and an
+        array rebuilt by a traversal was writeable while that traversal was
+        still running. Anything else copied in the same pass may hold a view
+        of it. See :data:`_PASSED_THROUGH`.
 
         This hook is the one both the copy and pickle protocols run **by
         default**, so re-freezing here covers every route that does not replace
@@ -616,16 +1187,20 @@ class AffineDynamics:
         about a broken one.
 
         A buffer already at the constructor's postcondition -- owning and
-        frozen -- is left exactly where it is, because replacing it would gain
-        nothing and costs the only thing this branch can lose: a read-only
-        property answering for a coefficient cannot be assigned to, and an
-        ordinary round trip of a subclass the optimizer accepts raised
-        ``property '_M' ... has no setter``. When the buffer is writeable and
-        the storage still refuses assignment there is no safe outcome -- the
-        copy cannot be stored and freezing the original would change an object
-        the caller did not ask to change -- so restoration refuses, names the
-        buffer and says why, rather than letting a bare ``AttributeError`` out
-        of ``copy.deepcopy``.
+        frozen -- is left exactly where it is, but only when the arriving
+        state is the instance's own. Then the array is one the constructor
+        froze and checked, so replacing it would establish nothing, and
+        assigning it would run the subclass's setter against state
+        ``copy.copy`` shares with the source. When the subclass produced the
+        state it could equally have fabricated that buffer, so there the
+        postcondition earns no exemption and the coefficient is replaced like
+        any other.
+
+        When a buffer must be replaced and the storage refuses the assignment
+        there is no safe outcome -- the copy cannot be stored and freezing the
+        original would change an object the caller did not ask to change -- so
+        restoration refuses, names the buffer and says why, rather than
+        letting a bare ``AttributeError`` out of ``copy.deepcopy``.
 
         A buffer that does not own its storage is replaced by one that does,
         rather than merely frozen. Pickle reconstructs an ``ndarray`` as a view
@@ -639,6 +1214,15 @@ class AffineDynamics:
         slots: dict[str, Any] | None = None
         if isinstance(state, tuple) and len(state) == 2:
             state, slots = state
+        # Lifted out before the state lands, so the record never becomes an
+        # attribute of the restored object and cannot be read back from one.
+        produced_as: dict[str, Any] = {}
+        if isinstance(state, dict) and _STATE_PROVENANCE in state:
+            state = dict(state)
+            recorded = state.pop(_STATE_PROVENANCE)
+            if isinstance(recorded, dict):
+                produced_as = recorded
+        passed_through = produced_as.get(_PASSED_THROUGH) is _NOT_TRAVELLED
         storage = _AFFINE_INSTANCE_DICT.__get__(self)
         if state:
             storage.update(state)
@@ -651,20 +1235,90 @@ class AffineDynamics:
         if not names:
             return
 
-        handed: list[tuple[str, NDArray[np.float64]]] = []
+        # Every name's identity, recorded before any setter runs -- not only
+        # the ones about to be replaced. A skipped coefficient is still a
+        # coefficient another name's setter can substitute, and recording only
+        # replacements left exactly that gap: ``_M`` arriving already at the
+        # postcondition was skipped and therefore never checked, while ``_C``'s
+        # setter rebuilt it and kept a writeable view of the rebuild.
+        expected: dict[str, Any] = {
+            name: _resolve_buffer(self, name) for name in names
+        }
+        replaced: set[str] = set()
+        faithful: dict[str, bool] = {}
+        replacements: dict[str, NDArray] = {}
         for name in names:
-            buffer = _resolve_buffer(self, name)
+            buffer = expected[name]
             if not isinstance(buffer, np.ndarray):
                 continue
-            if buffer.flags.owndata and not buffer.flags.writeable:
-                # Already the constructor's postcondition. Replacing it would
-                # gain nothing and costs the one thing this branch can lose:
-                # a read-only property answering for a coefficient cannot be
-                # assigned to, and an ordinary round trip of a subclass the
-                # optimizer accepts raised ``property has no setter``.
+            # Satisfying the constructor's postcondition is not the same as
+            # having been put there by the constructor. A ``__getstate__``
+            # may fabricate a coefficient -- allocate an array, take a view of
+            # it, freeze the array, and hand back both -- and what arrives is
+            # then owning and frozen, with a writeable alias of its memory
+            # sitting beside it in the same state. Nothing about the restored
+            # object records that: the view is reachable from no coefficient,
+            # and identity cannot help, because the array restoration resolves
+            # is the only one it ever saw. So a buffer at the postcondition is
+            # replaced as well, which leaves the fabricated alias pointing at
+            # an array the solve never reads.
+            at_postcondition = (
+                buffer.flags.owndata and not buffer.flags.writeable
+            )
+            recorded = produced_as.get(name, _MISSING)
+            if recorded is None and name in produced_as:
+                # The array never travelled in the state, so no traversal
+                # copied it and none can have aliased it. A descriptor
+                # answering from storage held elsewhere lands here, and a
+                # read-only property answering for a coefficient depends on
+                # it: assigning one raises.
+                vouched = True
+            elif recorded is buffer:
+                # The right array, but that only settles where it came from.
+                # If a traversal rebuilt this state it also rebuilt this
+                # array, and memoisation means the record was rebuilt with
+                # it, so identity agrees while a companion object copied in
+                # the same traversal may hold a writeable view of it.
+                # `OBSERVED` on the C-15.7 fixture at ``C = 2``, through
+                # ``copy.deepcopy`` of a plain ``AffineDynamics`` carrying an
+                # ordinary attribute that keeps a flattened view of ``M`` and
+                # rebuilds it in its own ``__deepcopy__``: the copy verified,
+                # its ``_M`` owning and frozen, with a writeable alias
+                # sharing that memory, and the optimizer returned
+                # ``0.7552125`` against an exact ``0.6781500``. Replacing
+                # severs the alias, and on a rebuilt state that costs
+                # nothing, because the state is the traversal's own and no
+                # setter can reach the object being copied through it.
+                vouched = passed_through
+            else:
+                vouched = False
+            if at_postcondition and vouched:
+                # Nothing to gain and something to lose. The arriving state is
+                # the source instance's own, so this array is the one its
+                # constructor froze and checked; replacing it would establish
+                # nothing. And replacing it means assigning it, which runs the
+                # subclass's setter -- against state that ``copy.copy`` shares
+                # with the source, so a setter with a side effect on any of it
+                # reaches back and changes the object being copied. It is also
+                # why an expectation is recorded for every name: this is the
+                # one coefficient another setter can still substitute without
+                # restoration having assigned it. A read-only property
+                # answering for a coefficient is left alone here for the same
+                # reason, and refused aloud when the state *was* built, since
+                # then there is provenance to establish and no way to.
                 continue
-            if rooted and buffer.flags.owndata:
-                continue
+            # A rooted buffer that owns its data used to be left for the
+            # freezing pass on the grounds that both it and whatever it might
+            # share with were frozen already. That premise fails for exactly
+            # the buffer this branch caught -- owning and *writeable* -- and
+            # it stayed writeable for as long as the other coefficients'
+            # setters were running. One of them took a view of it, the final
+            # pass froze the owner, and the view kept writing to the same
+            # memory: the guard passed and the optimizer returned the C-15.7
+            # displacement. So the rule is now uniform. Anything not already
+            # at the postcondition is replaced by a frozen copy before any
+            # setter runs, and no writeable coefficient is ever live while
+            # subclass code executes.
             # Not ``buffer.copy()``: an ``ndarray`` subclass may override it,
             # and one returning ``self`` put the freeze back on the shared
             # source this branch exists to protect, while one perturbing the
@@ -688,28 +1342,36 @@ class AffineDynamics:
             # allocates storage of its own instead is beyond any ordering, and
             # is refused below.
             replacement.flags.writeable = False
+            replacements[name] = replacement
+
+        # Every copy is taken and frozen above, before the first setter runs
+        # below, and not one name at a time. Interleaving them left the
+        # coefficients later in the order still holding the writeable arrays
+        # ``deepcopy`` and protocol 4 hand back, for exactly as long as the
+        # earlier names' setters were running. A setter that wrote into one of
+        # those -- ``self._C[...] = 3.0`` from inside ``_M``'s setter -- was
+        # writing into the array the loop had not yet copied, so the change
+        # was taken into the replacement as though it had arrived that way.
+        # `OBSERVED` through ``copy.deepcopy`` of the C-15.7 fixture built at
+        # ``C = 2``: the copy held ``C = 3``, owning and frozen, with intact
+        # provenance, and verified; ``[0.6781500, 0.6165000]`` became
+        # ``[1.1265375, 1.0241250]``, the exact gradient for the value
+        # substituted. Copying first closes the window: what the setters are
+        # handed is read from the state as it arrived, and the arrays they can
+        # still reach are no longer the ones anything will read.
+        for name, replacement in replacements.items():
             try:
                 setattr(self, name, replacement)
             except Exception as exc:
-                # The reason is read off the buffer, not assumed. This branch
-                # takes both a writeable buffer and a frozen one that does not
-                # own its storage, and naming the wrong one sends the caller
-                # after the wrong remedy.
-                reason = (
-                    "writeable, and freezing it where it lies would reach back "
-                    "through the sharing a copy leaves and freeze the original"
-                    if buffer.flags.writeable
-                    else "frozen but does not own its storage, so it has to be "
-                    "replaced by one that does"
-                )
-                raise MutableCoefficients(
-                    type(self),
-                    name,
-                    f"{reason}; and it cannot be replaced with a frozen copy "
-                    f"({type(exc).__name__}: {exc}). Give the attribute a "
-                    f"setter, or leave the root's buffers as constructed",
-                ) from exc
-            handed.append((name, replacement))
+                raise _cannot_replace(self, name, expected[name], exc) from exc
+            expected[name] = replacement
+            replaced.add(name)
+            # Measured now, not at the end: "did this name's own setter store
+            # what it was handed" and "is this name still correct once every
+            # setter has run" are different questions, and only the first can
+            # be answered here. Recorded rather than raised on, so that a
+            # later setter still gets to run and be blamed for its own doing.
+            faithful[name] = _resolve_buffer(self, name) is replacement
 
         # Restoration does not run ``__init__``, so this is where the same
         # substitution is refused on the way back in; without it a pickle
@@ -717,8 +1379,24 @@ class AffineDynamics:
         # here for the reason the constructor defers it: one coefficient's
         # setter may replace another, so a name checked the instant it was
         # assigned is checked before the setter that rewrites it has run.
-        for name, replacement in handed:
-            _require_stored_as_handed(self, name, replacement)
+        # A name absent when ``names`` was computed is absent from
+        # ``expected``, so nothing would have checked it. An unrooted instance
+        # can gain one: a setter that builds a coefficient the state did not
+        # carry, keeping a writeable handle to it, produced the C-15.7
+        # displacement with every check quiet. It is recorded as having been
+        # expected to stay absent, which is what makes the refusal true.
+        for name in _resolving_buffer_names(self):
+            expected.setdefault(name, _MISSING)
+        for name, buffer in expected.items():
+            if buffer is _MISSING:
+                case = "appeared"
+            elif name not in replaced:
+                case = "unassigned"
+            elif faithful[name]:
+                case = "later"
+            else:
+                case = "own"
+            _require_stored_as_handed(self, name, buffer, case)
         for name in names:
             buffer = _resolve_buffer(self, name)
             if not isinstance(buffer, np.ndarray) or not buffer.flags.owndata:
@@ -731,6 +1409,9 @@ class AffineDynamics:
             buffer.flags.writeable = False
         if names == _COEFFICIENT_BUFFERS:
             storage[_ROOT_INITIALISED] = True
+        # Last, once every buffer is the one this will answer with. The
+        # register is what a route that never reached here cannot produce.
+        _record_establishment(self)
 
     @property
     def M(self) -> NDArray:
@@ -1386,6 +2067,12 @@ def require_immutable_coefficients(problem: object) -> None:
                 f"of dtype {buffer.dtype!s}, whose elements stay mutable "
                 f"however the array is flagged",
             )
+    # Last, because the checks above name a specific defect in a specific
+    # buffer and this one does not: it reports the absence of evidence, which
+    # is the right answer only once nothing more definite is available.
+    unestablished = _not_established_by_the_root(problem)
+    if unestablished is not None:
+        raise MutableCoefficients(type(problem), "_M", unestablished)
 
 
 def affine_dynamics_verified(
