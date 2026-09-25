@@ -97,12 +97,45 @@ Nonlinear parametrisations are specified in `NUMERICS.md` C-10.3 and are not
 implemented. They need an extra curvature term; omitting it yields a
 Gauss-Newton operator, which may not be presented as the exact Hessian.
 
+### Factorisation reuse
+
+An LU factorisation is reused across stages and steps only when the caller
+declares the structure that makes reuse exact:
+
+```python
+from adjungo import GLMOptimizer, ProblemStructure
+from adjungo.core.problem import Linearity
+
+structure = ProblemStructure(
+    linearity=Linearity.SEMILINEAR,
+    jacobian_constant=True,      # the declaration that permits reuse
+    jacobian_control_dependent=False,
+    has_second_derivatives=True,
+)
+optimizer = GLMOptimizer(problem, objective, method, t_span, N, y0,
+                         problem_structure=structure)
+```
+
+Two things are then true. Reuse is *declared*, never inferred: an earlier
+version probed `F` to discover constancy, varied only `u` and `t`, and let a
+state-dependent Jacobian through, which handed the adjoint another stage's
+matrix (precedent R-9 in `NUMERICS.md`). And the declaration is *checked*:
+before any stored factorisation is returned, the matrix it was taken from is
+compared with the matrix now being asked for, element for element. A
+declaration contradicted by the problem raises rather than reusing.
+
+With a constant Jacobian declared, an entire solve takes one factorisation
+instead of one per stage per Newton iteration per step. The counts are
+asserted, not timed — refactoring the same matrix gives the same answer, so
+no accuracy test can detect a failure to reuse. See
+`tests/test_factorization_reuse.py` and `NUMERICS.md` C-15.
+
 ### Not yet implemented
 
-- Factorisation **reuse** across stages or steps. Each stage is factored at its
-  own converged iterate. An earlier reuse path was removed after it was found
-  to hand the adjoint another stage's matrix; see precedent R-9 in
-  `NUMERICS.md`.
+- Factorisation reuse for a **varying** Jacobian (modified Newton, lagged
+  Jacobian). Reuse under a declared-constant Jacobian is implemented and is
+  described above; what is missing is reuse where the matrix genuinely
+  changes and a stale one would be used deliberately.
 - Nonlinear control parametrisation, sparse operators, and checkpointing.
 
 ## Installation
@@ -276,25 +309,32 @@ The library is organized into several modules:
 | [`docs/linalg_requirements.tex`](docs/linalg_requirements.tex) | Linear algebra requirements by method family. A **design** document for the eventual C++ library, not a description of this code. Its status preamble lists four rules it stated that were later refuted, and the clauses that correct them. |
 | [`docs/history/`](docs/history/README.md) | Superseded development reports, kept as evidence. Not maintained; see the index for where each durable claim now lives. |
 
+## Examples
+
+All three are executed by the test suite, and each is checked against the
+independently assembled reference rather than merely run.
+
+| Example | What it demonstrates |
+|---|---|
+| [`minimum_energy_oscillator.py`](examples/minimum_energy_oscillator.py) | The quick start above. Explicit Runge–Kutta (`rk4`) on dynamics affine in `(y, u)`, with both optimizer routes: gradient-only and the exact Hessian-vector product. |
+| [`nonlinear_implicit_control.py`](examples/nonlinear_implicit_control.py) | The fully implicit route. A controlled Van der Pol oscillator under `gauss2`: coupled stages solved as one `(s·n)` Newton system per step, and a Jacobian that genuinely depends on the state, so the second derivatives of `f` are not zero. |
+| [`factorization_reuse_counts.py`](examples/factorization_reuse_counts.py) | Declaration-gated factorisation reuse, counted rather than timed. One factorisation for the whole solve when `jacobian_constant=True` is declared, against one per stage per Newton iteration per step when it is not — with an identical gradient either way. |
+
 ## Development
 
-Run tests:
+All commands invoke the virtual environment's interpreter explicitly; there is
+no assumption that a shell has been activated.
 
 ```bash
-pytest
+.venv/bin/python -m pytest                            # full suite
+.venv/bin/python -m ruff check adjungo tests examples # lint
+.venv/bin/python -m mypy adjungo                      # type check
 ```
 
-Format code:
-
-```bash
-black adjungo/
-```
-
-Type checking:
-
-```bash
-mypy adjungo/
-```
+The full suite runs in a few seconds, so there is no reason to select a subset.
+[`AGENTS.md`](AGENTS.md) carries the working rules this repository enforces:
+the defect-injection procedure, where exploratory scripts live, and the
+tolerance and documentation conventions.
 
 ## License
 
@@ -302,4 +342,6 @@ See LICENSE file for details.
 
 ## Contributing
 
-Contributions are welcome! Please see CONTRIBUTING.md for guidelines.
+Contributions are welcome. [`AGENTS.md`](AGENTS.md) is the contributor guide;
+[`NUMERICS.md`](NUMERICS.md) is the normative contract, and any accuracy,
+envelope or degeneracy claim must cite a clause that exists there.

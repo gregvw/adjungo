@@ -263,6 +263,86 @@ def test_certified_families_agree_with_the_code():
     )
 
 
+def test_the_readme_status_table_agrees_with_the_code():
+    """The README's own certified table is checked, not only its prose.
+
+    ``tests/test_examples.py`` already forbids the README from advertising a
+    *refused* family, and executes its quick start. Both of those guards
+    point the same way: they catch the README claiming more than the code
+    delivers. Nothing compared the README's status table with
+    ``CERTIFIED_STAGE_TYPES``, so the opposite drift was invisible -- and it
+    had happened, in the section this table sits above, which listed
+    factorisation reuse as unimplemented long after C-15 delivered and
+    counted it.
+
+    ``docs/architecture.md`` is checked in both directions. This gives the
+    README, the document a reader meets first, the same treatment.
+    """
+    from adjungo.core.method import StageType
+    from adjungo.optimization.interface import CERTIFIED_STAGE_TYPES
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    section = readme[readme.index("## What is supported"):]
+
+    #: README row label -> implementing stage type, or ``None`` where the
+    #: family has no route at all. The labels carry their method names, so a
+    #: reworded row surfaces here as unknown rather than being skipped.
+    ROUTES = {
+        "Explicit Runge–Kutta (`explicit_euler`, `heun`, `rk4`)": (
+            StageType.EXPLICIT
+        ),
+        "DIRK (`implicit_trapezoid` / Crank–Nicolson)": StageType.DIRK,
+        "SDIRK (`implicit_midpoint`, `sdirk2`, `sdirk3`)": StageType.SDIRK,
+        "Fully implicit, dense `A` (`gauss2`)": StageType.IMPLICIT,
+        "BDF (`bdf2`, `bdf3`)": None,
+        "Adams (`adams_bashforth2`, `adams_moulton2`)": None,
+        "IMEX / additive splitting": None,
+    }
+
+    rows = _first_table_block(section)
+    labels = {label for label, _ in rows}
+
+    unknown = labels - set(ROUTES)
+    assert not unknown, (
+        f"README lists method families this test cannot verify: "
+        f"{sorted(unknown)}. Record the implementing stage type here, or "
+        "None if the family has no route."
+    )
+    missing = set(ROUTES) - labels
+    assert not missing, (
+        f"README no longer lists {sorted(missing)}. Dropping a row removes "
+        "a certification or a refusal without removing the capability."
+    )
+
+    for label, row in rows:
+        certified_in_readme = "**certified**" in row
+        stage_type = ROUTES[label]
+
+        if stage_type is None:
+            assert not certified_in_readme, (
+                f"README marks {label!r} certified, but no stage-solver route "
+                "implements it."
+            )
+            continue
+
+        certified_in_code = stage_type in CERTIFIED_STAGE_TYPES
+        assert certified_in_readme == certified_in_code, (
+            f"{label}: README says "
+            f"{'certified' if certified_in_readme else 'not certified'} but "
+            f"CERTIFIED_STAGE_TYPES says "
+            f"{'certified' if certified_in_code else 'not certified'}"
+        )
+
+    # Under-claiming is the direction the other README guards miss.
+    routed = {ROUTES[label] for label, row in rows if "**certified**" in row}
+    unadvertised = CERTIFIED_STAGE_TYPES - routed
+    assert not unadvertised, (
+        f"the code certifies {unadvertised}, which the README does not "
+        "present as certified. Delivered capability must not exceed what the "
+        "README tells a reader is available."
+    )
+
+
 # ---------------------------------------------------------------------------
 # The archived reports
 # ---------------------------------------------------------------------------

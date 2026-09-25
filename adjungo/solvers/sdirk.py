@@ -19,13 +19,13 @@ class SDIRKStageSolver(StageDispatchMixin, StageSolver):
     SDIRK stage solver: a constant diagonal coefficient ``γ`` means every
     implicit stage has a matrix of the same *form*, ``I - h γ F``.
 
-    **Factorization reuse is not performed.** Each stage publishes the LU
-    factorization taken at its own converged iterate. That is the matrix the
-    stage equation actually used and therefore the matrix whose transpose the
-    adjoint must use (NUMERICS.md C-5.4).
+    **A factorization object is never shared between stages.** Each stage
+    publishes the LU factorization taken at its own converged iterate. That is
+    the matrix the stage equation actually used and therefore the matrix whose
+    transpose the adjoint must use (NUMERICS.md C-5.4).
 
-    Reuse is only exact when ``F`` is genuinely constant, and the solver
-    cannot establish that. An earlier version of this class probed ``F`` at
+    Sharing one object across stages is exact only when ``F`` is genuinely
+    constant, and the solver cannot establish that. An earlier version of this class probed ``F`` at
     ``(y_history[0], u_i, t_i)`` and, on agreement, published one shared
     factorization object for every stage. The probe varied only ``u`` and
     ``t``: it never varied the state, so a Jacobian depending on ``y`` alone
