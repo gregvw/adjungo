@@ -95,10 +95,33 @@ jobs:
           echo "Repository root is clean."
 
       # testpaths must make bare `pytest` and `pytest tests/` agree.
+      #
+      # Compare collected node IDs, not a summary line. `pyproject.toml`
+      # already sets `-q`, so the `-q` below was the *second* one: at that
+      # quiet level pytest prints per-file counts followed by a blank line,
+      # `tail -1` selected the blank line, and the check compared "" with "".
+      # It passed even when the two collections genuinely differed (833 vs
+      # 819 was verified to pass). `-o addopts=--strict-markers` restores a
+      # single `-q` while keeping strict markers. This is the same doubling
+      # hazard AGENTS.md records for R-11 injection counts.
       - name: Bare pytest collects exactly tests/
         run: |
-          bare=$(python -m pytest --collect-only -q 2>&1 | tail -1)
-          scoped=$(python -m pytest tests/ --collect-only -q 2>&1 | tail -1)
-          echo "bare  : $bare"
-          echo "scoped: $scoped"
-          test "$bare" = "$scoped"
+          set -o pipefail
+          tmp=$(mktemp -d)
+          collect='--collect-only -q -o addopts=--strict-markers'
+          # Not piped: a collection error must fail the step, not be masked
+          # by a grep that finds nothing.
+          python -m pytest $collect > "$tmp/bare.raw"
+          python -m pytest tests/ $collect > "$tmp/scoped.raw"
+          grep '::' "$tmp/bare.raw" | sort > "$tmp/bare.ids" || true
+          grep '::' "$tmp/scoped.raw" | sort > "$tmp/scoped.ids" || true
+          bare=$(wc -l < "$tmp/bare.ids")
+          scoped=$(wc -l < "$tmp/scoped.ids")
+          echo "bare  : $bare node IDs"
+          echo "scoped: $scoped node IDs"
+          if [ "$bare" -eq 0 ]; then
+            echo "::error::Collection produced no node IDs. The comparison"
+            echo "::error::below would be vacuous; failing instead."
+            exit 1
+          fi
+          diff "$tmp/bare.ids" "$tmp/scoped.ids"

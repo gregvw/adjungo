@@ -12,6 +12,8 @@ the code cites, still point at something.
 """
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -332,6 +334,80 @@ def test_no_ad_hoc_reports_remain_in_the_repository_root():
         + ", ".join(unexpected)
         + ". Session reports and working notes belong in docs/history/ with a "
         "superseded banner and an entry in docs/history/README.md."
+    )
+
+
+# --------------------------------------------------------------------------
+# Collection parity
+#
+# `testpaths` is what makes bare `pytest` safe. CI checks this too, but the
+# CI check was vacuous from the day it was written, so the property is held
+# here as well, where it can be run and falsified locally.
+# --------------------------------------------------------------------------
+
+
+def _collected_node_ids(*args: str) -> list[str]:
+    """Node IDs from a collection run, with the quiet level pinned.
+
+    ``addopts`` is replaced rather than extended. ``pyproject.toml`` sets
+    ``-q``, so passing ``-q`` here would be the *second* one, and at that
+    level pytest stops listing node IDs and prints per-file counts instead.
+    ``--strict-markers`` is restored explicitly because collection is
+    exactly when it applies.
+    """
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            *args,
+            "--collect-only",
+            "-q",
+            "-o",
+            "addopts=--strict-markers",
+            "-p",
+            "no:cacheprovider",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,  # the assertion below reports the output, not CalledProcessError
+    )
+    assert completed.returncode == 0, (
+        f"collection failed for {args or ('<bare>',)}:\n{completed.stdout}"
+        f"\n{completed.stderr}"
+    )
+    return sorted(
+        line.strip() for line in completed.stdout.splitlines() if "::" in line
+    )
+
+
+def test_bare_collection_and_scoped_collection_agree():
+    """``pytest`` and ``pytest tests/`` must collect the same node IDs.
+
+    Root-level ``test_*.py`` files once made these two commands disagree,
+    and one of them raised at import and broke bare collection outright.
+    ``testpaths = ["tests"]`` in ``pyproject.toml`` is what keeps them
+    equal, and this test is what notices if that stops being true.
+
+    The node IDs are compared, not a count and not a summary line. The
+    equivalent CI step compared ``tail -1`` of a doubled-``-q`` run, which
+    is an empty line, so it compared ``""`` with ``""`` and passed while
+    bare collection saw 833 tests and a deliberately narrowed scoped
+    collection saw 819. A guard that cannot fail is not a guard; see the
+    same ``-q`` doubling hazard recorded in ``AGENTS.md`` under R-11.
+    """
+    bare = _collected_node_ids()
+    scoped = _collected_node_ids("tests/")
+
+    assert bare, "bare collection produced no node IDs; the comparison would be vacuous"
+
+    only_bare = sorted(set(bare) - set(scoped))
+    only_scoped = sorted(set(scoped) - set(bare))
+    assert bare == scoped, (
+        "bare `pytest` and `pytest tests/` collect different tests.\n"
+        f"  only bare ({len(only_bare)}): {only_bare[:5]}\n"
+        f"  only scoped ({len(only_scoped)}): {only_scoped[:5]}"
     )
 
 
