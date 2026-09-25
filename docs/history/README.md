@@ -1,6 +1,6 @@
 # Historical reports — archive and accounting checklist
 
-The 17 files in this directory were written during earlier development and kept
+The original 17 reports in this directory were written during earlier development and kept
 in the repository root. They are **superseded**. Each now carries a banner
 saying so.
 
@@ -45,6 +45,7 @@ than lost.
 
 | Report | Durable content | Where it lives now | Deliberately not promoted |
 |---|---|---|---|
+| `WARM_START_2026_09_24.md` | Travel checkpoint at `5c19cc8`: Git custody, verified runtime, 822-test baseline, closure reproducers, hashes and resume commands. | Current numerical claims remain in `NUMERICS.md` C-15.7 and `tests/test_coefficient_immutability.py`; dated evidence and checksums accompany this snapshot in `checkpoints/2026-09-24/`. | The checkpoint is not a full independent review, injection-campaign rerun, policy approval or authorization to begin parked work. |
 | `ADJOINT_FIXES_SUMMARY.md` | The stage adjoint carries the step size `h`; omitting it from the terminal and coupling terms is a defect, not a scaling choice. | `NUMERICS.md` C-8.1 (placement of `h`) and C-13 item 1. | A scalar anchor `dy/dt = u`, `J = ½y(T)² + ½u²` with derivative `2.0`. The anchor idea was promoted; this instance's indexing is not fully stated. Closed-form anchors now live in `tests/`. |
 | `ADJOINT_SENSITIVITY_IMPLEMENTED.md` | The second-order adjoint is a second backward sweep with the same operator and a different right-hand side. | `NUMERICS.md` R-6; implemented in `adjungo/stepping/sensitivity.py`. | Hessian finite-difference discrepancies of `6.7e-4`–`3e-3`: no random direction, objective, mesh or tolerance recorded. |
 | `ADJOINT_SIGN_ISSUE.md` | The sign conflict between the Lagrangian as stated and the terminal/recursion/gradient relations derived from it. | **Fixed in `docs/glm_opt.tex`** — the Lagrangian now adjoins constraints with a minus sign, and a "Sign convention (corrected)" paragraph explains why `Aᴴμ = Bᴴλ` is invariant under the flip while the relations carrying `∂J` are not. Matches `adjungo/stepping/adjoint.py` and `adjungo/optimization/gradient.py`. | Diagnostic vectors for `dy/dt = −y + u`, `h = 0.333`: the objective and initial state are not fully stated. |

@@ -1,0 +1,77 @@
+Adjungo checkpoint verification — 2026-09-24
+Source HEAD: 5c19cc8676d1b39435d6bfeee51671f3a67ce517
+Commands: .venv/bin/python -m pytest; .venv/bin/python -m ruff check adjungo tests examples; .venv/bin/python -m mypy adjungo; .venv/bin/python examples/minimum_energy_oscillator.py
+........................................................................ [  8%]
+........................................................................ [ 17%]
+........................................................................ [ 26%]
+........................................................................ [ 35%]
+........................................................................ [ 43%]
+........................................................................ [ 52%]
+........................................................................ [ 61%]
+........................................................................ [ 70%]
+........................................................................ [ 78%]
+........................................................................ [ 87%]
+........................................................................ [ 96%]
+..............................                                           [100%]
+822 passed in 1.86s
+All checks passed!
+Success: no issues found in 41 source files
+Minimum-energy rendezvous for a damped mass-spring oscillator
+==============================================================
+  natural frequency  omega_0 = 2.0000 rad/s
+  damping ratio      zeta    = 0.1000 (underdamped)
+  natural period             = 3.1416 s
+  horizon T                  = 4.0 s
+  step h                     = 0.0500 s   (h*omega_0 = 0.100)
+
+  converged                  : True
+  iterations                 : 5
+  objective J                : 2.9259452002e-01
+  |grad J|_inf               : 1.995e-17
+
+  final position x(T)        :  5.685135e-04 m
+  final velocity v(T)        : -6.517304e-03 m/s
+  peak control               : 1.072986 N
+
+  uncontrolled x(T)          : -2.594075e-03 m
+  uncontrolled v(T)          : -8.981267e-01 m/s
+
+The gradient driving this solve is the exact derivative of the
+discrete objective at this mesh, not a finite-difference or
+continuous-adjoint approximation (NUMERICS.md C-2).
+
+Environment and Git identities:
+5c19cc8676d1b39435d6bfeee51671f3a67ce517
+4b749628268f29fd554081c98dfd236dc4663990
+Python: 3.14.3 (main, Feb  3 2026, 15:32:20) [Clang 17.0.0 (clang-1700.6.3.2)]
+Executable: /Users/greg.von.winckel/Projects/github/adjungo/.venv/bin/python
+Platform: macOS-26.7-arm64-arm-64bit-Mach-O
+NumPy: 2.5.3
+SciPy: 1.18.1
+Package: /Users/greg.von.winckel/Projects/github/adjungo/adjungo/__init__.py
+BLAS: {'name': 'accelerate', 'found': True, 'version': 'unknown', 'detection method': 'system', 'include directory': 'unknown', 'lib directory': 'unknown', 'openblas configuration': 'unknown', 'pc file directory': 'unknown'}
+
+Targeted closure checks (exact reproduction in WARM_START_2026_09_24.md):
+Checkpoint time: 2026-09-24T16:48:04.906443-06:00
+deepcopy external-buffer metadata: accepted, closed form matches
+pickle4 external-buffer metadata: accepted, closed form matches
+pickle5 external-buffer metadata: accepted, closed form matches
+Three chained protocol-5 round trips, then deepcopy: closed form matches
+
+No injection campaign was rerun. Full independent review of the two newer commits remains separate.
+
+Final document-inclusive validation:
+Command: .venv/bin/python -m pytest
+........................................................................ [  8%]
+........................................................................ [ 17%]
+........................................................................ [ 26%]
+........................................................................ [ 35%]
+........................................................................ [ 43%]
+........................................................................ [ 52%]
+........................................................................ [ 61%]
+........................................................................ [ 70%]
+........................................................................ [ 78%]
+........................................................................ [ 87%]
+........................................................................ [ 96%]
+..............................                                           [100%]
+822 passed in 1.87s
