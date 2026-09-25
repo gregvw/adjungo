@@ -21,6 +21,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 NUMERICS = ROOT / "NUMERICS.md"
+COEFFICIENT_EVIDENCE = ROOT / "docs" / "evidence" / "coefficient_immutability.md"
+CONTRACT_DOCUMENTS = (NUMERICS, COEFFICIENT_EVIDENCE)
 HISTORY = ROOT / "docs" / "history"
 
 
@@ -47,8 +49,11 @@ def _anchors(text: str) -> set[str]:
     return found
 
 
-def test_numerics_internal_links_resolve():
-    """Every ``[...](#...)`` in NUMERICS.md points at a real anchor.
+@pytest.mark.parametrize(
+    "document", CONTRACT_DOCUMENTS, ids=lambda path: str(path.relative_to(ROOT))
+)
+def test_numerics_internal_links_resolve(document):
+    """Contract and evidence links resolve, including across the file boundary.
 
     Eleven of the thirteen internal links in this document were broken when
     this test was written, all in the same way: the link was spelled from the
@@ -56,16 +61,34 @@ def test_numerics_internal_links_resolve():
     as "— `APPROVED`", which GitHub folds into the generated anchor. The cure
     was explicit anchors; this test is what stops it recurring.
     """
-    text = _numerics_text()
-    anchors = _anchors(text)
-    links = sorted(set(re.findall(r"\]\((#[^)]+)\)", text)))
+    text = document.read_text(encoding="utf-8")
+    links = sorted(set(re.findall(r"\]\(([^)]+)\)", text)))
+    assert links, "no links found; the extraction pattern is wrong"
 
-    assert links, "no internal links found; the extraction pattern is wrong"
-
-    broken = [link for link in links if link not in anchors]
+    broken = []
+    for link in links:
+        if re.match(r"[a-z]+:", link):
+            continue
+        filename, _, fragment = link.partition("#")
+        target = (document.parent / filename).resolve() if filename else document
+        if not target.is_file() or (
+            fragment
+            and "#" + fragment not in _anchors(target.read_text(encoding="utf-8"))
+        ):
+            broken.append(link)
     assert not broken, (
-        "NUMERICS.md contains links to anchors that do not exist:\n  "
+        f"{document.relative_to(ROOT)} contains links that do not resolve:\n  "
         + "\n  ".join(broken)
+    )
+
+
+def test_coefficient_history_is_linked_from_its_clause():
+    """Moving the history must not make its witnesses undiscoverable."""
+    clause = _numerics_text().split("### C-15.7", 1)[1].split("## C-16", 1)[0]
+    target = COEFFICIENT_EVIDENCE.relative_to(ROOT).as_posix()
+    links = re.findall(r"\]\(([^)]+)\)", clause)
+    assert any(link.partition("#")[0] == target for link in links), (
+        "C-15.7 no longer links to its failure history and campaign evidence"
     )
 
 
@@ -830,7 +853,7 @@ def test_the_adjoint_block_matrix_is_the_forward_transpose():
 
 
 def _injection_tables(text: str) -> list[tuple[int, list[str]]]:
-    """Each injection table in NUMERICS.md, as (line number, defect cells)."""
+    """Each injection table in a document, as (line number, defect cells)."""
     tables: list[tuple[int, list[str]]] = []
     lines = text.splitlines()
     for index, line in enumerate(lines):
@@ -856,35 +879,47 @@ def test_each_injection_campaign_is_reported_once():
     into ``__setstate__``. Two clauses reporting the same injected defect is
     the signature.
     """
-    tables = _injection_tables(_numerics_text())
+    tables = [
+        (document, line, rows)
+        for document in CONTRACT_DOCUMENTS
+        for line, rows in _injection_tables(document.read_text(encoding="utf-8"))
+    ]
     assert len(tables) >= 4
 
-    seen: dict[str, int] = {}
-    for line, rows in tables:
-        assert rows, f"empty injection table at NUMERICS.md:{line}"
+    seen: dict[str, tuple[Path, int]] = {}
+    for document, line, rows in tables:
+        location = (document.relative_to(ROOT), line)
+        assert rows, f"empty injection table at {location[0]}:{line}"
         for defect in rows:
-            first = seen.setdefault(defect, line)
-            assert first == line, (
-                f"NUMERICS.md:{line} repeats the defect first reported at "
-                f"line {first}: {defect!r}"
+            first = seen.setdefault(defect, location)
+            assert first == location, (
+                f"{location[0]}:{line} repeats the defect first reported at "
+                f"{first[0]}:{first[1]}: {defect!r}"
             )
 
 
 def test_a_reported_campaign_size_matches_its_table():
-    """``n of n detected`` is a count of the rows that follow it."""
-    text = _numerics_text()
-    tables = _injection_tables(text)
-    lines = text.splitlines()
+    """``n of n detected`` is a count of the rows that follow it.
 
+    Only a complete claim is checked. A table whose lead states nothing, or
+    states a partial ``n of m``, is skipped, so four of the five campaigns
+    recorded across the contract and its evidence are currently unguarded.
+    Recognition of partial claims is deferred. Tables without a stated
+    campaign size provide no total to compare; the final assertion requires
+    at least one recognized complete claim.
+    """
     checked = 0
-    for line, rows in tables:
-        lead = "\n".join(lines[max(0, line - 8) : line - 1])
-        stated = re.search(r"(\d+) of \1\b", lead)
-        if stated is None:
-            continue
-        checked += 1
-        assert len(rows) == int(stated.group(1)), (
-            f"NUMERICS.md:{line} claims {stated.group(1)} defects and lists "
-            f"{len(rows)}"
-        )
+    for document in CONTRACT_DOCUMENTS:
+        text = document.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        for line, rows in _injection_tables(text):
+            lead = "\n".join(lines[max(0, line - 8) : line - 1])
+            stated = re.search(r"(\d+) of \1\b", lead)
+            if stated is None:
+                continue
+            checked += 1
+            assert len(rows) == int(stated.group(1)), (
+                f"{document.relative_to(ROOT)}:{line} claims "
+                f"{stated.group(1)} defects and lists {len(rows)}"
+            )
     assert checked, "no injection table states its size"

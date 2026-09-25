@@ -176,6 +176,18 @@ class OverwritesCoefficientMidSolve:
         return np.ones((1, 1))
 
 
+class _Holds:
+    """Presents a loose array as the ``_M`` the callback above overwrites.
+
+    The mutation moment is the one the whole clause measures — the first
+    callback of the backward sweep — so a case whose aliased array is not
+    reachable through the problem borrows it rather than restating it.
+    """
+
+    def __init__(self, buffer: NDArray) -> None:
+        self._M = buffer
+
+
 class AliasesAMutableBuffer:
     """A plain callback problem returning a live reference to its own buffer.
 
@@ -3468,6 +3480,191 @@ def test_an_out_of_band_round_trip_that_hands_back_its_own_buffers(
     assert np.asarray(
         _gradient(restored, OverwritesCoefficientMidSolve(None))
     ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+class ResolvesThroughItsMetadataExporter(AffineDynamics):
+    """``_M`` is answered from the array a metadata view exports.
+
+    The setter keeps a *view* of the array it is handed, and the reader
+    hands back that view's owner, so the coefficient resolves to the root's
+    own frozen buffer by identity while the state carries only the view.
+    Nothing here overrides a copy hook, a reader or the provenance record,
+    and every default and supported out-of-band route answers exactly --
+    which is asserted separately, so that the witness below isolates the one
+    thing a replacement provider changes.
+
+    The walk in ``_arrays_a_traversal_would_reach`` does not follow
+    ``ndarray.base``, so the coefficient is recorded as never having
+    travelled and restoration leaves it exactly as it arrives. In band that
+    is sound, because no default route rebuilds an array through its
+    storage. Out of band the loader borrows whatever the caller supplies,
+    and this shape is where the difference between the two reaches a
+    coefficient (C-15.7).
+    """
+
+    @property
+    def _M(self) -> NDArray:  # type: ignore[override]
+        view = cast("NDArray", self.metadata)
+        owner = view.base
+        if isinstance(owner, np.ndarray) and owner.flags.owndata:
+            return owner
+        return view
+
+    @_M.setter
+    def _M(self, value: NDArray) -> None:
+        self.metadata = value.view()
+
+
+def _out_of_band(
+    supply: Callable[[list[pickle.PickleBuffer]], list[Any]],
+    problem: AffineDynamics,
+) -> AffineDynamics:
+    """Round trip through protocol 5 with the buffers ``supply`` returns."""
+    buffers: list[pickle.PickleBuffer] = []
+    payload = pickle.dumps(problem, protocol=5, buffer_callback=buffers.append)
+    assert buffers, "the fixture must actually serialise out of band"
+    return cast(
+        "AffineDynamics", pickle.loads(payload, buffers=supply(buffers))
+    )
+
+
+def _replaced_by_faithful_storage(
+    problem: AffineDynamics,
+) -> tuple[AffineDynamics, NDArray]:
+    """Load out of band from a byte-identical provider the caller still holds.
+
+    This is the receiver's half of an ordinary transport, in the one form
+    C-15.7 excludes: identical bytes, size and order, in storage of the
+    caller's own rather than the storage the dump returned. The alias is
+    taken while that storage is writeable and kept after it is frozen, which
+    is what a zero-copy receiver has in hand — the sender's buffer is
+    read-only, being a view of a frozen coefficient, so nothing here
+    unfreezes anything.
+    """
+    buffers: list[pickle.PickleBuffer] = []
+    payload = pickle.dumps(problem, protocol=5, buffer_callback=buffers.append)
+    coefficient = problem._M
+    index = next(
+        position
+        for position, exported in enumerate(buffers)
+        if np.shares_memory(
+            np.frombuffer(exported.raw(), dtype=np.uint8), coefficient
+        )
+    )
+    replacement = np.array(coefficient, dtype=float, copy=True)
+    alias = replacement.view()
+    replacement.flags.writeable = False
+    assert bytes(memoryview(replacement)) == bytes(buffers[index].raw()), (
+        "the replacement must be byte-for-byte faithful, so that nothing "
+        "but the backing storage distinguishes it from what was produced"
+    )
+
+    providers: list[Any] = list(buffers)
+    providers[index] = replacement
+    restored = cast("AffineDynamics", pickle.loads(payload, buffers=providers))
+    return restored, alias
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        *[
+            pytest.param(
+                functools.partial(_round_trip_through_pickle, protocol),
+                id=f"pickle-p{protocol}",
+            )
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        ],
+        pytest.param(
+            functools.partial(_out_of_band, list),
+            id="out-of-band-original-providers",
+        ),
+        pytest.param(
+            functools.partial(
+                _out_of_band,
+                lambda produced: [memoryview(b.raw()) for b in produced],
+            ),
+            id="out-of-band-wrappers-over-the-same-storage",
+        ),
+    ],
+)
+def test_a_metadata_exporter_answers_on_every_supported_route(
+    route: Callable[[AffineDynamics], AffineDynamics],
+) -> None:
+    """The control for the witness below: only the provider differs.
+
+    Without this, the measurement that follows would not say which of the
+    fixture and the replacement storage displaced the gradient.
+    """
+    exact, _ = _closed_form(2.0)
+    source = ResolvesThroughItsMetadataExporter(M_CONST, C_DOUBLED)
+    assert affine_dynamics_verified(source)
+
+    restored = route(source)
+    require_immutable_coefficients(restored)
+    assert restored._M.flags.owndata and not restored._M.flags.writeable
+    assert np.asarray(
+        _gradient(restored, OverwritesCoefficientMidSolve(None))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+
+def test_a_replacement_provider_displaces_the_gradient() -> None:
+    """The excluded half of PEP 574, as a measurement rather than a claim.
+
+    C-15.7 excludes any out-of-band provider backed by storage other than
+    the storage the dump returned, *even a byte-for-byte faithful one*,
+    because neither end of the mechanism is visible from the object: the
+    library cannot check what it would be promising. This asserts the state
+    that exclusion describes, so that the number in the clause can be
+    rechecked rather than taken on trust.
+
+    **This test asserts a wrong answer on purpose.** It records where the
+    implementation stands, not a property worth preserving: the
+    displacement is derived in closed form by :func:`_closed_form`, and the
+    first gradient component moves from ``0.6781500`` to ``0.7552125`` at
+    ``C = 2``. Anything that severs the receiver's alias -- restoring the
+    ``ndarray.base`` descent, or any other improvement to the provenance
+    scheme -- fails here, and that failure is a prompt to update this test
+    and the observation in C-15.7 rather than a defect: closing the case
+    *widens* the supported envelope, and a correct answer is not a contract
+    violation. Promising support for the whole replacement-provider class
+    is a separate decision, which this test does not make.
+
+    The ordinary shape is the control, and it is not displaced: a plain
+    ``AffineDynamics`` carries its coefficient in the state, so restoration
+    replaces it with a frozen copy and the receiver's alias is severed even
+    for replacement storage. What the exclusion is *for* is the shape that
+    resolves a coefficient through storage the state only exports.
+    """
+    exact, displacement = _closed_form(2.0)
+    displaced = np.array(exact, dtype=float)
+    displaced[0, 0, 0] += displacement
+
+    plain, severed = _replaced_by_faithful_storage(
+        AffineDynamics(M_CONST, C_DOUBLED)
+    )
+    require_immutable_coefficients(plain)
+    assert not np.shares_memory(plain._M, severed), (
+        "the coefficient travels in the state, so restoration replaces it"
+    )
+    assert np.asarray(
+        _gradient(plain, OverwritesCoefficientMidSolve(_Holds(severed)))
+    ) == pytest.approx(exact, abs=EXACT_TOL)
+
+    restored, alias = _replaced_by_faithful_storage(
+        ResolvesThroughItsMetadataExporter(M_CONST, C_DOUBLED)
+    )
+    assert affine_dynamics_verified(restored), "every check this clause makes"
+    assert restored._M.flags.owndata and not restored._M.flags.writeable
+    assert np.shares_memory(restored._M, alias) and alias.flags.writeable, (
+        "the receiver kept a writeable alias of the restored coefficient"
+    )
+
+    assert np.asarray(
+        _gradient(restored, OverwritesCoefficientMidSolve(_Holds(alias)))
+    ) == pytest.approx(displaced, abs=EXACT_TOL)
 
 
 @pytest.mark.parametrize(
