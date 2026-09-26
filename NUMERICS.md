@@ -889,6 +889,68 @@ citations rather than newly decided, and states no requirement that was not
 already being applied. The gap was found by
 `tests/test_documentation.py::test_cited_clause_is_defined`.
 
+### C-14.3 The tier-1 oracle's starting point is chosen, not fixed — `APPROVED`
+
+`reference_solve` is a monolithic Newton iteration, so it has a starting point,
+and the starting point decides how far the oracle reaches. Holding every step
+node and every stage at `y₀` is a constant guess whose distance from the root is
+the whole excursion of the trajectory. On an oscillatory problem that does not
+merely cost iterations: the undriven pendulum at amplitude 2.8 over six
+libration periods (`gauss2`, `N = 60`, `h = 0.98`) leaves Newton at
+`‖R‖_∞ = 7.5e+07` after fifty iterations and the oracle refuses. The refusal is
+loud, per [C-7](#c-7), so this was a limit on the oracle's **reach**, never a
+wrong answer.
+
+The oracle therefore builds two candidates and starts from the better one:
+
+- the constant guess, and
+- a **forward sweep**, taking each step's stages from the explicit part
+  `Σ_k U[i,k] Y[n,k]` and applying Picard corrections `Z ← U Y + h A f(Z)`.
+
+The sweep uses the tableau and the problem callbacks only. It solves no linear
+system, so no implicit equation enters the predictor, and it reads nothing from
+`adjungo/stepping/`, so the independence C-14.1 item 1 requires is preserved.
+
+Two properties make this safe rather than merely faster.
+
+1. **A sweep is kept only while it contracts.** The Picard map contracts only
+   while `h` times the Lipschitz constant of `f` is below one; above it the
+   iteration runs away superlinearly. On the Van der Pol fixture of
+   `examples/nonlinear_implicit_control.py` at `h = 1.2`, two unguarded sweeps
+   reach `3e+72` and three reach `1e+252`, which produced a singular Newton
+   Jacobian and a `LinAlgError` — the failure that established this rule.
+2. **The sweep is adopted only on measured evidence.** Both candidates are
+   scored by `‖R‖_∞`, the same quantity Newton is driving to `tol`, and the
+   smaller wins. Nothing else is needed to handle a runaway: a defect is
+   `max(abs(·))`, hence `nan` or in `[0, ∞]`, and `nan < x` and `∞ < x` are both
+   false. `y' = −200 y` at `h = 0.1` overflows the sweep to `nan` and is
+   rejected by the ordinary comparison.
+
+**The acceptance test is unchanged.** A returned answer has been measured
+against the same `‖R‖_∞ ≤ tol`; `iterations = 0` reports a starting point that
+was *checked* and found converged, not one assumed to be. The accepted point is
+not bit-identical to the one the constant start reached and is not claimed to
+be: Newton stops at the first iterate inside an absolute ball of radius `tol`,
+and which point that is depends on where it began. Over `gauss2`, `sdirk3` and
+`rk4` on the damped pendulum at `N = 20` and `N = 80` the two accepted roots
+differ by at most `5e-14` relative — two points in a `1e-13` ball. A sweep that
+delivered Newton to a *different* root would differ by the scale of the
+trajectory, order `1`, so the `1e-10` bound asserted in
+`tests/test_reference_initial_guess.py` separates those outcomes by eight orders
+while staying clear of backend rounding ([C-11.3](#c-11)).
+
+The reach gained is finite and is not claimed to be unlimited. At amplitude 3.0
+and `h = 1.24` both starting points still refuse.
+
+`OBSERVED` — `tests/test_reference_initial_guess.py`, ten tests. Injection
+campaign per [C-14.2](#c-14) against the 911-test baseline: eleven injections,
+ten detected (1–3 failures each), one deliberately not covered. Evaluating the
+sweep at the step time rather than the stage time is undetected and is dismissed
+rather than cured — the sweep is a starting point, so its accuracy is a cost
+question that the selection and the unchanged acceptance test insulate from the
+result; both fields in that suite are autonomous, so the edit is not observable
+in them at all.
+
 ---
 
 <a id="c-15"></a>
