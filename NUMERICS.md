@@ -900,6 +900,13 @@ An implicit stage solver may reuse an LU factorization across stages, steps, or
 repeated calls **only** when the caller has declared
 `ProblemStructure(jacobian_constant=True)`.
 
+Reuse **across calls only**, at the same stage time, has a second licence. It
+applies when the structure states that `F` depends on neither the state nor
+the control: `state_affine=True` with `jacobian_control_dependent=False`. The
+structure may be declared by the caller or deduced from a verified
+`TimeVaryingAffineDynamics`. That route is [C-17.6](#c-17), and the C-15.2
+comparison applies to it unchanged.
+
 It may never decide to reuse by examining the problem at run time. Precedent
 [R-9](#r-9) records what that costs: a probe that evaluated `F` at
 `(y_history[0], u_i, t_i)` varied the control and the time but never the state,
@@ -1689,7 +1696,7 @@ Evidence: `tests/test_instance_shadowing.py`.
 ---
 
 <a id="c-17"></a>
-## C-17 Time-varying affine coefficients keep the skip and lose the reuse — `APPROVED`
+## C-17 Time-varying affine coefficients keep the skip and reuse only across calls — `APPROVED`
 
 [C-16.2](#c-16) states `jointly_affine` as `f = M(t)y + C(t)u + b(t)`, with the
 coefficients free to vary in time, and then opens the zero-curvature route only
@@ -1754,12 +1761,20 @@ Whether this residue should be closed by having the representation own
 coefficient *samples* on the solve mesh, rather than invoke callables, is
 [C-Q6](#open-questions).
 
+C-17.6 narrows the residue for `M` on implicit routes, and only there. An `M`
+that reads the control is refused on the *next* evaluation at a different
+control, because the matrix at each stage time is then compared with the one
+factored on the previous call. The first evaluation is still silently wrong.
+Nothing changes for `C` or `b`, which are never factored, or for explicit
+methods.
+
 ### C-17.2 Zero curvature does not imply a constant Jacobian
 
 [C-16.1](#c-16) requires the three dispatch axes be kept separate, and this is
 the case that separates two of them. `F = M(t_i)` differs between stages at
-distinct abscissae, so [C-15](#c-15) reuse must be **off** while the curvature
-skip stays **on**.
+distinct abscissae, so [C-15](#c-15) reuse *within a solve* must be **off**
+while the curvature skip stays **on**. Reuse across calls, where the same
+stage times recur, is C-17.6.
 
 The fact is carried by `coefficients_constant`, a member of each root class's
 guarantee rather than a caller declaration, and is read by `deduce_structure` to
@@ -1795,6 +1810,10 @@ residual check (`adjungo/solvers/dirk.py:98`, `adjungo/solvers/sdirk.py:159`),
 so a coefficient that drifted on that call would seed the adjoint with a matrix
 the forward solve never used, undetected. Determinism is an obligation, not a
 verified fact.
+
+Across calls it is now verified for `M` on implicit routes: C-17.6 compares
+the matrix at each stage time with the one factored on the previous call, and
+refuses drift rather than reusing a stale factorization.
 
 Two further obligations are enforced rather than documented:
 
@@ -1905,6 +1924,75 @@ because the defect lives in the caller's closure. It is held by a pair of
 closed-form tests instead.
 
 Evidence: `tests/test_time_varying_affine.py`.
+
+### C-17.6 Reuse across calls at the same stage time — `OBSERVED`
+
+**Why it is sound.** With `F = M(t)`, each stage matrix `I − h a_ii M(t_i)` is
+a function of the stage time alone. On a fixed mesh the same stage times recur
+on every call, so the matrix at each one recurs exactly, whatever the control.
+Reuse *within* a solve stays off (C-17.2), because distinct stage times give
+distinct matrices.
+
+The store key carries the stage time: `(a_ii, h, t_i)` for DIRK, `(γ, h, t_i)`
+for SDIRK, `("coupled", h, t_n)` for a dense `A`. The key is still only a
+hint. Every hit is decided by the [C-15.2](#c-15) exact comparison, so a key
+that fails to match costs a factorization, never an answer.
+
+**Licence.** `SolverRequirements.can_reuse_across_calls` is true when
+`state_affine` holds and `jacobian_control_dependent` does not. A constant
+Jacobian implies it.
+
+- For `TimeVaryingAffineDynamics`, both facts are constructed (C-17.1).
+- A caller may declare them for another problem. C-15.2 then refuses the
+  first call whose matrix at some stage time differs from the earlier one.
+  That is the second licence recorded in [C-15.1](#c-15).
+
+**A guard gained.** The comparison needs two matrices, and across calls both
+now exist. So C-17.3's determinism obligation is verified for `M` on implicit
+routes, and C-17.1's closure residue is narrowed as that clause records.
+
+**Certified count.** Measured on the C-17.4 fixture over three evaluations at
+distinct controls: two gradients, then a Hessian-vector product.
+
+| Method | Factorizations per call |
+|---|---|
+| `implicit_midpoint` | `[6, 0, 0]` |
+| `implicit_trapezoid` | `[6, 0, 0]` |
+| `sdirk2` | `[12, 0, 0]` |
+| `sdirk3` | `[18, 0, 0]` |
+| `gauss2` | `[6, 0, 0]` |
+
+The first entry is C-17.4's count for one evaluation. Two contrasts are
+asserted beside it:
+
+- the constant case, at `[1, 0, 0]`;
+- a structure that withholds the time-only fact, which must stay at
+  `[k, k, k]`.
+
+`factorizations_for_repeated_solve` predicts the zeros. Per
+[C-15.4](#c-15), derivatives at a later control equal, bit for bit, those of
+an optimizer that has never factored anything.
+
+**Cost.** The store keeps one matrix and its factors per distinct stage time:
+about `2·N·(implicit stage solves per step)·m²` doubles, where `m` is `n`, or
+`s·n` for a dense `A`. On the C-17.4 fixture this is trivial. A problem whose
+`N·m²` makes it prohibitive needs a memory policy this package does not yet
+have.
+
+**Injection evidence** — `OBSERVED`. Each defect introduced alone, under the
+[R-11](#r-11) procedure, against a baseline of 889 passed:
+
+| Defect | Failures |
+|---|---|
+| the solvers drop the stage time from the key, with reuse still on | 66 |
+| the factory does not pass `reuse_across_calls` to the solver | 21 |
+| the store stops comparing before it reuses | 17 |
+| the deduction ignores control dependence | 7 |
+| the deduction ignores state affinity | 7 |
+| the repeated-solve prediction never claims zero | 5 |
+| SDIRK keys by the step time instead of the stage time | 25 |
+
+Evidence: `tests/test_time_varying_affine.py`, section "Reuse across calls".
 
 ---
 

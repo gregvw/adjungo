@@ -53,6 +53,7 @@ class SDIRKStageSolver(StageDispatchMixin, StageSolver):
     def __init__(
         self,
         reuse_across_steps: bool = False,
+        reuse_across_calls: bool = False,
         y_scale: float = 1.0,
         needs_newton: bool = True,
     ) -> None:
@@ -62,6 +63,12 @@ class SDIRKStageSolver(StageDispatchMixin, StageSolver):
         #: which was computed and unconsumed before milestone M7. ``False``
         #: routes each stage through one exact linear solve.
         self.needs_newton = needs_newton
+        #: A Jacobian depending on time alone (C-17.6): the matrix at a stage
+        #: time recurs on every call on the same mesh but differs between
+        #: stage times, so the key carries the stage time and reuse spans
+        #: calls, never stages or steps. A constant Jacobian already reuses
+        #: across all three and keeps the coarser key.
+        self.key_by_stage_time = reuse_across_calls and not reuse_across_steps
         #: All SDIRK implicit stages share one diagonal coefficient, so with
         #: a declared-constant Jacobian every stage of every step presents
         #: the same matrix ``I - h g F`` and exactly one factorization is
@@ -69,7 +76,8 @@ class SDIRKStageSolver(StageDispatchMixin, StageSolver):
         #: each matrix before reusing; see
         #: :mod:`adjungo.solvers.factorization`.
         self.factorizations = FactorizationStore(
-            reuse_enabled=reuse_across_steps
+            reuse_enabled=reuse_across_steps or reuse_across_calls,
+            across_calls=self.key_by_stage_time,
         )
 
     def solve_stages(
@@ -150,7 +158,10 @@ class SDIRKStageSolver(StageDispatchMixin, StageSolver):
                     y_scale=self.y_scale,
                     context=stage_context("SDIRK", i, step, t_stage),
                     factor=functools.partial(
-                        self.factorizations.factor, (gamma, h)
+                        self.factorizations.factor,
+                        (gamma, h, t_stage)
+                        if self.key_by_stage_time
+                        else (gamma, h),
                     ),
                 )
                 factorizations.append(lu)

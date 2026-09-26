@@ -61,7 +61,10 @@ class DeclaredStructureViolation(RuntimeError):
     """A declared :class:`ProblemStructure` is contradicted by the problem.
 
     Raised when ``jacobian_constant=True`` was declared and two stage matrices
-    that the declaration says are identical are observed not to be.
+    that the declaration says are identical are observed not to be, or --
+    with ``across_calls=True`` -- when the structure states that ``F`` depends
+    on time alone and the matrix at one stage time differs between calls
+    (C-17.6).
 
     This is a hard guard with no override. The alternative to raising is to
     return a derivative computed with the transpose of a matrix the forward
@@ -72,17 +75,42 @@ class DeclaredStructureViolation(RuntimeError):
     ``jacobian_constant=False``, which costs accuracy nothing.
     """
 
-    def __init__(self, key: Hashable, largest_difference: float) -> None:
-        super().__init__(
-            f"ProblemStructure declared jacobian_constant=True, but the stage "
-            f"matrix for {key!r} differs between uses by {largest_difference:.3e} "
-            f"in the largest element. The declaration is false for this "
-            f"problem. Reusing the factorization would make the adjoint solve "
-            f"with the transpose of a matrix the forward solve did not use "
-            f"(NUMERICS.md R-9). Declare jacobian_constant=False; the "
-            f"derivatives will be identical and only the factorization count "
-            f"will rise."
-        )
+    def __init__(
+        self,
+        key: Hashable,
+        largest_difference: float,
+        *,
+        across_calls: bool = False,
+    ) -> None:
+        if across_calls:
+            message = (
+                f"The problem structure states that F depends on neither the "
+                f"state nor the control (state_affine=True, "
+                f"jacobian_control_dependent=False), so the stage matrix at a "
+                f"given stage time must be the same on every call. The matrix "
+                f"for {key!r} differs from the one factored on an earlier call "
+                f"by {largest_difference:.3e} in the largest element. Either F "
+                f"depends on y or u, or a coefficient is not a deterministic "
+                f"function of t (NUMERICS.md C-17.3). Reusing the "
+                f"factorization would make the adjoint solve with the "
+                f"transpose of a matrix the forward solve did not use "
+                f"(NUMERICS.md R-9). If the structure was declared, declare "
+                f"jacobian_control_dependent=True; the derivatives will be "
+                f"identical and only the factorization count will rise."
+            )
+        else:
+            message = (
+                f"ProblemStructure declared jacobian_constant=True, but the "
+                f"stage matrix for {key!r} differs between uses by "
+                f"{largest_difference:.3e} in the largest element. The "
+                f"declaration is false for this problem. Reusing the "
+                f"factorization would make the adjoint solve with the "
+                f"transpose of a matrix the forward solve did not use "
+                f"(NUMERICS.md R-9). Declare jacobian_constant=False; the "
+                f"derivatives will be identical and only the factorization "
+                f"count will rise."
+            )
+        super().__init__(message)
         self.key = key
         self.largest_difference = largest_difference
 
@@ -93,6 +121,9 @@ class FactorizationStore:
     One store is held by a stage solver for its whole lifetime, so reuse spans
     stages *and* steps *and* repeated ``gradient``/``hessian_vector_product``
     calls: if the Jacobian is constant, none of those vary the stage matrix.
+    If it depends on time alone, the matrix at each stage time recurs on every
+    call on the same mesh, and callers key by stage time so that reuse spans
+    calls but never stages or steps (C-17.6).
 
     The counters are not diagnostics. `NUMERICS.md` C-15 makes the observed
     factorization count a certified quantity with a predicted value, because a
@@ -101,10 +132,17 @@ class FactorizationStore:
     cost changes. ``tests/test_factorization_reuse.py`` asserts the count.
     """
 
-    def __init__(self, *, reuse_enabled: bool) -> None:
-        #: Whether the caller declared a constant Jacobian. When false the
-        #: store is a pass-through that still counts.
+    def __init__(
+        self, *, reuse_enabled: bool, across_calls: bool = False
+    ) -> None:
+        #: Whether a declaration licenses reuse. When false the store is a
+        #: pass-through that still counts.
         self.reuse_enabled = reuse_enabled
+        #: Which declaration reuse rests on, so that a refusal names the one
+        #: that is false: ``False`` for a constant Jacobian, ``True`` for a
+        #: Jacobian depending on time alone, whose callers key by stage time
+        #: and reuse only across calls (C-17.6). The comparison is the same.
+        self.across_calls = across_calls
         self._entries: dict[Hashable, tuple[NDArray, Any]] = {}
         #: Number of ``lu_factor`` calls actually made.
         self.factorizations = 0
@@ -151,7 +189,9 @@ class FactorizationStore:
                     if reference.shape == matrix.shape
                     else float("inf")
                 )
-                raise DeclaredStructureViolation(key, difference)
+                raise DeclaredStructureViolation(
+                    key, difference, across_calls=self.across_calls
+                )
             self.reuses += 1
             return lu
 

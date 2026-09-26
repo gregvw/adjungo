@@ -130,6 +130,15 @@ asserted, not timed — refactoring the same matrix gives the same answer, so
 no accuracy test can detect a failure to reuse. See
 `tests/test_factorization_reuse.py` and `NUMERICS.md` C-15.
 
+A Jacobian that depends on time alone, such as that of
+`TimeVaryingAffineDynamics`, gets a narrower reuse. Its stage matrices differ
+from one stage time to the next, so nothing is shared within a solve. But on a
+fixed mesh the matrix at each stage time is the same on every call, whatever
+the control. The first gradient therefore takes one factorisation per implicit
+stage solve, and every later gradient or Hessian-vector product takes none.
+The same exact comparison guards every reuse, so a coefficient that changes
+between calls is refused. See `NUMERICS.md` C-17.6.
+
 ### Not yet implemented
 
 - Factorisation reuse for a **varying** Jacobian (modified Newton, lagged

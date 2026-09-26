@@ -375,7 +375,11 @@ def test_constant_coefficients_still_claim_a_constant_jacobian() -> None:
 
 
 @pytest.mark.parametrize("factory", IMPLICIT_METHODS)
-def test_no_reuse_is_deduced_for_time_varying_coefficients(factory) -> None:
+def test_no_reuse_within_a_solve_is_deduced_for_time_varying_coefficients(
+    factory,
+) -> None:
+    """Distinct stage times give distinct matrices (C-17.2). Reuse *across
+    calls* is deduced, and is asserted separately under C-17.6."""
     opt, _u, _m = build(factory)
     requirements = opt.requirements
     assert not requirements.needs_newton
@@ -898,3 +902,160 @@ def test_declaring_a_constant_jacobian_here_is_refused(factory) -> None:
     opt, u, _m = build(factory, structure=lying)
     with pytest.raises(DeclaredStructureViolation):
         opt.gradient(u)
+
+
+# ---------------------------------------------------------------------------
+# Reuse across calls (C-17.6)
+# ---------------------------------------------------------------------------
+
+
+def _counts_per_call(opt, method) -> list[int]:
+    """Factorizations taken by each of three evaluations at distinct controls.
+
+    The third is a Hessian-vector product rather than a gradient, so that the
+    count covers the call an optimizer's inner Krylov loop makes most often.
+    """
+    store = opt.stage_solver.factorizations
+    store.reset_counts()
+    counts = []
+    for seed in (5, 29, 31):
+        u = make_controls(N_STEPS, method.s, NU, seed=seed, scale=0.4)
+        before = store.factorizations
+        if seed == 31:
+            v = make_controls(N_STEPS, method.s, NU, seed=37, scale=0.3)
+            opt.hessian_vector_product(u, v)
+        else:
+            opt.gradient(u)
+        counts.append(store.factorizations - before)
+    return counts
+
+
+@pytest.mark.parametrize("factory", IMPLICIT_METHODS)
+def test_reuse_across_calls_is_deduced_for_time_varying_coefficients(
+    factory,
+) -> None:
+    """``F = M(t)`` depends on neither the state nor the control, so the
+    matrix at each stage time is the same on every call (C-17.6)."""
+    opt, _u, _m = build(factory)
+    requirements = opt.requirements
+    assert requirements.can_reuse_across_calls
+    assert requirements.factorizations_for_repeated_solve() == 0
+    assert opt.stage_solver.key_by_stage_time
+
+
+@pytest.mark.parametrize("factory", IMPLICIT_METHODS)
+def test_a_repeated_solve_takes_no_factorizations(factory) -> None:
+    """The certified count for C-17.6, with its contrasts.
+
+    The first call takes exactly what C-17.4 certifies for one evaluation;
+    every later call on the same mesh takes none, whatever the control. The
+    constant case is asserted beside it, as in C-17.4, and a structure that
+    withholds the time-only fact must keep refactoring, so that neither
+    number can be vacuous.
+    """
+    opt, _u, method = build(factory)
+    first = expected_factorizations(method, N_STEPS)
+    assert _counts_per_call(opt, method) == [first, 0, 0]
+
+    opt_const, _u, _m = build(factory, problem=constant_problem())
+    assert _counts_per_call(opt_const, method) == [1, 0, 0]
+
+    withheld = ProblemStructure(
+        linearity=Linearity.LINEAR,
+        jacobian_constant=False,
+        jacobian_control_dependent=True,
+        has_second_derivatives=True,
+        state_affine=True,
+    )
+    opt_withheld, _u, _m = build(factory, structure=withheld)
+    assert not opt_withheld.requirements.can_reuse_across_calls
+    assert opt_withheld.requirements.factorizations_for_repeated_solve() is None
+    assert _counts_per_call(opt_withheld, method) == [first, first, first]
+
+
+@pytest.mark.parametrize("factory", IMPLICIT_METHODS)
+def test_reuse_across_calls_reproduces_a_fresh_solve_exactly(factory) -> None:
+    """C-15.4 for this route. A reused factorization is the factorization of
+    the identical matrix, so derivatives at a later control must equal, bit
+    for bit, those of an optimizer that has never factored anything. This
+    holds under any BLAS, because both sides run the same LU on the same
+    input."""
+    opt_reusing, u_first, method = build(factory)
+    opt_reusing.gradient(u_first)
+
+    u = make_controls(N_STEPS, method.s, NU, seed=41, scale=0.4)
+    v = make_controls(N_STEPS, method.s, NU, seed=43, scale=0.3)
+    grad_reused = opt_reusing.gradient(u)
+    hvp_reused = opt_reusing.hessian_vector_product(u, v)
+    assert opt_reusing.stage_solver.factorizations.reuses > 0
+
+    opt_fresh, _u, _m = build(factory)
+    assert np.array_equal(grad_reused, opt_fresh.gradient(u))
+    assert np.array_equal(hvp_reused, opt_fresh.hessian_vector_product(u, v))
+
+
+@pytest.mark.parametrize("factory", IMPLICIT_METHODS)
+def test_a_coefficient_that_drifts_between_calls_is_refused(factory) -> None:
+    """C-17.3 makes determinism in ``t`` a caller obligation. Reuse across
+    calls would turn a violation into a stale factorization, so the C-15.2
+    comparison must refuse it -- and it can, because the two matrices it
+    compares now both exist: one from the earlier call, one from this one."""
+    scale = np.array([1.0])
+
+    def m_drifting(t: float) -> np.ndarray:
+        return M_0 + scale[0] * np.sin(1.7 * t) * M_1
+
+    problem = TimeVaryingAffineDynamics(
+        m_drifting, C_of_t, b_of_t, state_dim=NX, control_dim=NU
+    )
+    opt, u, method = build(factory, problem=problem)
+    opt.gradient(u)
+
+    scale[0] = 1.25
+    u_next = make_controls(N_STEPS, method.s, NU, seed=47, scale=0.4)
+    with pytest.raises(DeclaredStructureViolation) as excinfo:
+        opt.gradient(u_next)
+    message = str(excinfo.value)
+    assert "C-17.3" in message, "the refusal must name the obligation"
+    assert "jacobian_constant=True" not in message, (
+        "the refusal must name the declaration reuse rested on, and here that "
+        "is not a constant Jacobian"
+    )
+
+
+def test_a_matrix_coefficient_closing_over_the_control_is_caught_next_call() -> None:
+    """C-17.1's residue, narrowed for ``M`` on an implicit route.
+
+    The first evaluation is silently wrong exactly as C-17.1 records: nothing
+    inside one solve can see a coefficient that varies only with the control.
+    The next evaluation at a different control is compared against the first
+    at every stage time, so the leak is refused there. Nothing is gained for
+    ``C`` or ``b``, which are never factored, or for explicit methods, which
+    factor nothing; C-17.1's own test covers those and still passes.
+    """
+    current = np.array([0.3])
+
+    def m_leaky(t: float) -> np.ndarray:
+        return np.array([[-0.2 + 0.7 * current[0]]])
+
+    def c_unit(t: float) -> np.ndarray:
+        return np.array([[1.0]])
+
+    problem = TimeVaryingAffineDynamics(
+        m_leaky, c_unit, state_dim=1, control_dim=1
+    )
+    opt = GLMOptimizer(
+        problem,
+        AnchorObjective(),
+        implicit_midpoint(),
+        t_span=(0.0, 0.5),
+        N=1,
+        y0=np.array([0.8]),
+    )
+
+    grad = opt.gradient(np.array([[[0.3]]]))
+    assert np.all(np.isfinite(grad))
+
+    current[0] = 0.45
+    with pytest.raises(DeclaredStructureViolation):
+        opt.gradient(np.array([[[0.45]]]))

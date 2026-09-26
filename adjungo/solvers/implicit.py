@@ -125,6 +125,7 @@ class ImplicitStageSolver(StageDispatchMixin, StageSolver):
         self,
         y_scale: float = 1.0,
         reuse_across_steps: bool = False,
+        reuse_across_calls: bool = False,
         needs_newton: bool = True,
     ) -> None:
         self.y_scale = y_scale
@@ -133,6 +134,12 @@ class ImplicitStageSolver(StageDispatchMixin, StageSolver):
         #: which was computed and unconsumed before milestone M7. ``False``
         #: routes each stage through one exact linear solve.
         self.needs_newton = needs_newton
+        #: A Jacobian depending on time alone (C-17.6): the matrix at a stage
+        #: time recurs on every call on the same mesh but differs between
+        #: stage times, so the key carries the stage time and reuse spans
+        #: calls, never stages or steps. A constant Jacobian already reuses
+        #: across all three and keeps the coarser key.
+        self.key_by_stage_time = reuse_across_calls and not reuse_across_steps
         #: The coupled Newton Jacobian is ``I - h (A kron I) blockdiag(F_j)``
         #: of size ``s*n``. With a constant ``F`` it is the same matrix at
         #: every step, so the single ``O((s*n)^3)`` factorization is taken
@@ -141,7 +148,8 @@ class ImplicitStageSolver(StageDispatchMixin, StageSolver):
         #: do the most damage: the adjoint, the tangent and the second-order
         #: adjoint all solve with these same factors.
         self.factorizations = FactorizationStore(
-            reuse_enabled=reuse_across_steps
+            reuse_enabled=reuse_across_steps or reuse_across_calls,
+            across_calls=self.key_by_stage_time,
         )
 
     def solve_stages(
@@ -211,7 +219,10 @@ class ImplicitStageSolver(StageDispatchMixin, StageSolver):
                 y_scale=self.y_scale,
                 context=coupled_stage_context(step, t_n, h),
                 factor=functools.partial(
-                    self.factorizations.factor, ("coupled", h)
+                    self.factorizations.factor,
+                    ("coupled", h, t_n)
+                    if self.key_by_stage_time
+                    else ("coupled", h),
                 ),
             )
         except StageSolveError as exc:

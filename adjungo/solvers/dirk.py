@@ -25,6 +25,7 @@ class DIRKStageSolver(StageDispatchMixin, StageSolver):
         self,
         y_scale: float = 1.0,
         reuse_across_steps: bool = False,
+        reuse_across_calls: bool = False,
         needs_newton: bool = True,
     ) -> None:
         self.y_scale = y_scale
@@ -33,6 +34,12 @@ class DIRKStageSolver(StageDispatchMixin, StageSolver):
         #: which was computed and unconsumed before milestone M7. ``False``
         #: routes each stage through one exact linear solve.
         self.needs_newton = needs_newton
+        #: A Jacobian depending on time alone (C-17.6): the matrix at a stage
+        #: time recurs on every call on the same mesh but differs between
+        #: stage times, so the key carries the stage time and reuse spans
+        #: calls, never stages or steps. A constant Jacobian already reuses
+        #: across all three and keeps the coarser key.
+        self.key_by_stage_time = reuse_across_calls and not reuse_across_steps
         #: A DIRK tableau has distinct diagonal entries, so each implicit
         #: stage presents a different matrix ``I - h A[i,i] F`` even when
         #: ``F`` is constant. Keying on ``A[i,i]`` therefore gives one
@@ -41,7 +48,8 @@ class DIRKStageSolver(StageDispatchMixin, StageSolver):
         #: entry, which is sound for the same reason: the store compares the
         #: matrices before reusing.
         self.factorizations = FactorizationStore(
-            reuse_enabled=reuse_across_steps
+            reuse_enabled=reuse_across_steps or reuse_across_calls,
+            across_calls=self.key_by_stage_time,
         )
 
     def solve_stages(
@@ -134,7 +142,8 @@ class DIRKStageSolver(StageDispatchMixin, StageSolver):
             y_scale=self.y_scale,
             context=stage_context("DIRK", stage, step, t_stage),
             factor=functools.partial(
-                self.factorizations.factor, (a_ii, h)
+                self.factorizations.factor,
+                (a_ii, h, t_stage) if self.key_by_stage_time else (a_ii, h),
             ),
         )
 

@@ -40,6 +40,17 @@ class SolverRequirements:
     store_stage_values: bool
     trajectory_vectors_per_step: int  # ns + nr for (Z, y)
 
+    #: Whether the matrix at a given stage time recurs on every later call on
+    #: the same mesh. True when ``F`` depends on neither the state nor the
+    #: control -- ``state_affine`` with ``jacobian_control_dependent=False``,
+    #: so ``F = M(t)`` -- because the stage matrix ``I - h a_ii M(t_i)`` is
+    #: then a function of the stage time alone, whatever the control. It says
+    #: nothing about reuse *within* a solve: distinct stage times still give
+    #: distinct matrices (C-17.2). Implied by a constant Jacobian. The store
+    #: verifies every hit exactly (C-15.2), so a false statement here is
+    #: refused, not reused.
+    can_reuse_across_calls: bool = False
+
     def factorizations_for_solve(self, steps: int) -> int | None:
         """Predicted LU factorizations for a whole forward solve.
 
@@ -61,6 +72,23 @@ class SolverRequirements:
         if not self.can_reuse_across_steps:
             return None
         return self.factorizations_per_step
+
+    def factorizations_for_repeated_solve(self) -> int | None:
+        """Predicted LU factorizations for a later solve on the same mesh.
+
+        Zero when every stage matrix of the later solve already occurred in an
+        earlier one: always so for a constant Jacobian, and so for a Jacobian
+        depending on time alone, whose matrices recur at the same stage times
+        on every call (C-17.6). ``None`` otherwise, for the reason
+        :meth:`factorizations_for_solve` gives.
+
+        Like that count, this one is certified because it is invisible to
+        every accuracy test: a store that stopped reusing across calls would
+        return bit-identical derivatives at a higher cost.
+        """
+        if self.can_reuse_across_steps or self.can_reuse_across_calls:
+            return 0
+        return None
 
 
 def deduce_requirements(
@@ -110,6 +138,17 @@ def deduce_requirements(
     needs_newton = not is_linear
     n = state_dim
 
+    # F independent of the state and the control means F = M(t): each stage
+    # matrix is a function of its stage time alone, and recurs exactly at that
+    # time on every call on the same mesh (C-17.6). A constant Jacobian is the
+    # special case that also recurs across stages and steps.
+    jacobian_depends_on_time_only = (
+        problem.state_affine and not problem.jacobian_control_dependent
+    )
+    can_reuse_across_calls = (
+        problem.jacobian_constant or jacobian_depends_on_time_only
+    )
+
     if method.stage_type == StageType.SDIRK:
         # SDIRK's defining property is a single diagonal coefficient, so all
         # implicit stages present the matrix I - h g F: one distinct matrix
@@ -134,6 +173,7 @@ def deduce_requirements(
             store_jacobians=True,
             store_stage_values=True,
             trajectory_vectors_per_step=method.s + method.r,
+            can_reuse_across_calls=can_reuse_across_calls,
         )
 
     if method.stage_type == StageType.DIRK:
@@ -155,6 +195,7 @@ def deduce_requirements(
             store_jacobians=True,
             store_stage_values=True,
             trajectory_vectors_per_step=method.s + method.r,
+            can_reuse_across_calls=can_reuse_across_calls,
         )
 
     # Fully implicit
@@ -168,4 +209,5 @@ def deduce_requirements(
         store_jacobians=True,
         store_stage_values=True,
         trajectory_vectors_per_step=method.s + method.r,
+        can_reuse_across_calls=can_reuse_across_calls,
     )

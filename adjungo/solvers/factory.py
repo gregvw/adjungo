@@ -53,6 +53,7 @@ def create_stage_solver(
     if method.stage_type == StageType.SDIRK:
         return SDIRKStageSolver(
             reuse_across_steps=requirements.can_reuse_across_steps,
+            reuse_across_calls=requirements.can_reuse_across_calls,
             y_scale=y_scale,
             needs_newton=requirements.needs_newton,
         )
@@ -61,6 +62,7 @@ def create_stage_solver(
         return DIRKStageSolver(
             y_scale=y_scale,
             reuse_across_steps=requirements.can_reuse_across_steps,
+            reuse_across_calls=requirements.can_reuse_across_calls,
             needs_newton=requirements.needs_newton,
         )
 
@@ -68,5 +70,6 @@ def create_stage_solver(
     return ImplicitStageSolver(
         y_scale=y_scale,
         reuse_across_steps=requirements.can_reuse_across_steps,
+        reuse_across_calls=requirements.can_reuse_across_calls,
         needs_newton=requirements.needs_newton,
     )
