@@ -60,6 +60,10 @@ class Linearity(Enum):
     may be used to skip a contracted-Hessian term. ``LINEAR`` permits
     ``f = M y + b(u, t)`` with ``b`` arbitrary in ``u``. Use
     :attr:`ProblemStructure.jointly_affine` for that question.
+
+    Nor does any member establish that ``F`` is constant in time: ``LINEAR``
+    permits ``M = M(t)``, so none may be read as
+    :attr:`ProblemStructure.jacobian_constant` (C-15.1).
     """
     LINEAR = auto()       # F independent of y, u
     BILINEAR = auto()     # F = H + uV
@@ -96,7 +100,9 @@ class ProblemStructure:
     ``f = M y + b(u, t)`` with ``b`` arbitrary in ``u``; see
     :mod:`adjungo.core.affine` and the in-tree counterexample
     ``tests/problems.py::ConstantJacobianQuadraticControl``, which is ``LINEAR``
-    with a nonzero ``F_uu``.
+    with a nonzero ``F_uu``. For the same reason it **must never imply
+    ``jacobian_constant``**: ``LINEAR`` also permits ``M = M(t)``, as
+    ``tests/problems.py::LinearTimeVarying`` does.
     """
 
     def __init__(

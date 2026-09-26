@@ -920,6 +920,28 @@ Jacobian is control-independent and still differs at every stage. It was inert
 only because nothing consumed the flag. **Correctness of a gate that nothing
 reads is not evidence that the gate is correct.**
 
+The prohibition also covers deduction rules that *make* the declaration on
+the caller's behalf. Until 2026-09-26, `GLMOptimizer._deduce_problem_structure`
+set `jacobian_constant = linearity is Linearity.LINEAR`. `LINEAR` declares
+that `F` is independent of `y` and `u`. It says nothing about `t`, and
+`F = M(t)` satisfies it ([C-16.1](#c-16)). So a time-varying problem that
+declared `LINEAR` was routed to reuse and refused by the C-15.2 guard at its
+second stage matrix. The refusal was loud, so no wrong number escaped, but a
+valid problem could not be solved without overriding the deduction.
+
+The in-tree `LinearTimeVarying` fixture never exposed this. It declares no
+`linearity`, so it was deduced `NONLINEAR` and never reached the rule. That
+is the second lesson of [C-16.8](#c-16) again. **A declaration of one fact is
+not a declaration of another.**
+
+A constant Jacobian now reaches reuse only as an explicit
+`ProblemStructure(jacobian_constant=True)`, or from a verified affine class's
+`coefficients_constant` ([C-17.2](#c-17)). The witness is
+`tests/test_factorization_reuse.py::test_a_declared_linear_time_varying_problem_is_solved_not_refused`,
+which runs over all five implicit families. It and
+`tests/test_cache_and_structure.py::test_declared_linearity_does_not_deduce_a_constant_jacobian`
+fail when the old deduction is restored (6 tests, under the R-11 procedure).
+
 ### C-15.2 A declaration is a promise; reuse requires the fact
 
 `ProblemStructure` is supplied by the caller and is not checked by declaring it.

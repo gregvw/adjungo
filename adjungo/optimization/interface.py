@@ -168,6 +168,12 @@ class GLMOptimizer:
           re-evaluation and disables reuse. A problem that knows it is linear
           declares so via ``problem.linearity`` or by passing an explicit
           ``problem_structure``.
+        - ``jacobian_constant`` is **not** deduced from ``linearity``. A
+          linearity declaration classifies how ``F`` depends on the state and
+          the control, not on time, so it cannot stand in for the C-15.1
+          declaration that licenses reuse. That declaration is made by
+          passing ``ProblemStructure(jacobian_constant=True)``; the only
+          deduced source is a verified affine class (C-17.2).
         """
         declared = getattr(self.problem, "linearity", None)
         linearity = declared if isinstance(declared, Linearity) else (
@@ -207,8 +213,15 @@ class GLMOptimizer:
                 jointly_affine=True,
             )
 
-        # Only a problem that declares linearity may claim a constant Jacobian.
-        jacobian_constant = linearity is Linearity.LINEAR
+        # A constant Jacobian is never deduced from a linearity declaration.
+        # LINEAR says F is independent of y and u; it says nothing about t,
+        # and F = M(t) satisfies it (C-16.1). Reading it as constancy made the
+        # C-15.1 declaration on the caller's behalf, and a time-varying LINEAR
+        # problem was routed to reuse and then refused by the C-15.2 guard.
+        # Constancy reaches reuse only as an explicit
+        # ProblemStructure(jacobian_constant=True) or from a verified affine
+        # class's coefficients_constant (C-17.2), handled above.
+        jacobian_constant = False
         jacobian_control_dependent = linearity not in (
             Linearity.LINEAR,
             Linearity.SEMILINEAR,

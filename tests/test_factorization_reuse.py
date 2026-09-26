@@ -42,9 +42,11 @@ from adjungo.solvers.factorization import (
     DeclaredStructureViolation,
     FactorizationStore,
 )
+from adjungo.validation import reference_gradient, reference_hessian
 from tests.problems import (
     ConstantJacobianQuadraticControl,
     FullCostObjective,
+    LinearTimeVarying,
     StateDependentJacobian,
     make_controls,
 )
@@ -369,6 +371,80 @@ def test_the_same_problem_is_correct_when_declared_honestly():
 
     scale = max(float(np.max(np.abs(numeric))), 1.0)
     assert np.max(np.abs(analytic - numeric)) / scale < 1e-7
+
+
+class _DeclaredLinearTimeVarying(LinearTimeVarying):
+    """``LinearTimeVarying`` routed through the ``LINEAR`` branch.
+
+    The parent is ``LINEAR`` by that member's own definition -- ``F`` depends
+    on ``t`` alone -- but declares no ``linearity``, so it is deduced
+    ``NONLINEAR`` and never reaches the deduction that could misread it.
+    Pinning a counterexample is not the same as routing it through the code
+    that could misuse it (C-16.8, item 2).
+    """
+
+    linearity = Linearity.LINEAR
+
+
+# Basis (R-13), measured on this fixture across all five implicit families:
+# package and reference agree to at most 1.1e-16 relative, gradient and
+# Hessian-vector product alike, because both take one exact LU solve per stage
+# with no iteration. A stale factorization reused across these t-varying stage
+# matrices -- measured with the C-15.2 comparison bypassed on the Newton route,
+# where nothing else notices -- moves the gradient by 6.9e-4 to 2.8e-3. 1e-11
+# sits five orders above the first and seven below the second.
+_LINEAR_ROUTE_RTOL = 1e-11
+
+
+@pytest.mark.parametrize("name,factory", IMPLICIT_METHODS)
+def test_a_declared_linear_time_varying_problem_is_solved_not_refused(
+    name, factory
+):
+    """``LINEAR`` is not a constancy declaration (C-15.1).
+
+    ``Linearity.LINEAR`` says ``F`` is independent of ``y`` and ``u``; it says
+    nothing about ``t``, and ``F = M(t)`` satisfies it (C-16.1). The deduction
+    used to read it as ``jacobian_constant=True``, which made the C-15.1
+    declaration on the caller's behalf, routed this problem to reuse, and had
+    the C-15.2 guard refuse it at the second stage matrix. The guard was right;
+    the deduction was not.
+
+    The problem must now be solved on the linear route with reuse off, and
+    both derivatives must match the independent reference (C-14.1).
+    """
+    method = factory()
+    problem = _DeclaredLinearTimeVarying()
+    objective = FullCostObjective(nx=2, nu=2)
+    y0 = np.array([0.6, -0.4])
+    optimizer = GLMOptimizer(problem, objective, method, T_SPAN, N_STEPS, y0)
+    u = make_controls(N_STEPS, method.s, 2, seed=7)
+    v = make_controls(N_STEPS, method.s, 2, seed=8)
+
+    assert optimizer.problem_structure.linearity is Linearity.LINEAR
+    assert optimizer.problem_structure.jacobian_constant is False
+    assert not optimizer.requirements.needs_newton
+    assert not _store(optimizer).reuse_enabled
+
+    grad = optimizer.gradient(u)
+    grad_ref = reference_gradient(
+        y0, u, T_SPAN, N_STEPS, problem, method, objective
+    )
+    hessian = reference_hessian(
+        y0, u, T_SPAN, N_STEPS, problem, method, objective
+    )
+    hvp = optimizer.hessian_vector_product(u, v)
+    hvp_ref = (hessian.reshape(u.size, u.size) @ v.ravel()).reshape(u.shape)
+
+    for label, value, reference in (
+        ("gradient", grad, grad_ref),
+        ("Hessian-vector product", hvp, hvp_ref),
+    ):
+        scale = max(float(np.max(np.abs(reference))), 1.0)
+        err = float(np.max(np.abs(value - reference))) / scale
+        assert err < _LINEAR_ROUTE_RTOL, (
+            f"{name}: {label} differs from the independent reference by "
+            f"{err:.3e} (relative, C-3 basis)"
+        )
 
 
 # --------------------------------------------------------------------------

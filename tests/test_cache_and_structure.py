@@ -181,7 +181,20 @@ def test_declared_linearity_is_honoured():
     structure = _build(_DeclaredLinear())._deduce_problem_structure()
 
     assert structure.linearity is Linearity.LINEAR
-    assert structure.jacobian_constant is True
+
+
+def test_declared_linearity_does_not_deduce_a_constant_jacobian():
+    """``LINEAR`` says ``F`` is independent of ``y`` and ``u``, not of ``t``.
+
+    ``F = M(t)`` satisfies it (C-16.1), so reading it as a constant Jacobian
+    would make the C-15.1 declaration on the caller's behalf. Constancy
+    reaches the reuse path only as an explicit ``ProblemStructure`` or from a
+    verified affine class (C-17.2). The end-to-end consequence is asserted in
+    ``tests/test_factorization_reuse.py``.
+    """
+    structure = _build(_DeclaredLinear())._deduce_problem_structure()
+
+    assert structure.jacobian_constant is False
 
 
 @pytest.mark.parametrize("bogus", ["linear", 0, None])

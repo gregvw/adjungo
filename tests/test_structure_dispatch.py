@@ -697,7 +697,10 @@ def test_declaring_linear_does_not_deduce_zero_curvature() -> None:
     problem = DeclaredLinear()
     opt, u, method = build(sdirk2, problem=problem)
     assert opt.problem_structure.linearity is Linearity.LINEAR
-    assert opt.problem_structure.jacobian_constant
+    # What the LINEAR branch legitimately decides: stage equations linear in
+    # their unknown. It no longer decides constancy (C-15.1), so the branch is
+    # witnessed by the stage route rather than by jacobian_constant.
+    assert not opt.requirements.needs_newton
     assert not opt.problem_structure.jointly_affine
 
     v = make_controls(N_STEPS, method.s, 2, seed=31, scale=0.25)
