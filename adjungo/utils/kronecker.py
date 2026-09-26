@@ -88,24 +88,26 @@ def block_solve(A: NDArray, b: NDArray, s: int, n: int) -> NDArray:
     b_reshaped = b.reshape(s, n)
     x = np.zeros((s, n))
 
+    # Structure is decided exactly (NUMERICS.md C-8.3): a tolerance would
+    # treat a small off-triangle entry as absent and solve another system.
     # If A is lower triangular, use forward substitution
-    if np.allclose(A, np.tril(A)):
+    if not np.any(np.triu(A, 1)):
         for i in range(s):
             rhs = b_reshaped[i].copy()
             for j in range(i):
                 rhs -= A[i, j] * x[j]
-            if not np.isclose(A[i, i], 0):
+            if A[i, i] != 0.0:
                 x[i] = rhs / A[i, i]
             else:
                 x[i] = rhs
 
     # If A is upper triangular, use backward substitution
-    elif np.allclose(A, np.triu(A)):
+    elif not np.any(np.tril(A, -1)):
         for i in range(s - 1, -1, -1):
             rhs = b_reshaped[i].copy()
             for j in range(i + 1, s):
                 rhs -= A[i, j] * x[j]
-            if not np.isclose(A[i, i], 0):
+            if A[i, i] != 0.0:
                 x[i] = rhs / A[i, i]
             else:
                 x[i] = rhs

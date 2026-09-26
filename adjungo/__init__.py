@@ -11,7 +11,12 @@ General Linear Methods (GLMs) with support for:
 
 __version__ = "0.1.0"
 
-from adjungo.core.method import GLMethod, PropType, StageType
+from adjungo.core.method import (
+    GLMethod,
+    PropType,
+    StageType,
+    TableauDeclarationError,
+)
 from adjungo.core.problem import Problem, ProblemStructure
 from adjungo.optimization.interface import GLMOptimizer
 from adjungo.optimization.parametrization import (
@@ -30,4 +35,5 @@ __all__ = [
     "ProblemStructure",
     "PropType",
     "StageType",
+    "TableauDeclarationError",
 ]

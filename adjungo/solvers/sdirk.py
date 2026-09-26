@@ -125,7 +125,7 @@ class SDIRKStageSolver(StageDispatchMixin, StageSolver):
             for j in range(i):
                 rhs = rhs + h * method.A[i, j] * f_cached[j]
 
-            if np.isclose(method.A[i, i], 0):
+            if method.A[i, i] == 0.0:  # exact (C-8.3)
                 Z[i] = rhs
                 factorizations.append(None)
             else:

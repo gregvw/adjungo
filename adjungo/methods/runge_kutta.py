@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from adjungo.core.method import GLMethod
+from adjungo.core.method import GLMethod, StageType
 
 
 def explicit_euler() -> GLMethod:
@@ -12,7 +12,9 @@ def explicit_euler() -> GLMethod:
     B = np.array([[1.0]])
     V = np.array([[1.0]])
     c = np.array([0.0])
-    return GLMethod(A=A, U=U, B=B, V=V, c=c)
+    return GLMethod(
+        A=A, U=U, B=B, V=V, c=c, declared_stage_type=StageType.EXPLICIT
+    )
 
 
 def rk4() -> GLMethod:
@@ -27,7 +29,9 @@ def rk4() -> GLMethod:
     B = np.array([[1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0]])
     V = np.array([[1.0]])
     c = np.array([0.0, 0.5, 0.5, 1.0])
-    return GLMethod(A=A, U=U, B=B, V=V, c=c)
+    return GLMethod(
+        A=A, U=U, B=B, V=V, c=c, declared_stage_type=StageType.EXPLICIT
+    )
 
 
 def heun() -> GLMethod:
@@ -40,7 +44,9 @@ def heun() -> GLMethod:
     B = np.array([[0.5, 0.5]])
     V = np.array([[1.0]])
     c = np.array([0.0, 1.0])
-    return GLMethod(A=A, U=U, B=B, V=V, c=c)
+    return GLMethod(
+        A=A, U=U, B=B, V=V, c=c, declared_stage_type=StageType.EXPLICIT
+    )
 
 
 def implicit_midpoint() -> GLMethod:
@@ -50,7 +56,9 @@ def implicit_midpoint() -> GLMethod:
     B = np.array([[1.0]])
     V = np.array([[1.0]])
     c = np.array([0.5])
-    return GLMethod(A=A, U=U, B=B, V=V, c=c)
+    return GLMethod(
+        A=A, U=U, B=B, V=V, c=c, declared_stage_type=StageType.SDIRK
+    )
 
 
 def gauss2() -> GLMethod:
@@ -64,7 +72,9 @@ def gauss2() -> GLMethod:
     B = np.array([[0.5, 0.5]])
     V = np.array([[1.0]])
     c = np.array([0.5 - sqrt3/6.0, 0.5 + sqrt3/6.0])
-    return GLMethod(A=A, U=U, B=B, V=V, c=c)
+    return GLMethod(
+        A=A, U=U, B=B, V=V, c=c, declared_stage_type=StageType.IMPLICIT
+    )
 
 
 def sdirk2() -> GLMethod:
@@ -78,7 +88,9 @@ def sdirk2() -> GLMethod:
     B = np.array([[1.0 - gamma, gamma]])
     V = np.array([[1.0]])
     c = np.array([gamma, 1.0])
-    return GLMethod(A=A, U=U, B=B, V=V, c=c)
+    return GLMethod(
+        A=A, U=U, B=B, V=V, c=c, declared_stage_type=StageType.SDIRK
+    )
 
 
 def sdirk3() -> GLMethod:
@@ -94,7 +106,9 @@ def sdirk3() -> GLMethod:
     B = np.array([[A[2, 0], A[2, 1], A[2, 2]]])
     V = np.array([[1.0]])
     c = np.array([gamma, (1.0 + gamma)/2.0, 1.0])
-    return GLMethod(A=A, U=U, B=B, V=V, c=c)
+    return GLMethod(
+        A=A, U=U, B=B, V=V, c=c, declared_stage_type=StageType.SDIRK
+    )
 
 
 def implicit_trapezoid() -> GLMethod:
@@ -122,4 +136,6 @@ def implicit_trapezoid() -> GLMethod:
     B = np.array([[0.5, 0.5]])  # Equal weights (trapezoidal)
     V = np.array([[1.0]])
     c = np.array([0.0, 1.0])    # Evaluate at t_n and t_{n+1}
-    return GLMethod(A=A, U=U, B=B, V=V, c=c)
+    return GLMethod(
+        A=A, U=U, B=B, V=V, c=c, declared_stage_type=StageType.DIRK
+    )

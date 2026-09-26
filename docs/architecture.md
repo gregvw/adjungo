@@ -64,7 +64,10 @@ adjungo/
     objective.py       Objective protocol: terminal and running cost, their
                        first derivatives, and their second-derivative actions.
     method.py          GLMethod: tableaux A, U, B, V, abscissae c; StageType
-                       and PropType classification of a tableau.
+                       and PropType classification of a tableau, decided by
+                       exact zeros and exact equality. An optional declared
+                       stage type is checked against that structure at
+                       construction (C-8.3).
     requirements.py    deduce_requirements(method, structure, state_dim):
                        decides, from the declaration alone, what the solver
                        must be able to do.

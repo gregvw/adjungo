@@ -94,7 +94,7 @@ class DIRKStageSolver(StageDispatchMixin, StageSolver):
             for j in range(i):
                 rhs = rhs + h * method.A[i, j] * f_cached[j]
 
-            if np.isclose(a_ii, 0):
+            if a_ii == 0.0:  # exact: a tiny a_ii is still implicit (C-8.3)
                 Z[i] = rhs
                 factorizations.append(None)
             else:
