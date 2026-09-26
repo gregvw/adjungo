@@ -14,6 +14,7 @@ the code cites, still point at something.
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import numpy as np
@@ -512,6 +513,74 @@ def test_bare_collection_and_scoped_collection_agree():
         f"  only bare ({len(only_bare)}): {only_bare[:5]}\n"
         f"  only scoped ({len(only_scoped)}): {only_scoped[:5]}"
     )
+
+
+# --------------------------------------------------------------------------
+# Language level (C-11.4)
+#
+# The declared floor is a claim about which interpreters can import this
+# package. A single development interpreter cannot observe a violation: the
+# one used here runs every construct in the tree. CI is what checks it, so
+# the matrix must name the floor and nothing may be pinned below it.
+# --------------------------------------------------------------------------
+
+
+def _version(text: str) -> tuple[int, int]:
+    """``3.13``, ``"3.13"``, ``py313`` and ``>=3.13`` as a comparable pair."""
+    digits = re.search(r"(\d+)\.(\d+)", text.replace("py3", "3."))
+    assert digits, f"no version found in {text!r}"
+    return int(digits.group(1)), int(digits.group(2))
+
+
+def test_the_ci_matrix_exercises_the_declared_python_floor():
+    """C-11.4: every interpreter CI names is one the package admits.
+
+    ``requires-python`` said ``>=3.10`` while the suite imported
+    ``typing.Self`` (3.11) and referenced ``copy.replace`` (3.13) at module
+    scope. Both fail at collection rather than skipping. The matrix named
+    3.10 and 3.12 and would have caught either, but had not run; see R-12.
+
+    Two properties are held here. The floor must be exercised, so that the
+    claim is measured rather than asserted, and no job may pin below it,
+    because such a job installs a package whose own metadata refuses that
+    interpreter.
+    """
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    floor = _version(config["project"]["requires-python"])
+
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    listed = re.search(r"python-version:\s*\[([^\]]*)\]", workflow)
+    assert listed, "no python-version matrix found in ci.yml"
+    matrix = [_version(entry) for entry in listed.group(1).split(",")]
+
+    assert floor in matrix, (
+        f"ci.yml never runs the declared floor {floor[0]}.{floor[1]}; "
+        f"the matrix is {matrix}. The floor is then unmeasured."
+    )
+
+    pinned = [_version(v) for v in re.findall(r'python-version:\s*"([\d.]+)"', workflow)]
+    below = [v for v in pinned + matrix if v < floor]
+    assert not below, (
+        f"ci.yml pins {below}, below the declared floor {floor[0]}.{floor[1]}. "
+        "Those jobs cannot install this package."
+    )
+
+
+def test_the_tool_targets_are_the_declared_floor():
+    """C-11.4: mypy and ruff check the language level the package promises.
+
+    A checker aimed above the floor cannot see syntax the floor rejects, and
+    one aimed below it reports failures for a version nobody supports. Both
+    settings had drifted: ``py310`` remained in the ruff and black targets,
+    and mypy checked 3.12, long after the code required more.
+    """
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    floor = _version(config["project"]["requires-python"])
+
+    assert _version(config["tool"]["mypy"]["python_version"]) == floor
+    assert _version(config["tool"]["ruff"]["target-version"]) == floor
+    for target in config["tool"]["black"]["target-version"]:
+        assert _version(target) == floor
 
 
 # --------------------------------------------------------------------------

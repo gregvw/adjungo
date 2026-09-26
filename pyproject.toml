@@ -7,7 +7,7 @@ name = "adjungo"
 version = "0.1.0"
 description = "General Linear Method optimization library for optimal control problems"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 authors = [
     {name = "Greg", email = "greg@example.com"}
 ]
@@ -37,12 +37,12 @@ xfail_strict = true
 
 [tool.black]
 line-length = 88
-target-version = ['py310']
+target-version = ['py313']
 
 [tool.mypy]
-# numpy's bundled stubs use `type` statements that require 3.12+ to parse, so the
-# type-check target is 3.12 even though the package supports 3.10 at runtime.
-python_version = "3.12"
+# C-11.4: the type-check target is the declared floor, so mypy sees the same
+# language level the package promises to run on.
+python_version = "3.13"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -58,4 +58,4 @@ ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py313"

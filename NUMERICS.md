@@ -630,6 +630,27 @@ Every numeric pin is a tolerance with its **basis written beside it** — either
 derived bound under C-3, or a stated relative/ULP budget. A pin with no stated
 basis certifies a machine, not a method, and is a review finding.
 
+### C-11.4 Language level — `APPROVED`
+
+The supported interpreter is **CPython 3.13 or later**, declared by
+`requires-python` in `pyproject.toml`. The CI matrix must include that floor,
+and no CI job may pin an interpreter below it.
+
+The floor is set by the constructs the supported paths actually use, tests
+included, not by a preference for breadth. `copy.replace` and the
+`__replace__` hook C-15.7's restoration walk models are new in 3.13;
+`typing.Self` is new in 3.11. A floor below the constructs in use is not a
+wider envelope, it is a false one: the package declares an interpreter on
+which it cannot be imported.
+
+The floor also bounds the type-check evidence. mypy's verdict depends on the
+stub versions resolved for the interpreter, and numpy's stubs are not stable
+across its own releases — the same tree that checks clean under numpy 2.5
+reports `Returning Any` under 2.4 and two further assignment errors under
+2.2, which is the newest numpy an older interpreter can install. Declaring a
+floor therefore fixes a stub range, and widening the floor commits the
+repository to every stub difference inside it.
+
 ---
 
 <a id="c-12"></a>
@@ -2275,3 +2296,36 @@ Two requirements follow. Use the command in `AGENTS.md` **as written**, without
 adding `-q`. And have the harness cross-check the parsed count against the
 process exit status, refusing to report a number when a nonzero exit yields no
 parsed failures or a zero exit yields some; the discrepancy is what caught this.
+
+### R-12 An unrun check is not a check — `APPROVED`
+
+**Why this clause exists.** [C-14.2](#c-14) treats "fails against the defect,
+passes against the cure" as evidence. That form assumes the check runs. A
+check that exists, is correct, and is never executed contributes nothing, and
+is more dangerous than a missing one because the repository looks guarded.
+
+**Mechanism.** Two instances were found together, on the same push.
+
+`requires-python` declared `>=3.10` while `tests/test_coefficient_immutability.py`
+imported `typing.Self` (3.11) and referenced `copy.replace` (3.13) at module
+scope. Both are collection-time failures, not skips: on 3.10 the import
+raises, on 3.12 the attribute lookup does. The CI matrix named `3.10` and
+`3.12` and would have caught either on the day it was written. It had not run,
+because twenty-one commits had accumulated locally unpushed. The declaration
+and the evidence for it were both present; only the execution was missing.
+
+The second instance is the same shape one level down. The workflow step
+guarding bare-`pytest` collection compared `tail -1` of two collection runs.
+`pyproject.toml` already supplies `-q`, so the step's own `-q` raised the
+quiet level past the summary line and both sides reduced to a blank line: the
+step compared `""` with `""` for its entire life. Verified insensitive at 833
+collected against 819. The step ran on every push and checked nothing, which
+is why the first instance survived even the pushes that did occur.
+
+**What follows.** A guard's first evidence is that it fails when the property
+it names is false; [C-14.2](#c-14) already requires this, and the repaired
+step was falsified before being kept. Beyond that, local verification does not
+substitute for the matrix. A single development interpreter cannot observe a
+floor violation, and this one could not: CPython 3.14 runs every construct
+above without complaint. Push before the local history grows past what CI has
+seen, or the matrix is a description of intent rather than a measurement.
