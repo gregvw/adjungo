@@ -119,7 +119,7 @@ def forward_sensitivity(
                                           cache.G[j] @ delta_u[step, j])
 
                 # For explicit stages (a_{ii} = 0): δZ_i = rhs
-                if np.isclose(A[i, i], 0):
+                if A[i, i] == 0.0:  # exact, as in the forward solve (C-8.3)
                     delta_Z[step, i] = rhs
                 else:
                     # Implicit stage. Differentiating

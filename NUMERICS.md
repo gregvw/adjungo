@@ -445,6 +445,89 @@ where `s` is the number of internal stages and `r` the number of external stages
 These are enforced at `GLMethod` construction. A tableau storing per-history
 coefficients in the rows of `A` is malformed, not merely unconventional.
 
+### C-8.3 Tableau structure is exact, and a declared class is checked — `APPROVED`
+
+**Exact structure.** Zero means exactly zero, and equal means exactly equal.
+This applies to every decision that routes on the structure of a tableau:
+
+- its stage type and propagation type;
+- whether a stage is explicit, in the solvers and in the tangent sweep;
+- triangularity in `block_solve`.
+
+A tolerance in any of these does not approximate a structure. It selects a
+different method. Both defects this clause cures were measured on the fixture
+in `tests/test_tableau_structure.py`:
+
+- **A near-SDIRK classified as SDIRK.** A DIRK with `A[1,1] = γ(1 + 1e-6)`
+  was classified SDIRK and solved with `A[0,0]` at both stages. Against the
+  independent reference, the gradient moved by 2.07e-9 relative and the
+  Hessian-vector product by 3.6e-10.
+- **A tiny diagonal entry treated as explicit.** A stage with `a_ii = 1e-9`
+  was treated as explicit, and its implicit term was dropped. That moved the
+  gradient by only 6.8e-12, below the certified tolerance, so no accuracy test
+  can see it. It is certified structurally instead: 24 stage factorizations per
+  gradient rather than 12, and 24 untransposed tangent solves per
+  Hessian-vector product rather than 12.
+
+Exactness can err only toward a more general class. A stray `1e-17` above the
+diagonal makes a DIRK dense. Diagonal entries that differ in the last bit make
+an SDIRK a DIRK. Both integrate the coefficients as written, at greater cost.
+For every shipped tableau, exact classification agrees with the tolerance-based
+one it replaces.
+
+**Declared class.** `GLMethod(..., declared_stage_type=...)` states the class
+the author intends. Construction checks it against the exact structure using
+`stage_structure_violations`, the same function that classifies, so the two
+cannot drift apart.
+
+| Declared | Admits exact structure |
+|---|---|
+| `EXPLICIT` | `EXPLICIT` |
+| `SDIRK` | `SDIRK` |
+| `DIRK` | `EXPLICIT`, `SDIRK`, `DIRK` |
+| `IMPLICIT` | any |
+
+- **Narrower than the structure:** construction raises
+  `TableauDeclarationError`, naming each offending entry and its exact value.
+- **More general than the structure:** admitted, and routing follows the
+  declaration. The DIRK solver handles zero and constant diagonals, and the
+  coupled solver handles any `A`.
+- **Undeclared:** routing follows the exact structure alone.
+
+**Why declare.** Exact deduction integrates the coefficients faithfully,
+including a typo that moves the tableau into another class. [C-2](#c-2) then
+holds for a method nobody chose, and [C-4](#c-4) fails without a sound. Only a
+statement of intent can catch that. Declaring is therefore the recommended
+practice, and every shipped tableau declares its most specific class, which a
+test asserts.
+
+**What a declared class does not catch.** A wrong value *inside* the declared
+pattern gets through. Checking a declared order against the order conditions
+would catch it. That is deferred, because it needs either a tolerance basis for
+float coefficients or exact coefficients.
+`adjungo/methods/glm.py::check_consistency` keeps its tolerance for the same
+reason: it is a numerical consistency check, not a routing decision.
+
+**Injection evidence** — `OBSERVED`. Each defect introduced alone, under the
+[R-11](#r-11) procedure, against a baseline of 922 passed:
+
+| Defect | Failures |
+|---|---|
+| SDIRK diagonal equality decided by tolerance | 4 |
+| entries above the diagonal ignored below a tolerance | 2 |
+| `explicit_stage_indices` decided by tolerance | 1 |
+| the DIRK solver's explicit-stage test decided by tolerance | 2 |
+| the tangent sweep's explicit-stage test decided by tolerance | 1 |
+| a declared class is not checked against the structure | 5 |
+| the declaration is ignored when routing | 4 |
+| propagation structure decided by tolerance | 1 |
+| `block_solve` decides triangularity by tolerance | 1 |
+
+The tangent-sweep row was undetected until its structural count was added,
+because the first version of the population checked it only through accuracy.
+The SDIRK solver's zero test was made exact for uniformity but is not injected,
+because it is unreachable: the SDIRK class requires a nonzero diagonal.
+
 ---
 
 <a id="c-9"></a>
