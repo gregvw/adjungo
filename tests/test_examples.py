@@ -1120,7 +1120,7 @@ def test_each_example_documents_an_invocation_that_resolves():
             assert (directory.parent / target).is_file(), command
             assert target == f"examples/{path.name}"
         checked += 1
-    assert checked == 4, f"expected four runnable examples, found {checked}"
+    assert checked == 5, f"expected five runnable examples, found {checked}"
 
 
 @requires_sympy
@@ -1162,3 +1162,333 @@ def test_the_fuel_budget_is_a_direct_function_of_the_control():
             f"N={n_steps}: quadrature formula gives {direct!r}, the solve "
             f"{stepped!r}, {deviation / np.finfo(float).eps:.1f} eps apart"
         )
+
+
+# ---------------------------------------------------------------------------
+# examples/double_integrator.py
+#
+# The first example here that knows its own answer. Every test below compares
+# against something assembled outside adjungo: a backward Riccati recursion on
+# an independently built step map, or the closed-form solution of the
+# continuous optimality conditions.
+# ---------------------------------------------------------------------------
+
+
+def test_the_step_map_assembly_reproduces_the_package_solve():
+    """The independent step map is the same map ``adjungo.stepping`` applies.
+
+    Everything downstream -- the Riccati optimum, the objective the mesh
+    study refines -- is built on ``step_maps``. If it assembled a *different*
+    discretisation, the comparisons would still agree with each other and
+    silently stop being about the package at all. So this is checked first.
+    """
+    from examples.double_integrator import (
+        DRAG,
+        T_FINAL,
+        Y0,
+        build_optimizer,
+        discrete_objective,
+        step_maps,
+    )
+
+    for drag in (0.0, DRAG):
+        n_steps = 10
+        a_map, b_map = step_maps(n_steps, drag)
+        rng = np.random.default_rng(31)
+        u = rng.standard_normal((n_steps, 4, 1))
+
+        y = Y0.astype(float).copy()
+        for step in range(n_steps):
+            y = a_map @ y + b_map @ u[step].ravel()
+
+        optimizer = build_optimizer(n_steps, drag)
+        stepped = optimizer.trajectory(u).Y[-1][0]
+
+        # Two assemblies of one linear map over ten steps. The budget is
+        # 64 unit roundoffs against the state scale; observed is under four.
+        scale = max(float(np.max(np.abs(stepped))), 1.0)
+        assert np.max(np.abs(y - stepped)) / scale < 64 * np.finfo(float).eps
+        assert discrete_objective(u, n_steps, drag) == pytest.approx(
+            optimizer.objective_value(u), rel=1e-13
+        )
+        assert T_FINAL > 0.0
+
+
+def test_the_riccati_control_is_stationary_for_the_package_gradient():
+    """The package's gradient vanishes at the independently computed optimum.
+
+    This is the strongest form of the derivative check available here.
+    A gradient that was wrong by a constant factor would still vanish at the
+    right point, but a gradient that was wrong in *direction* -- the usual
+    consequence of a dropped adjoint term -- would not.
+    """
+    from examples.double_integrator import (
+        DRAG,
+        build_optimizer,
+        riccati_control,
+    )
+
+    for drag in (0.0, DRAG):
+        n_steps = 20
+        optimizer = build_optimizer(n_steps, drag)
+        gradient = optimizer.gradient(riccati_control(n_steps, drag))
+
+        # Scale: the objective's own control term is R*h*w_k*u ~ 1e-3, so a
+        # gradient of 1e-15 is fifteen orders below the terms that cancel.
+        assert np.max(np.abs(gradient)) < 1e-13, (
+            f"drag={drag}: |grad| = {np.max(np.abs(gradient)):.3e} at the "
+            "Riccati optimum"
+        )
+
+
+def test_the_optimizer_reaches_the_independently_computed_optimum():
+    """``trust-ncg`` on the package's derivatives finds the Riccati control."""
+    from examples.double_integrator import DRAG, riccati_control, solve
+
+    for drag in (0.0, DRAG):
+        n_steps = 20
+        _, result, u_scipy = solve(n_steps, drag)
+        u_riccati = riccati_control(n_steps, drag)
+
+        assert result.success, result.message
+        # The reduced problem is quadratic with a positive definite Hessian,
+        # so the exact Newton step solves it; the iteration count is a
+        # trust-region artefact, not a convergence rate.
+        assert result.nit < 25
+        scale = float(np.max(np.abs(u_riccati)))
+        assert np.max(np.abs(u_scipy - u_riccati)) / scale < 1e-11
+
+
+def test_the_discrete_problem_has_a_unique_minimiser():
+    """Positive definite Hessian: the comparisons above are well posed.
+
+    ``rk4`` has a repeated abscissa, ``c_2 = c_3 = ½``, so two stage controls
+    act at the same instant. If the discrete objective were flat along some
+    direction, 'the' discrete optimum would not be a single object to compare
+    with, and an optimizer landing elsewhere on the manifold would look like
+    a failure.
+    """
+    from examples.double_integrator import build_optimizer
+
+    n_steps = 5
+    optimizer = build_optimizer(n_steps)
+    hessp = optimizer.scipy_hessp()
+    size = n_steps * optimizer.method.s
+    origin = np.zeros(size)
+    hessian = np.column_stack([hessp(origin, np.eye(size)[:, j]) for j in range(size)])
+
+    asymmetry = float(np.max(np.abs(hessian - hessian.T)))
+    assert asymmetry < 1e-14, f"Hessian asymmetry {asymmetry:.3e}"
+
+    eigenvalues = np.linalg.eigvalsh(0.5 * (hessian + hessian.T))
+    # Smallest observed 3.3e-3 against a largest of 3.1. The floor only has
+    # to exclude zero by a clear margin.
+    assert eigenvalues.min() > 1e-4, f"spectrum {eigenvalues.min():.3e} .. {eigenvalues.max():.3e}"
+
+
+def test_the_closed_form_solves_the_ode_it_claims_to():
+    """C-14.1: verify the anchor's defining property, independently.
+
+    A closed form is only an oracle if it is right. These expressions were
+    integrated by hand from the costate equations, so they are checked
+    against ``scipy.integrate.solve_ivp`` at a tolerance three orders tighter
+    than the agreement asserted -- a path that shares nothing with either
+    adjungo or the derivation.
+    """
+    from scipy.integrate import solve_ivp
+
+    from examples.double_integrator import (
+        DRAG,
+        T_FINAL,
+        Y0,
+        continuous_optimum,
+    )
+
+    for drag in (0.0, DRAG):
+        exact = continuous_optimum(drag)
+        solution = solve_ivp(
+            lambda t, y, exact=exact, drag=drag: [
+                y[1],
+                -drag * y[1] + float(exact.control(t)),
+            ],
+            (0.0, T_FINAL),
+            Y0.astype(float),
+            rtol=1e-13,
+            atol=1e-14,
+        )
+        assert solution.success
+        deviation = np.max(np.abs(solution.y[:, -1] - exact.state(T_FINAL)))
+        assert deviation < 1e-10, f"drag={drag}: closed form off by {deviation:.3e}"
+
+
+def test_the_closed_form_satisfies_the_transversality_condition():
+    """The other half of the optimality system, which the ODE check misses.
+
+    ``solve_ivp`` confirms the state solves the dynamics under ``u*``. It
+    says nothing about whether ``u*`` is *optimal*: that is ``lambda(T) =
+    S (y(T) - y_target)`` together with ``u* = -lambda_2 / R``. Checking only
+    the ODE would accept any admissible control.
+    """
+    from examples.double_integrator import (
+        DRAG,
+        ENERGY_WEIGHT,
+        T_FINAL,
+        TERMINAL_WEIGHT,
+        Y_TARGET,
+        continuous_optimum,
+    )
+
+    for drag in (0.0, DRAG):
+        exact = continuous_optimum(drag)
+        costate_terminal = TERMINAL_WEIGHT @ (exact.state(T_FINAL) - Y_TARGET)
+
+        # lambda_1 is constant; lambda_2 = -R u*.
+        assert exact.a == pytest.approx(costate_terminal[0], rel=1e-12)
+        lambda_2 = -ENERGY_WEIGHT * float(exact.control(T_FINAL))
+        assert lambda_2 == pytest.approx(costate_terminal[1], rel=1e-12)
+
+
+def test_the_undamped_optimum_is_the_continuous_one_at_every_mesh():
+    """No discretisation error at all, and none appears under refinement.
+
+    ``u*`` is linear in ``t``, the state is a cubic, and rk4's weights are
+    Simpson's rule, so both the propagation and the cost quadrature are exact
+    for the functions this optimum produces. The discrete optimal control is
+    then the continuous one sampled at the stage abscissae -- including at
+    ``N = 5``, five steps over the whole horizon.
+
+    Stated as a mesh study because that is what makes it falsifiable: an
+    error that were merely small would shrink as the mesh refines, and this
+    one does not move.
+    """
+    from examples.double_integrator import (
+        continuous_optimum,
+        discrete_objective,
+        riccati_control,
+        stage_times,
+    )
+
+    exact = continuous_optimum()
+    scale = float(np.max(np.abs(exact.control(stage_times(5)))))
+    deviations = []
+    for n_steps in (5, 10, 20, 40, 80, 160):
+        u_discrete = riccati_control(n_steps)
+        u_continuous = exact.control(stage_times(n_steps))[:, :, None]
+        deviations.append(float(np.max(np.abs(u_discrete - u_continuous))) / scale)
+        assert discrete_objective(u_discrete, n_steps) == pytest.approx(
+            exact.objective, rel=1e-13
+        )
+
+    # Budget: 64 unit roundoffs, about three times the largest observed (the
+    # Riccati recursion accumulates rounding over N backward steps). The
+    # claim is that this does not decrease with N, which is why the same
+    # bound applies to the coarsest mesh and the finest.
+    assert max(deviations) < 64 * np.finfo(float).eps, f"deviations {deviations}"
+
+
+def test_the_damped_optimum_converges_at_fourth_order():
+    """C-4: with drag the costate is exponential and the error is real.
+
+    This is the test that keeps the exactness result above from being
+    vacuous. Adding ``-c v`` to the state equation makes ``lambda_2``
+    exponential rather than linear, so rk4 is no longer exact for the optimal
+    trajectory, and the discrete optimum approaches the continuous one at the
+    method's order. Observed 4.16, 4.08, 4.04, 4.02, 4.01.
+
+    The quantity refined is the optimum, not a solve: each mesh solves its
+    own discrete optimal control problem to machine precision first.
+    """
+    from examples.double_integrator import (
+        DRAG,
+        continuous_optimum,
+        discrete_objective,
+        riccati_control,
+    )
+
+    exact = continuous_optimum(DRAG)
+    errors = []
+    for n_steps in (5, 10, 20, 40, 80, 160):
+        u_discrete = riccati_control(n_steps, DRAG)
+        errors.append(abs(discrete_objective(u_discrete, n_steps, DRAG) - exact.objective))
+
+    rates = [np.log2(a / b) for a, b in itertools.pairwise(errors)]
+    assert min(rates) > 3.8, f"observed orders {rates} from errors {errors}"
+    assert max(rates) < 4.4, f"orders above rk4's: {rates}"
+    assert errors[-1] < 1e-10
+
+
+def test_double_integrator_gradient_matches_the_independent_reference():
+    """The monolithic reference, at a point that is not the optimum.
+
+    Stationarity at the Riccati control checks the gradient where it
+    vanishes. This checks it where it does not, which is where a scale error
+    would show.
+    """
+    from examples.double_integrator import DRAG, T_FINAL, Y0, build_optimizer
+
+    n_steps = 8
+    optimizer = build_optimizer(n_steps, DRAG)
+    rng = np.random.default_rng(13)
+    u = rng.standard_normal((n_steps, optimizer.method.s, 1))
+
+    grad_ref = reference_gradient(
+        Y0,
+        u,
+        (0.0, T_FINAL),
+        n_steps,
+        optimizer.problem,
+        optimizer.method,
+        optimizer.objective,
+    )
+    assert np.max(np.abs(grad_ref)) > 1e-3, "degenerate case"
+    err = np.max(np.abs(optimizer.gradient(u) - grad_ref)) / max(
+        float(np.max(np.abs(grad_ref))), 1.0
+    )
+    assert err < 1e-11, f"double integrator gradient off by {err:.3e}"
+
+
+def test_double_integrator_hessian_is_constant_and_matches_the_reference():
+    """A quadratic reduced objective: the Hessian cannot depend on ``u``.
+
+    Affine dynamics and a quadratic cost make ``J`` a quadratic function, so
+    ``d²J/du²`` is one constant matrix. Evaluating it at two unrelated points
+    is a structural check the nonlinear examples cannot make, and it would
+    fail if a second-derivative term were contracted against the wrong
+    variable.
+    """
+    from examples.double_integrator import DRAG, T_FINAL, Y0, build_optimizer
+
+    n_steps = 6
+    optimizer = build_optimizer(n_steps, DRAG)
+    size = n_steps * optimizer.method.s
+    hessp = optimizer.scipy_hessp()
+
+    rng = np.random.default_rng(7)
+    points = [np.zeros(size), rng.standard_normal(size) * 3.0]
+    assembled = [
+        np.column_stack([hessp(point, np.eye(size)[:, j]) for j in range(size)])
+        for point in points
+    ]
+    scale = float(np.max(np.abs(assembled[0])))
+    assert np.max(np.abs(assembled[0] - assembled[1])) / scale < 1e-13
+
+    reference = reference_hessian(
+        Y0,
+        rng.standard_normal((n_steps, optimizer.method.s, 1)),
+        (0.0, T_FINAL),
+        n_steps,
+        optimizer.problem,
+        optimizer.method,
+        optimizer.objective,
+    )
+    assert np.max(np.abs(assembled[0] - reference)) / scale < 1e-11
+
+
+def test_double_integrator_main_runs(capsys):
+    """The example executes end to end and reports both studies."""
+    from examples.double_integrator import main
+
+    main()
+    out = capsys.readouterr().out
+    assert "The discrete optimum *is* the continuous one" in out
+    assert "order" in out
