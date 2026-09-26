@@ -386,13 +386,22 @@ class _DeclaredLinearTimeVarying(LinearTimeVarying):
     linearity = Linearity.LINEAR
 
 
-# Basis (R-13), measured on this fixture across all five implicit families:
-# package and reference agree to at most 1.1e-16 relative, gradient and
-# Hessian-vector product alike, because both take one exact LU solve per stage
-# with no iteration. A stale factorization reused across these t-varying stage
-# matrices -- measured with the C-15.2 comparison bypassed on the Newton route,
-# where nothing else notices -- moves the gradient by 6.9e-4 to 2.8e-3. 1e-11
-# sits five orders above the first and seven below the second.
+# Basis (R-13), measured on this fixture across all five implicit families.
+#
+# Rounding side: package and reference agree to between 5.6e-17 and 2.2e-16
+# relative, gradient and Hessian-vector product alike. The two are not the
+# same computation done twice. The package walks the trajectory, solving each
+# stage matrix in turn -- 10 to 30 factorizations here. The reference forms
+# the monolithic residual over the whole trajectory, 60 to 100 unknowns, and
+# applies Newton to it; because f is affine in y that converges in exactly one
+# iteration to a residual of 3.9e-16 to 6.6e-16. Agreement at rounding between
+# a sequential and a monolithic route is the C-14.1 evidence this test wants.
+#
+# Defect side: a stale factorization reused across these t-varying stage
+# matrices -- measured with the C-15.2 comparison bypassed on the Newton
+# route, where nothing else notices -- moves the gradient by 6.9e-4 to 2.8e-3.
+#
+# 1e-11 sits five orders above the rounding and seven below the defect.
 _LINEAR_ROUTE_RTOL = 1e-11
 
 
