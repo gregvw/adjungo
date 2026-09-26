@@ -40,12 +40,21 @@ Y0 = np.array([0.6, -0.4])
 #: sdirk2's diagonal coefficient, as the library computes it.
 GAMMA = 1.0 - 1.0 / np.sqrt(2.0)
 
-# Basis (R-13), measured on this module's fixture: the package and the
-# independent reference agree to at most 1.1e-16 relative, gradient and
-# Hessian-vector product, because both take one exact LU solve per stage on
-# this linear route. The near-SDIRK defect below moved the gradient by 2.07e-9
-# and the Hessian-vector product by 3.6e-10. 1e-11 sits five orders above the
-# first and more than an order below the second.
+# Basis (R-13), measured over this module's six reference comparisons.
+#
+# Rounding side: the package and the independent reference agree to at most
+# 1.1e-16 relative for the gradient and 5.6e-17 for the Hessian-vector product.
+# They are not the same computation done twice. The package solves each stage
+# equation directly, one small LU per implicit stage. The reference forms the
+# monolithic residual over the whole trajectory, 74 or 122 unknowns here, and
+# applies Newton to it. Because f is affine in y, that converges in one
+# iteration to a residual of 3.7e-16 to 1.4e-15.
+#
+# Defect side: the near-SDIRK defect below moved the gradient by 2.07e-9 and
+# the Hessian-vector product by 3.6e-10.
+#
+# 1e-11 sits five orders above the rounding and more than an order below the
+# defect.
 REFERENCE_RTOL = 1e-11
 
 
@@ -223,9 +232,11 @@ def _library_tableaux() -> list:
 
 @pytest.mark.parametrize("factory", _library_tableaux())
 def test_library_tableaux_declare_their_exact_structure(factory) -> None:
-    """Every shipped tableau declares its class, and the class it declares is
-    the most specific one its coefficients satisfy. Construction has already
-    checked admission; this asserts the declaration is not merely general."""
+    """Every factory in ``methods/runge_kutta.py`` declares its class, and the
+    class it declares is the most specific one its coefficients satisfy.
+    Construction has already checked admission; this asserts the declaration
+    is not merely general. The retained experimental tableaux are left
+    undeclared (C-8.3)."""
     method = factory()
     assert method.declared_stage_type is not None
     assert method.declared_stage_type is method.structural_stage_type

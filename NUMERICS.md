@@ -472,8 +472,15 @@ in `tests/test_tableau_structure.py`:
 Exactness can err only toward a more general class. A stray `1e-17` above the
 diagonal makes a DIRK dense. Diagonal entries that differ in the last bit make
 an SDIRK a DIRK. Both integrate the coefficients as written, at greater cost.
-For every shipped tableau, exact classification agrees with the tolerance-based
-one it replaces.
+
+Exact classification agrees with the tolerance-based one it replaces, in both
+stage type and propagation type, for:
+
+- every factory in `methods/runge_kutta.py`;
+- every constructible retained experimental tableau: `bdf2`, `bdf3`, and both
+  halves of `imex_ark2` and `imex_ark3`.
+
+The Adams tableaux are refused earlier, by C-8.2.
 
 **Declared class.** `GLMethod(..., declared_stage_type=...)` states the class
 the author intends. Construction checks it against the exact structure using
@@ -498,8 +505,10 @@ cannot drift apart.
 including a typo that moves the tableau into another class. [C-2](#c-2) then
 holds for a method nobody chose, and [C-4](#c-4) fails without a sound. Only a
 statement of intent can catch that. Declaring is therefore the recommended
-practice, and every shipped tableau declares its most specific class, which a
-test asserts.
+practice. Every factory in `methods/runge_kutta.py` declares its most specific
+class, which a test asserts. The retained experimental tableaux are left
+undeclared: they are refused at optimizer construction (C-6.2) and are kept as
+reference material, not as endorsed methods.
 
 **What a declared class does not catch.** A wrong value *inside* the declared
 pattern gets through. Checking a declared order against the order conditions
