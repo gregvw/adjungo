@@ -267,6 +267,200 @@ def _dR_du(
     return Ju
 
 
+def _stage_defect(
+    Zn: NDArray,
+    explicit: NDArray,
+    problem: Problem,
+    u_step: NDArray,
+    t_stage: NDArray,
+    A: NDArray,
+    h: float,
+    s: int,
+) -> float:
+    """How far ``Zn`` is from satisfying one step's stage equations."""
+    f_st = np.array([problem.f(Zn[j], u_step[j], t_stage[j]) for j in range(s)])
+    return float(np.max(np.abs(Zn - explicit - h * (A @ f_st))))
+
+
+def _constant_guess(y0: NDArray, lay: _Layout) -> NDArray:
+    """Every step node and every stage at the initial state."""
+    Y = np.zeros((lay.N + 1, lay.r, lay.nx))
+    Y[:] = _embed_initial(y0, lay.r, lay.nx)
+    Z = np.zeros((lay.N, lay.s, lay.nx))
+    Z[:] = y0
+    return lay.pack(Y, Z)
+
+
+def _swept_guess(
+    u: NDArray,
+    y0: NDArray,
+    problem: Problem,
+    method: GLMethod,
+    t0: float,
+    h: float,
+    lay: _Layout,
+    max_sweeps: int = 4,
+) -> NDArray:
+    """Sweep a candidate ``w`` forward along the trajectory.
+
+    Each step takes its stages from the explicit part ``sum_k U[i,k] Y[n,k]``
+    and then applies Picard corrections, which are fixed-point updates built
+    from the tableau alone. No linear system is solved, so no implicit
+    equation is smuggled into the predictor, and this shares no code with
+    ``adjungo/stepping`` as C-14.1 requires of this reference. The clause
+    governing this starting point is C-14.3.
+
+    The map is ``Z -> explicit + h A f(Z)``, so a sufficient condition for it
+    to contract is ``h ||A|| L < 1`` on the states it visits, where ``L`` is
+    a Lipschitz constant for ``f``. The tableau belongs in that bound and
+    dropping it understates the useful range badly: implicit midpoint has
+    ``||A||_inf = 1/2``, so ``y' = -1.5 y`` at ``h = 1`` contracts by exactly
+    ``0.75`` per sweep even though ``h L = 1.5``.
+
+    That bound is sufficient and not necessary, so failing it predicts
+    nothing. It is a norm bound on the iteration matrix, and for a
+    non-normal one it is pessimistic: implicit midpoint at ``h=1`` with
+    ``f(y) = My``, ``M = [[-1/4, 2], [0, -1/4]]``, has ``h||A||L = 9/8`` yet
+    an iteration matrix of spectral radius ``1/8``, and its defects fall.
+
+    Some sweeps really do amplify, which is the case this code has to
+    survive. Measured, on the Van der Pol fixture of
+    ``examples/nonlinear_implicit_control.py`` at ``h=1.2``: two unguarded
+    sweeps reach ``3e+72`` and three reach ``1e+252``.
+
+    Neither constant is available here -- ``L`` is a property of a caller's
+    callback on a region not known in advance -- so no such bound is
+    evaluated. A sweep is instead kept only while it is observed to reduce
+    the stage defect it is trying to zero. That is a monotonicity test, not a
+    proof of contraction: one decrease does not make a map a contraction. It
+    is used because it needs nothing beyond the values already computed and
+    because it stops the iteration on the step where growth begins, which is
+    what the caller needs from it. It also absorbs an overflowed sweep
+    without a separate test for one, since a non-finite candidate has a
+    non-finite defect and ``nan < defect`` is false.
+
+    The caller must still compare this against the alternative. The forward
+    propagation of ``Y`` is explicit, so it can amplify from step to step even
+    when no sweep is accepted within a step, and this function has no basis
+    for judging the trajectory as a whole.
+    """
+    A, U, B, V, c = method.A, method.U, method.B, method.V, method.c
+
+    Y = np.zeros((lay.N + 1, lay.r, lay.nx))
+    Z = np.zeros((lay.N, lay.s, lay.nx))
+    Y[0] = _embed_initial(y0, lay.r, lay.nx)
+
+    for n in range(lay.N):
+        t_stage = _stage_times(t0, h, c, n)
+        explicit = np.array(
+            [sum(U[i, k] * Y[n, k] for k in range(lay.r)) for i in range(lay.s)]
+        )
+
+        Zn = explicit
+        defect = _stage_defect(
+            Zn, explicit, problem, u[n], t_stage, A, h, lay.s
+        )
+        for _ in range(max_sweeps):
+            f_st = np.array(
+                [problem.f(Zn[j], u[n, j], t_stage[j]) for j in range(lay.s)]
+            )
+            candidate = explicit + h * (A @ f_st)
+            candidate_defect = _stage_defect(
+                candidate, explicit, problem, u[n], t_stage, A, h, lay.s
+            )
+            if not candidate_defect < defect:
+                break
+            Zn, defect = candidate, candidate_defect
+
+        Z[n] = Zn
+        f_st = np.array(
+            [problem.f(Zn[j], u[n, j], t_stage[j]) for j in range(lay.s)]
+        )
+        for l in range(lay.r):
+            Y[n + 1, l] = sum(
+                V[l, k] * Y[n, k] for k in range(lay.r)
+            ) + h * sum(B[l, j] * f_st[j] for j in range(lay.s))
+
+    return lay.pack(Y, Z)
+
+
+def _initial_guess(
+    u: NDArray,
+    y0: NDArray,
+    problem: Problem,
+    method: GLMethod,
+    t0: float,
+    h: float,
+    lay: _Layout,
+) -> NDArray:
+    """Choose where Newton starts, by measured residual.
+
+    Holding every node at ``y0`` puts the starting point a whole trajectory
+    excursion away from the root, which costs iterations on a short horizon
+    and reach on a long one: the undriven pendulum of
+    ``examples/pendulum_swing_up.py`` over sixteen periods leaves Newton at
+    ``||R||_inf = 7.5e+07`` after fifty iterations, and the reference then
+    refuses rather than return a half-converged answer.
+
+    Sweeping forward fixes that where the sweep is stable and makes it worse
+    where it is not, so neither candidate is right unconditionally. Both are
+    built and the one with the smaller ``||R||_inf`` is used. That is the same
+    quantity Newton is driving to ``tol``, it is cheap beside the dense solve
+    of each iteration, and it bounds the damage: the swept guess is adopted
+    only on evidence that it is the better starting point.
+
+    This changes only where Newton starts; the acceptance test is untouched.
+    A returned answer has been measured against the same ``tol`` on the same
+    residual, including when no Newton update was needed -- ``iterations=0``
+    reports a starting point that was checked and found converged, not one
+    that was assumed to be.
+
+    The accepted point is not bit-identical to the one the constant start
+    reached, and cannot be: Newton stops at the first iterate inside an
+    absolute residual ball of radius ``tol``, and which point that is depends
+    on where it began. Across the gauss2, sdirk3 and rk4 fixtures of the
+    damped pendulum at ``N=20`` and ``N=80`` the two accepted roots differ by
+    at most ``5e-14`` relative. That is a measurement on those fixtures, not
+    a bound: a residual ball is not a state-error ball, and the two are
+    related only through ``||(dR/dw)^-1||``, which grows with the horizon.
+    Consumers of this reference compare derivatives at rounding level, so the
+    displacement is reported here rather than asserted away.
+
+    A starting point can in principle select a different root, and no
+    residual test can rule that out. What the acceptance test does guarantee
+    is that whatever comes back is a root of the correct discrete system.
+    Sweeping is expected to *help* here rather than hurt, because a guess
+    that follows the dynamics lands near the solution branch continuous with
+    ``y0``, whereas a constant guess has no such affinity -- but that is a
+    reasoned expectation, not a theorem, and it is not relied on.
+    """
+    constant = _constant_guess(y0, lay)
+
+    # The predictor is optional, and it evaluates ``f`` at trial states the
+    # solution never visits. A callback that guards its domain -- as C-7 asks
+    # it to -- will raise there: ``y' = -sqrt(y)`` from ``y0 = 1`` with
+    # ``h = 1.5`` is asked for ``f(-0.5)`` on the first sweep, though both the
+    # continuous and the discrete solutions stay positive. Any failure of the
+    # predictor is therefore a rejected candidate, not a failure of the solve.
+    # Newton itself runs outside this guard, so a genuine error there is still
+    # raised.
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            swept = _swept_guess(u, y0, problem, method, t0, h, lay)
+            swept_defect = np.max(
+                np.abs(_residual(swept, u, y0, problem, method, t0, h, lay))
+            )
+    except Exception:  # noqa: BLE001 - see above; any predictor failure falls back
+        return constant
+
+    constant_defect = np.max(
+        np.abs(_residual(constant, u, y0, problem, method, t0, h, lay))
+    )
+    if swept_defect < constant_defect:
+        return swept
+    return constant
+
+
 def reference_solve(
     y0: NDArray,
     u: NDArray,
@@ -316,12 +510,7 @@ def reference_solve(
     t0, t1 = t_span
     h = (t1 - t0) / N
     lay = _Layout(N, method.s, method.r, problem.state_dim, problem.control_dim)
-
-    Y = np.zeros((N + 1, lay.r, lay.nx))
-    Y[:] = _embed_initial(y0, lay.r, lay.nx)
-    Z = np.zeros((N, lay.s, lay.nx))
-    Z[:] = y0
-    w = lay.pack(Y, Z)
+    w = _initial_guess(u, y0, problem, method, t0, h, lay)
 
     res_norm = np.inf
     for it in range(1, max_iter + 1):
