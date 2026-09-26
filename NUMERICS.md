@@ -913,18 +913,38 @@ system, so no implicit equation enters the predictor, and it reads nothing from
 
 Two properties make this safe rather than merely faster.
 
-1. **A sweep is kept only while it contracts.** The Picard map contracts only
-   while `h` times the Lipschitz constant of `f` is below one; above it the
-   iteration runs away superlinearly. On the Van der Pol fixture of
-   `examples/nonlinear_implicit_control.py` at `h = 1.2`, two unguarded sweeps
-   reach `3e+72` and three reach `1e+252`, which produced a singular Newton
-   Jacobian and a `LinAlgError` — the failure that established this rule.
+1. **A sweep is kept only while its defect decreases.** The map is
+   `Z ↦ explicit + h A f(Z)`, so a sufficient condition for it to contract is
+   `h‖A‖L < 1` on the states visited, where `L` is a Lipschitz constant for
+   `f`. **The tableau belongs in that bound.** Omitting it understates the
+   useful range badly: implicit midpoint has `‖A‖_∞ = ½`, so `y' = −1.5 y` at
+   `h = 1` contracts by exactly `0.75` per sweep while `hL = 1.5` would predict
+   growth. Where the condition does fail the sweep amplifies superlinearly — on
+   the Van der Pol fixture of `examples/nonlinear_implicit_control.py` at
+   `h = 1.2`, two unguarded sweeps reach `3e+72` and three reach `1e+252`,
+   producing a singular Newton Jacobian and a `LinAlgError`.
+
+   Neither `L` nor the region visited is known to this code, so no such bound
+   is evaluated. A sweep is kept only while it is *observed* to reduce the
+   stage defect. That is a monotonicity test and not a proof of contraction —
+   one decrease does not make a map a contraction — and it is used because it
+   needs nothing beyond values already computed and stops the iteration on the
+   step where growth begins.
 2. **The sweep is adopted only on measured evidence.** Both candidates are
    scored by `‖R‖_∞`, the same quantity Newton is driving to `tol`, and the
    smaller wins. Nothing else is needed to handle a runaway: a defect is
    `max(abs(·))`, hence `nan` or in `[0, ∞]`, and `nan < x` and `∞ < x` are both
    false. `y' = −200 y` at `h = 0.1` overflows the sweep to `nan` and is
    rejected by the ordinary comparison.
+3. **A predictor that raises is a rejected candidate.** The sweep evaluates `f`
+   at trial states the solution never visits, and a callback that guards its
+   domain — as [C-7](#c-7) asks it to — will raise there. `y' = −√y` from
+   `y₀ = 1` at `h = 1.5` is asked for `f(−0.5)` on the first sweep, though the
+   continuous solution `(1 − t/2)²` and the discrete backward-Euler root
+   `y₁ = 0.25` are both positive. Any failure of the predictor falls back to
+   the constant start. **Newton itself runs outside that guard**, so a genuine
+   failure of the solve is still raised rather than converted into a silent
+   answer.
 
 **The acceptance test is unchanged.** A returned answer has been measured
 against the same `‖R‖_∞ ≤ tol`; `iterations = 0` reports a starting point that
@@ -933,23 +953,37 @@ not bit-identical to the one the constant start reached and is not claimed to
 be: Newton stops at the first iterate inside an absolute ball of radius `tol`,
 and which point that is depends on where it began. Over `gauss2`, `sdirk3` and
 `rk4` on the damped pendulum at `N = 20` and `N = 80` the two accepted roots
-differ by at most `5e-14` relative — two points in a `1e-13` ball. A sweep that
-delivered Newton to a *different* root would differ by the scale of the
-trajectory, order `1`, so the `1e-10` bound asserted in
-`tests/test_reference_initial_guess.py` separates those outcomes by eight orders
-while staying clear of backend rounding ([C-11.3](#c-11)).
+differ by at most `5e-14` relative. The `1e-10` bound asserted in
+`tests/test_reference_initial_guess.py` sits two thousand times above that,
+clear of backend rounding ([C-11.3](#c-11)).
+
+**That is a measurement, not a guarantee, and the difference matters.** A
+residual ball is not a state-error ball; the two are related through
+`‖(∂R/∂w)⁻¹‖`, which is not bounded here and grows with the horizon. Distinct
+roots of a nonlinear system need not be far apart either. So the evidence is
+that the starting point does not move the answer *on the fixtures this oracle
+is used with*, and this clause claims no more than that. Sweeping is expected
+to help rather than hurt in this respect — a guess that follows the dynamics
+lands near the solution branch continuous with `y₀`, where a constant guess has
+no such affinity — but that is a reasoned expectation, not a theorem, and
+nothing here relies on it.
 
 The reach gained is finite and is not claimed to be unlimited. At amplitude 3.0
 and `h = 1.24` both starting points still refuse.
 
-`OBSERVED` — `tests/test_reference_initial_guess.py`, ten tests. Injection
-campaign per [C-14.2](#c-14) against the 911-test baseline: eleven injections,
-ten detected (1–3 failures each), one deliberately not covered. Evaluating the
-sweep at the step time rather than the stage time is undetected and is dismissed
-rather than cured — the sweep is a starting point, so its accuracy is a cost
-question that the selection and the unchanged acceptance test insulate from the
-result; both fields in that suite are autonomous, so the edit is not observable
-in them at all.
+`OBSERVED` — `tests/test_reference_initial_guess.py`, fourteen tests.
+Injection campaign per [C-14.2](#c-14) against a 915-test baseline: sixteen
+injections, fifteen detected at 1–3 failures each. Both directions of item 3
+are covered — removing the predictor guard fails a test, and widening it over
+either the residual evaluation or the Newton update fails a test.
+
+One gap is left open knowingly. Evaluating the sweep at the step time rather
+than the stage time is undetected, and is not cured: both fields in that suite
+are autonomous, so the edit is not observable in them. The reason for leaving
+it is the narrow one — the acceptance test guarantees that what returns is a
+root of the correct discrete system. It does **not** guarantee it is the same
+root, so degrading the predictor is not purely a question of cost, and this
+clause does not claim that it is.
 
 ---
 

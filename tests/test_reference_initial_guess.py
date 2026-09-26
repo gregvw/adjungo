@@ -15,15 +15,18 @@ the fallback, and the safeguard inside the sweep -- so that removing any one
 of them fails a test rather than silently narrowing the oracle.
 
 One deliberate gap. Degrading the sweep's *accuracy* -- for instance
-evaluating ``f`` at the step time rather than the stage time -- is not tested
-and is not intended to be. The sweep is a starting point, not an answer: the
-selection below compares it against the alternative and Newton then runs to
-the same ``||R||_inf <= tol``, so a worse sweep costs iterations and cannot
-change the result. Both fields used here are autonomous, so that particular
-edit is not even observable in them.
+evaluating ``f`` at the step time rather than the stage time -- is not
+tested. Both fields used in that comparison are autonomous, so the edit is
+not observable in them at all, and the acceptance test still guarantees that
+whatever returns is a root of the correct discrete system. It does not
+guarantee that it is the *same* root: a different starting point can in
+principle reach a different one, and no residual test can exclude that. The
+gap is left open knowingly rather than argued away.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import pytest
@@ -31,6 +34,7 @@ from numpy.typing import NDArray
 from scipy.special import ellipk
 
 import adjungo.validation.reference as ref
+from adjungo.core.method import GLMethod
 from adjungo.methods.runge_kutta import gauss2, rk4, sdirk3
 from adjungo.validation.reference import (
     _constant_guess,
@@ -305,15 +309,19 @@ def test_both_starts_accept_the_same_root(
     ``||R||_inf <= tol``, so the two answers cannot be bit-identical and are
     not asserted to be. What must hold is that they are the same root.
 
-    The budget separates two outcomes that differ by ten orders of magnitude.
-    Two points inside a ``1e-13`` residual ball sit within ``5e-14`` relative
-    of each other here, the largest value over these six cases. A sweep that
-    delivered Newton to a *different* root -- the real hazard when starting a
-    nonlinear iteration somewhere new -- would differ by the scale of the
-    trajectory itself, order ``1``. The ``1e-10`` bound is two thousand times
-    the observed rounding and eight orders below a distinct root, so it is
-    insensitive to the BLAS backend (C-11.3) while still excluding the defect
-    it exists to catch.
+    The budget is set by measurement on these six cases, not by a bound. The
+    largest observed displacement is ``5e-14`` relative, and ``1e-10`` sits
+    two thousand times above it, far enough to be insensitive to the BLAS
+    backend (C-11.3) and still far below any disagreement a reader would
+    call a different answer.
+
+    It is worth being exact about what this does and does not establish. A
+    residual ball is not a state-error ball: the two are related through
+    ``||(dR/dw)^-1||``, which is not bounded here and grows with the horizon.
+    Nor need two distinct roots of a nonlinear system be far apart. So this
+    is evidence that the starting point does not move the answer *on these
+    fixtures*, which is what the consumers of this oracle run, and it is not
+    a proof that it cannot do so in general.
     """
     problem = DampedPendulum()
     method = method_factory()
@@ -381,4 +389,146 @@ def test_an_overflowed_sweep_is_rejected_without_a_finiteness_test() -> None:
     # y(40) = exp(-8000) underflows to zero; the decay must not have blown up.
     assert abs(solution.Y[-1][0][0]) < 1e-12, (
         f"stiff decay did not decay: y_N = {solution.Y[-1][0][0]:.3e}"
+    )
+
+
+class DrainingTank:
+    """``y' = -sqrt(y)``: Torricelli's law, with the domain guarded.
+
+    ``math.sqrt`` raises on a negative argument rather than returning ``nan``,
+    which is what C-7 asks a callback to do instead of inventing a value. The
+    closed form ``y(t) = (1 - t/2)^2`` is positive for ``t < 2``, so nothing
+    about the problem or the horizon below leaves the domain -- only a trial
+    state does.
+    """
+
+    state_dim = 1
+    control_dim = 1
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.array([-math.sqrt(y[0]) + u[0]])
+
+    def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.array([[-0.5 / math.sqrt(y[0])]])
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.array([[1.0]])
+
+
+def backward_euler() -> GLMethod:
+    """Backward Euler as a one-stage, one-value GLM."""
+    return GLMethod(
+        A=np.array([[1.0]]),
+        U=np.array([[1.0]]),
+        B=np.array([[1.0]]),
+        V=np.array([[1.0]]),
+        c=np.array([1.0]),
+    )
+
+
+def test_a_predictor_that_raises_is_a_rejected_candidate() -> None:
+    """A domain error in the sweep must not take the solve down with it.
+
+    The predictor evaluates ``f`` at trial states the solution never visits.
+    From ``y0 = 1`` at ``h = 1.5`` the first Picard sweep asks for
+    ``f(-0.5)``, and a callback that guards its domain raises there -- while
+    both the continuous solution and the discrete root stay positive. Any
+    failure of an optional predictor has to degrade to the starting point
+    that was used before it existed.
+
+    The root is known independently: backward Euler on this field solves
+    ``y1 + h sqrt(y1) - y0 = 0``, and ``0.25 + 1.5(0.5) - 1 = 0`` exactly, so
+    this checks the answer and not merely the absence of an exception.
+    """
+    problem = DrainingTank()
+    method = backward_euler()
+    y0 = np.array([1.0])
+    u = np.zeros((1, 1, 1))
+    lay = _Layout(1, 1, 1, 1, 1)
+
+    with pytest.raises(ValueError):
+        _swept_guess(u, y0, problem, method, 0.0, 1.5, lay)
+
+    chosen = ref._initial_guess(u, y0, problem, method, 0.0, 1.5, lay)
+    assert np.array_equal(chosen, _constant_guess(y0, lay))
+
+    solution = reference_solve(y0, u, (0.0, 1.5), 1, problem, method)
+    assert solution.Y[-1][0][0] == pytest.approx(0.25, abs=1e-14), (
+        f"expected the known discrete root 0.25, got {solution.Y[-1][0][0]!r}"
+    )
+
+
+class JacobianRefuses(UndrivenPendulum):
+    """``f`` is well behaved; ``F`` refuses.
+
+    The solve therefore gets past assembling a residual and fails inside the
+    Newton update, which is the second of the two places an error can arise
+    and the one a predictor-shaped guard would not reach.
+    """
+
+    def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        raise ValueError("Jacobian unavailable")
+
+
+@pytest.mark.parametrize(
+    "problem, y0, label",
+    [
+        (DrainingTank(), np.array([-1.0]), "residual evaluation"),
+        (JacobianRefuses(), np.array([0.4, 0.0]), "Newton update"),
+    ],
+)
+def test_a_failing_newton_solve_still_raises(
+    problem: object, y0: NDArray, label: str
+) -> None:
+    """The fallback covers the predictor only, never the solve itself.
+
+    Catching broadly around an optional predictor is safe, because its
+    failure has a correct answer -- use the other candidate. Catching around
+    the iteration would convert a genuine failure into a silent wrong answer,
+    which is the defect class C-7 exists to prevent.
+
+    Both places an error can arise are covered. ``DrainingTank`` from a
+    negative state fails while the residual is assembled, before any update.
+    ``JacobianRefuses`` has a working ``f``, so it reaches the update and
+    fails there instead; without it, a guard wrapped around the update would
+    go unnoticed.
+    """
+    method = backward_euler() if problem.state_dim == 1 else gauss2()
+    u = np.zeros((1, method.s, problem.control_dim))
+    with pytest.raises(ValueError):
+        reference_solve(y0, u, (0.0, 1.5), 1, problem, method)
+
+
+def test_the_contraction_bound_carries_the_tableau() -> None:
+    """``h ||A|| L < 1``, not ``h L < 1``.
+
+    The sweep iterates ``Z -> explicit + h A f(Z)``, so its Lipschitz
+    constant carries ``||A||``. Dropping it understates the range badly, and
+    this fixture is the counterexample: implicit midpoint has
+    ``||A||_inf = 1/2``, so ``y' = -1.5 y`` at ``h = 1`` contracts by exactly
+    ``h ||A|| L = 0.75`` per sweep while ``h L = 1.5`` would predict growth.
+
+    This pins the statement the docstrings and C-14.3 make, so that the
+    weaker claim cannot quietly return.
+    """
+    A = np.array([[0.5]])
+    lam, h = -1.5, 1.0
+    lipschitz = abs(lam)
+    assert h * lipschitz > 1.0, "fixture must violate the tableau-free bound"
+    a_norm = float(np.abs(A).sum(axis=1).max())
+    assert h * a_norm * lipschitz < 1.0, "fixture must satisfy the real bound"
+
+    explicit = 1.0
+    Zn = explicit
+    ratios = []
+    defect = abs(Zn - explicit - h * A[0, 0] * lam * Zn)
+    for _ in range(5):
+        Zn = explicit + h * A[0, 0] * lam * Zn
+        nxt = abs(Zn - explicit - h * A[0, 0] * lam * Zn)
+        ratios.append(nxt / defect)
+        defect = nxt
+
+    assert np.allclose(ratios, h * a_norm * lipschitz, rtol=1e-12), (
+        f"expected every sweep to contract by {h * a_norm * lipschitz}, "
+        f"measured {ratios}"
     )

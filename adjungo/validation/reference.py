@@ -310,15 +310,27 @@ def _swept_guess(
     ``adjungo/stepping`` as C-14.1 requires of this reference. The clause
     governing this starting point is C-14.3.
 
-    A Picard sweep contracts only while ``h`` times the Lipschitz constant of
-    ``f`` stays below one. Above that it amplifies, and quickly: on the Van
-    der Pol fixture of ``examples/nonlinear_implicit_control.py`` at ``h=1.2``
-    two sweeps reach ``3e+72`` and three reach ``1e+252``. A sweep is
-    therefore kept only when it reduces the stage residual it is trying to
-    zero, which stops the iteration on the step where it would begin to
-    diverge. That comparison also absorbs an overflowed sweep without a
-    separate test for one, because a non-finite candidate has a non-finite
-    defect and ``nan < defect`` is false.
+    The map is ``Z -> explicit + h A f(Z)``, so a sufficient condition for it
+    to contract is ``h ||A|| L < 1`` on the states it visits, where ``L`` is
+    a Lipschitz constant for ``f``. The tableau belongs in that bound and
+    dropping it understates the useful range badly: implicit midpoint has
+    ``||A||_inf = 1/2``, so ``y' = -1.5 y`` at ``h = 1`` contracts by exactly
+    ``0.75`` per sweep even though ``h L = 1.5``.
+
+    Where the condition fails the sweep amplifies, and quickly: on the Van
+    der Pol fixture of ``examples/nonlinear_implicit_control.py`` at
+    ``h=1.2`` two sweeps reach ``3e+72`` and three reach ``1e+252``.
+
+    Neither constant is available here -- ``L`` is a property of a caller's
+    callback on a region not known in advance -- so no such bound is
+    evaluated. A sweep is instead kept only while it is observed to reduce
+    the stage defect it is trying to zero. That is a monotonicity test, not a
+    proof of contraction: one decrease does not make a map a contraction. It
+    is used because it needs nothing beyond the values already computed and
+    because it stops the iteration on the step where growth begins, which is
+    what the caller needs from it. It also absorbs an overflowed sweep
+    without a separate test for one, since a non-finite candidate has a
+    non-finite defect and ``nan < defect`` is false.
 
     The caller must still compare this against the alternative. The forward
     propagation of ``Y`` is explicit, so it can amplify from step to step even
@@ -401,16 +413,39 @@ def _initial_guess(
     absolute residual ball of radius ``tol``, and which point that is depends
     on where it began. Across the gauss2, sdirk3 and rk4 fixtures of the
     damped pendulum at ``N=20`` and ``N=80`` the two accepted roots differ by
-    at most ``5e-14`` relative, consistent with two points in a ``1e-13``
-    ball. Consumers of this reference compare derivatives at rounding level,
-    so that displacement is reported here rather than asserted away.
+    at most ``5e-14`` relative. That is a measurement on those fixtures, not
+    a bound: a residual ball is not a state-error ball, and the two are
+    related only through ``||(dR/dw)^-1||``, which grows with the horizon.
+    Consumers of this reference compare derivatives at rounding level, so the
+    displacement is reported here rather than asserted away.
+
+    A starting point can in principle select a different root, and no
+    residual test can rule that out. What the acceptance test does guarantee
+    is that whatever comes back is a root of the correct discrete system.
+    Sweeping is expected to *help* here rather than hurt, because a guess
+    that follows the dynamics lands near the solution branch continuous with
+    ``y0``, whereas a constant guess has no such affinity -- but that is a
+    reasoned expectation, not a theorem, and it is not relied on.
     """
     constant = _constant_guess(y0, lay)
-    with np.errstate(over="ignore", invalid="ignore"):
-        swept = _swept_guess(u, y0, problem, method, t0, h, lay)
-        swept_defect = np.max(
-            np.abs(_residual(swept, u, y0, problem, method, t0, h, lay))
-        )
+
+    # The predictor is optional, and it evaluates ``f`` at trial states the
+    # solution never visits. A callback that guards its domain -- as C-7 asks
+    # it to -- will raise there: ``y' = -sqrt(y)`` from ``y0 = 1`` with
+    # ``h = 1.5`` is asked for ``f(-0.5)`` on the first sweep, though both the
+    # continuous and the discrete solutions stay positive. Any failure of the
+    # predictor is therefore a rejected candidate, not a failure of the solve.
+    # Newton itself runs outside this guard, so a genuine error there is still
+    # raised.
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            swept = _swept_guess(u, y0, problem, method, t0, h, lay)
+            swept_defect = np.max(
+                np.abs(_residual(swept, u, y0, problem, method, t0, h, lay))
+            )
+    except Exception:  # noqa: BLE001 - see above; any predictor failure falls back
+        return constant
+
     constant_defect = np.max(
         np.abs(_residual(constant, u, y0, problem, method, t0, h, lay))
     )
