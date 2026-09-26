@@ -159,6 +159,37 @@ def test_a_tiny_diagonal_entry_is_implicit() -> None:
     _assert_matches_reference(method)
 
 
+def test_no_tolerance_however_tight_survives_these_tableaux() -> None:
+    """The two fixtures above are discriminating but not exhaustive: they are
+    separated by ``1e-6`` relative and ``1e-9`` absolute, so they would still
+    pass if someone replaced exact comparison with a tolerance tighter than
+    those. Injecting ``abs(A[i,i] - A[0,0]) > 1e-8`` in place of ``!=`` leaves
+    the whole suite green without this test.
+
+    These perturbations are the smallest a float can carry, so no nonzero
+    tolerance admits them and the comparison is pinned as exact rather than
+    as merely tight.
+    """
+    one_ulp = np.nextafter(GAMMA, 1.0)
+    assert one_ulp != GAMMA and one_ulp - GAMMA < 1e-16
+    method = _tableau(np.array([[GAMMA, 0.0], [1.0 - GAMMA, one_ulp]]))
+    assert method.structural_stage_type is StageType.DIRK
+    assert method.sdirk_gamma is None
+
+    # The smallest positive denormal: any absolute tolerance calls this zero.
+    denormal = np.nextafter(0.0, 1.0)
+    assert denormal > 0.0
+
+    # Otherwise strictly lower triangular, so this entry alone decides whether
+    # the tableau is explicit and whether stage 0 carries an implicit term.
+    method = _tableau(np.array([[denormal, 0.0], [0.5, 0.0]]))
+    assert method.structural_stage_type is StageType.DIRK
+    assert method.explicit_stage_indices == [1]
+
+    method = _tableau(np.array([[GAMMA, denormal], [1.0 - GAMMA, GAMMA]]))
+    assert method.structural_stage_type is StageType.IMPLICIT
+
+
 def test_the_tangent_sweep_treats_a_tiny_diagonal_entry_as_implicit(
     monkeypatch,
 ) -> None:
