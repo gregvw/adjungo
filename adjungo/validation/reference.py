@@ -279,9 +279,20 @@ def reference_solve(
 ) -> ReferenceSolution:
     """Solve the monolithic discrete system ``R(w, u) = 0`` by Newton's method.
 
-    The Newton iteration is exact for explicit tableaux (``R_Z`` is block
-    strictly lower triangular plus identity) and converges quadratically
-    otherwise.
+    For an explicit tableau ``R_Z`` is block strictly lower triangular plus
+    identity, so each Newton step is a forward substitution. That structure
+    is not exactness: the iteration terminates in one step only when ``f`` is
+    affine in the state, and a nonlinear ``f`` under an explicit tableau still
+    iterates -- measurably two steps for ``examples/rocket_ascent.py``.
+    Convergence is quadratic in either case.
+
+    ``tol`` is an **absolute** bound on ``||R||_inf``, so it carries the units
+    and scale of ``h * f``. A problem whose residual entries are of order
+    ``1e4`` cannot reach the default at all, and will exhaust ``max_iter``
+    against a target below its own rounding floor; pass a ``tol`` derived from
+    that scale. A residual bound is in any case a stopping rule and not an
+    error bound on a derivative computed from the result. See open question
+    C-Q8 in ``NUMERICS.md``.
 
     Args:
         y0: Initial state, shape ``(n_x,)``.
@@ -290,7 +301,7 @@ def reference_solve(
         N: Number of steps.
         problem: Problem callbacks.
         method: GLM tableau.
-        tol: Target ``||R||_inf``.
+        tol: Target ``||R||_inf``, absolute. See above.
         max_iter: Newton iteration cap.
 
     Returns:

@@ -106,9 +106,13 @@ singularity at ``m = 0`` and no meaning for ``m`` below the dry mass. The run
 below stays well inside the physical region -- the mass never falls below
 34.7 of an initial 100, against a dry mass of 20 -- but a different ``alpha``,
 horizon or target could leave it, and nothing in this example would stop it.
-Imposing ``z >= 0`` needs bounds, which ``scipy`` supports directly; imposing
-a terminal condition on the state needs a constraint Jacobian, which is open
-question C-Q7 in ``NUMERICS.md``.
+Imposing ``z >= 0`` needs bounds, which ``scipy`` supports directly. A
+terminal condition on the *altitude* is what needs a constraint Jacobian, and
+that is open question C-Q7 in ``NUMERICS.md``. A fuel budget does not: ``m``
+is the one state whose ``f`` does not depend on the state, so the tableau
+integrates it exactly and ``m_N = m0 - h * sum_{n,k} b_k z_{n,k}`` is a
+direct linear function of the control, verified against the discrete solve to
+7.1e-15.
 """
 
 from __future__ import annotations

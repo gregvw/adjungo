@@ -738,14 +738,24 @@ def _reference_solution(optimizer, u, n_steps):
     ``reference_solve`` measures ``||R||_inf`` against an absolute default of
     1e-13. That suits an O(1) problem; here the residual entries scale like
     ``h * max|f| ~ 7.5 s * 1e3 m/s ~ 7.5e3``, whose unit roundoff is about
-    1.7e-12, so the default is below the floating-point floor and Newton
-    stalls at 1.4e-12 with a RuntimeError. The tableau is explicit, so the
-    Newton iteration is exact and that stall is the rounding-limited exact
-    solution.
+    1.7e-12, so the default is below the floating-point floor. Newton
+    descends to 1.36e-12, cannot improve on it, and exhausts ``max_iter``
+    there -- a refusal of an answer that is already as good as the format
+    allows.
 
-    1e-10 is about sixty times that roundoff -- comfortably reachable -- and
-    1.3e-14 in relative terms, two orders below the 1e-11 relative budget the
-    comparisons below use.
+    An explicit tableau does **not** make that iteration exact. It makes
+    ``R_Z`` block strictly lower triangular plus identity, so each Newton
+    step is a forward substitution; the iteration terminates in one step
+    only when ``f`` is affine in the state, as in the oscillator example.
+    This ``f`` is not, and the solve measurably takes two steps.
+
+    The tolerance below is therefore a stopping rule, not an error bound. It
+    is set at 1e-10, about sixty times the roundoff of the residual scale, so
+    the iteration stops on the quadratic step that lands at ~1.8e-12 instead
+    of grinding against an unreachable target. What justifies it is not the
+    residual but the comparisons themselves: the package and the reference
+    agree to below 4e-15 relative, three orders inside the 1e-11 budget
+    asserted below. A residual tolerance alone would not establish that.
     """
     from adjungo.validation import reference_solve
     from examples.rocket_ascent import T_FINAL, Y0
@@ -761,6 +771,40 @@ def _reference_solution(optimizer, u, n_steps):
     )
 
 
+#: Rounding budget for a generated derivative against a hand-written one.
+#: Each entry of this problem's derivatives is a product or quotient of at
+#: most four operands, so at most four roundings separate any two orderings
+#: of the same expression; eight unit roundoffs leaves a factor of two over
+#: that bound. Observed deviation over 2000 sampled points on this machine
+#: was 0.0, but a generator that reassociated a product would still be
+#: correct, and the test must not call that a failure.
+DERIVATION_BUDGET = 8 * np.finfo(float).eps
+
+
+def _agrees_by_derivation(generated: np.ndarray, hand: np.ndarray, name: str) -> None:
+    """Compare a generated derivative with a hand-written one, entry by kind."""
+    generated = np.asarray(generated, dtype=float)
+    assert generated.shape == hand.shape, (
+        f"{name}: generated shape {generated.shape}, hand-derived {hand.shape}"
+    )
+
+    structural = hand == 0.0
+    assert np.array_equal(generated[structural], hand[structural]), (
+        f"{name}: an entry that vanishes identically came back nonzero at "
+        f"{np.argwhere(structural & (generated != 0.0)).tolist()}"
+    )
+
+    computed = ~structural
+    if not computed.any():
+        return
+    deviation = np.abs(generated[computed] - hand[computed]) / np.abs(hand[computed])
+    assert np.max(deviation) <= DERIVATION_BUDGET, (
+        f"{name}: generated and hand-derived entries differ by "
+        f"{np.max(deviation):.3e} relative, over the "
+        f"{DERIVATION_BUDGET:.3e} rounding budget"
+    )
+
+
 @requires_sympy
 def test_symbolic_derivatives_match_hand_derivation():
     """The generated callbacks equal derivatives taken by hand.
@@ -771,9 +815,14 @@ def test_symbolic_derivatives_match_hand_derivation():
     dropped term would separate them. The contractions follow the ``Problem``
     docstrings, ``F_yy_action(y, u, t, v)_{ij} = sum_l v_l d2 f_l/dy_i dy_j``.
 
-    The agreement is exact, not approximate. Both paths evaluate the same
-    elementary expressions in the same order, so nothing rounds differently;
-    the comparison is therefore against 0.0 rather than a tolerance.
+    Two different claims are made about the two kinds of entry, and
+    ``_agrees_by_derivation`` states the basis for each. A structurally zero
+    entry must be exactly zero: that the derivative *vanishes identically* is
+    an algebraic fact, not a small computed number. Every other entry is
+    compared against a rounding budget, because sympy chooses its own
+    association and is free to emit ``-(ve*z)/m**2`` where the hand form
+    writes ``-ve*z/m**2``. Requiring the last bits to match would pin a code
+    generator's formatting decisions, which C-11.3 forbids.
     """
     from examples.rocket_ascent import EXHAUST_VELOCITY, GRAVITY, rocket_dynamics
 
@@ -806,12 +855,12 @@ def test_symbolic_derivatives_match_hand_derivation():
         F_yu_hand = np.array([[0.0], [0.0], [-v[1] * ve / m**2]])
         F_uu_hand = np.zeros((1, 1))
 
-        assert np.array_equal(dynamics.f(y, u, 0.0), f_hand)
-        assert np.array_equal(dynamics.F(y, u, 0.0), F_hand)
-        assert np.array_equal(dynamics.G(y, u, 0.0), G_hand)
-        assert np.array_equal(dynamics.F_yy_action(y, u, 0.0, v), F_yy_hand)
-        assert np.array_equal(dynamics.F_yu_action(y, u, 0.0, v), F_yu_hand)
-        assert np.array_equal(dynamics.F_uu_action(y, u, 0.0, v), F_uu_hand)
+        _agrees_by_derivation(dynamics.f(y, u, 0.0), f_hand, "f")
+        _agrees_by_derivation(dynamics.F(y, u, 0.0), F_hand, "F")
+        _agrees_by_derivation(dynamics.G(y, u, 0.0), G_hand, "G")
+        _agrees_by_derivation(dynamics.F_yy_action(y, u, 0.0, v), F_yy_hand, "F_yy")
+        _agrees_by_derivation(dynamics.F_yu_action(y, u, 0.0, v), F_yu_hand, "F_yu")
+        _agrees_by_derivation(dynamics.F_uu_action(y, u, 0.0, v), F_uu_hand, "F_uu")
 
 
 @requires_sympy
@@ -1072,3 +1121,44 @@ def test_each_example_documents_an_invocation_that_resolves():
             assert target == f"examples/{path.name}"
         checked += 1
     assert checked == 4, f"expected four runnable examples, found {checked}"
+
+
+@requires_sympy
+def test_the_fuel_budget_is_a_direct_function_of_the_control():
+    """Mass is integrated exactly by the quadrature, so no adjoint is needed.
+
+    ``dm/dt = -z`` does not depend on the state, so the Runge-Kutta update
+    for that component reduces to the tableau's own quadrature and the
+    terminal mass is a *linear* function of the control,
+
+        m_N = m0 - h * sum_n sum_k b_k z_{n,k}.
+
+    This is what keeps C-Q7 from blocking a fuel-constrained problem: a
+    constraint with a direct formula in ``u`` needs no sweep per component,
+    and the general trajectory-Jacobian API can stay open while such a
+    problem is posed. The claim is asserted here rather than stated in prose
+    so that a change to the objective's quadrature convention, or to the
+    method, cannot quietly invalidate it.
+
+    The two sides are the same sum in different orders. Each accumulates
+    about ``N * s`` roundings, so the budget is ``4 * N * s`` unit roundoffs;
+    the observed deviation is under two.
+    """
+    from examples.rocket_ascent import T_FINAL, Y0, build_optimizer
+
+    for n_steps, seed in ((8, 5), (60, 11)):
+        optimizer = build_optimizer(n_steps)
+        u = _perturbed_burn(n_steps, seed=seed)
+        stages = optimizer.method.s
+
+        direct = Y0[2] - (T_FINAL / n_steps) * float(
+            np.einsum("k,nkv->", optimizer.method.B[0, :], u)
+        )
+        stepped = float(optimizer.trajectory(u).Y[-1][0][2])
+
+        budget = 4 * n_steps * stages * np.finfo(float).eps
+        deviation = abs(direct - stepped) / abs(stepped)
+        assert deviation <= budget, (
+            f"N={n_steps}: quadrature formula gives {direct!r}, the solve "
+            f"{stepped!r}, {deviation / np.finfo(float).eps:.1f} eps apart"
+        )
