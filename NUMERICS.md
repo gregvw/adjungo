@@ -2331,3 +2331,42 @@ substitute for the matrix. A single development interpreter cannot observe a
 floor violation, and this one could not: CPython 3.14 runs every construct
 above without complaint. Push before the local history grows past what CI has
 seen, or the matrix is a description of intent rather than a measurement.
+
+### R-13 A tolerance is set by what it must separate — `APPROVED`
+
+**Why this clause exists.** [C-11.3](#c-11) forbids pinning bit-exact output
+and requires every tolerance to carry its basis. "Three times the largest
+value I observed" looks like a basis and is not one. It records one machine's
+rounding and says nothing about what the assertion is supposed to detect, so
+it is simultaneously too fragile to survive a second machine and unexamined as
+to whether it still catches a defect.
+
+**Mechanism.** `test_the_undamped_optimum_is_the_continuous_one_at_every_mesh`
+asserts that the discrete optimum of the undamped double integrator equals the
+continuous one at every mesh — an exactness claim, because the optimal control
+is linear in `t`, the state is therefore a cubic, and `rk4`'s weights at
+abscissae `(0, ½, ½, 1)` are Simpson's rule. The deviation is pure rounding
+accumulated over `N` backward Riccati steps. Measured under Apple Accelerate
+it ranged from 15 to 40 unit roundoffs, so the budget was written as 64. The
+same assertion under OpenBLAS in CI measured 65, and the push went red. The
+backends differ in the last bits of an LU, which is exactly what C-11.3 names.
+The test had certified a BLAS.
+
+**What follows.** Set the budget from the separation it has to achieve, and
+state both sides. Above, rounding is 15 to 65 unit roundoffs across the two
+backends. Below, the smallest real defect the test must exclude is genuine
+truncation error, measured by running the identical computation on the damped
+problem, where `λ₂` picks up an exponential and the exactness argument fails:
+3.1e-2 at `N = 5` falling to 3.0e-5 at `N = 160`. A budget of 1e-11 sits about
+700x above the worst rounding and six orders below the smallest truncation
+error the family produces. Both numbers belong in the comment; a budget quoted
+without the defect scale it excludes cannot be rechecked.
+
+Two further habits come from the same incident. Where the claim is that a
+quantity does *not* shrink under refinement, assert that as well as the
+magnitude — a fourth-order error falls by 1024x from `N = 5` to `N = 160`,
+while rounding stayed between 0.8x and 2.2x, so the flatness check
+discriminates where a bound alone does not. And confirm the loosened budget
+still fails against injection: a 1e-9 relative perturbation of the closed form
+is still caught at 1e-11, which is the evidence that the margin was taken from
+the unused side.

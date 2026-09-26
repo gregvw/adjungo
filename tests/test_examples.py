@@ -1204,12 +1204,17 @@ def test_the_step_map_assembly_reproduces_the_package_solve():
         optimizer = build_optimizer(n_steps, drag)
         stepped = optimizer.trajectory(u).Y[-1][0]
 
-        # Two assemblies of one linear map over ten steps. The budget is
-        # 64 unit roundoffs against the state scale; observed is under four.
+        # Two assemblies of one linear map over ten steps, so the difference
+        # is rounding. The budget is not set from that rounding: it is set
+        # from what it has to exclude. Any *different* discretisation differs
+        # at O(h^p) with h = 0.2, which is 1e-4 at best, so 1e-10 relative
+        # sits six orders below the smallest real defect and six orders above
+        # a rounding difference of a fraction of an ulp. A budget pinned just
+        # above one machine's observation certifies that machine (C-11.3).
         scale = max(float(np.max(np.abs(stepped))), 1.0)
-        assert np.max(np.abs(y - stepped)) / scale < 64 * np.finfo(float).eps
+        assert np.max(np.abs(y - stepped)) / scale < 1e-10
         assert discrete_objective(u, n_steps, drag) == pytest.approx(
-            optimizer.objective_value(u), rel=1e-13
+            optimizer.objective_value(u), rel=1e-11
         )
         assert T_FINAL > 0.0
 
@@ -1233,8 +1238,9 @@ def test_the_riccati_control_is_stationary_for_the_package_gradient():
         optimizer = build_optimizer(n_steps, drag)
         gradient = optimizer.gradient(riccati_control(n_steps, drag))
 
-        # Scale: the objective's own control term is R*h*w_k*u ~ 1e-3, so a
-        # gradient of 1e-15 is fifteen orders below the terms that cancel.
+        # The objective's own control term is R*h*w_k*u ~ 1e-3, and a
+        # misdirected gradient would be of that order; the terms that cancel
+        # here are ten orders above the budget.
         assert np.max(np.abs(gradient)) < 1e-13, (
             f"drag={drag}: |grad| = {np.max(np.abs(gradient)):.3e} at the "
             "Riccati optimum"
@@ -1376,14 +1382,30 @@ def test_the_undamped_optimum_is_the_continuous_one_at_every_mesh():
         u_continuous = exact.control(stage_times(n_steps))[:, :, None]
         deviations.append(float(np.max(np.abs(u_discrete - u_continuous))) / scale)
         assert discrete_objective(u_discrete, n_steps) == pytest.approx(
-            exact.objective, rel=1e-13
+            exact.objective, rel=1e-11
         )
 
-    # Budget: 64 unit roundoffs, about three times the largest observed (the
-    # Riccati recursion accumulates rounding over N backward steps). The
-    # claim is that this does not decrease with N, which is why the same
-    # bound applies to the coarsest mesh and the finest.
-    assert max(deviations) < 64 * np.finfo(float).eps, f"deviations {deviations}"
+    # The budget separates two measured populations rather than fitting one.
+    # Rounding: 15 to 40 unit roundoffs under Apple Accelerate and up to 65
+    # under OpenBLAS -- the Riccati recursion accumulates over N backward
+    # steps, and the backends differ in the last bits of an LU (C-11.3). The
+    # first version of this test used 64 eps, which passed here and failed in
+    # CI: it had certified a BLAS, not a method.
+    #
+    # Truncation: the same measurement on the damped problem, where the
+    # discretisation is genuinely inexact, gives 3.1e-2 at N = 5 falling to
+    # 3.0e-5 at N = 160. So 1e-11 sits roughly 700x above the worst rounding
+    # seen on either backend and six orders below the smallest truncation
+    # error this family produces.
+    assert max(deviations) < 1e-11, f"deviations {deviations}"
+
+    # The magnitude alone could be met by an error that is simply small. The
+    # content of "exact" is that it does not fall under refinement: a
+    # fourth-order error would drop by 2^4 per halving, a factor of 1024 from
+    # N = 5 to N = 160. Rounding stays flat, observed between 0.8x and 2.2x.
+    assert deviations[-1] > deviations[0] / 100.0, (
+        f"deviation fell like truncation error under refinement: {deviations}"
+    )
 
 
 def test_the_damped_optimum_converges_at_fourth_order():
@@ -1469,8 +1491,11 @@ def test_double_integrator_hessian_is_constant_and_matches_the_reference():
         np.column_stack([hessp(point, np.eye(size)[:, j]) for j in range(size)])
         for point in points
     ]
+    # A genuine dependence on u would be O(1) relative, since the second
+    # derivative terms it would come from are not small; the two assemblies
+    # differ only by rounding, measured at 0.0 here.
     scale = float(np.max(np.abs(assembled[0])))
-    assert np.max(np.abs(assembled[0] - assembled[1])) / scale < 1e-13
+    assert np.max(np.abs(assembled[0] - assembled[1])) / scale < 1e-11
 
     reference = reference_hessian(
         Y0,
