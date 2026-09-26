@@ -23,6 +23,13 @@ dev = [
     "mypy>=1.0.0",
     "ruff>=0.1.0",
 ]
+# Examples only. The library itself stays on numpy and scipy: per C-1 this code
+# is a reference for a C++ port, and a symbolic-algebra dependency does not
+# port. `examples/symbolic.py` uses sympy to derive the callbacks the Problem
+# protocol requires, which is authoring convenience, not part of the method.
+examples = [
+    "sympy>=1.12",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

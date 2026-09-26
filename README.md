@@ -311,7 +311,7 @@ The library is organized into several modules:
 
 ## Examples
 
-All three are executed by the test suite, and each is checked against the
+All four are executed by the test suite, and each is checked against the
 independently assembled reference rather than merely run.
 
 | Example | What it demonstrates |
@@ -319,6 +319,7 @@ independently assembled reference rather than merely run.
 | [`minimum_energy_oscillator.py`](examples/minimum_energy_oscillator.py) | The quick start above. Explicit Runge–Kutta (`rk4`) on dynamics affine in `(y, u)`, with both optimizer routes: gradient-only and the exact Hessian-vector product. |
 | [`nonlinear_implicit_control.py`](examples/nonlinear_implicit_control.py) | The fully implicit route. A controlled Van der Pol oscillator under `gauss2`: coupled stages solved as one `(s·n)` Newton system per step, and a Jacobian that genuinely depends on the state, so the second derivatives of `f` are not zero. |
 | [`factorization_reuse_counts.py`](examples/factorization_reuse_counts.py) | Declaration-gated factorisation reuse, counted rather than timed. One factorisation for the whole solve when `jacobian_constant=True` is declared, against one per stage per Newton iteration per step when it is not — with an identical gradient either way. |
+| [`rocket_ascent.py`](examples/rocket_ascent.py) | Derivative callbacks differentiated by sympy rather than written out, via [`examples/symbolic.py`](examples/symbolic.py), and checked against hand-derived ones. A Tsiolkovsky rocket ascent with a closed-form solution under constant burn, an objective that carries the C-9.3 stage quadrature itself, and second derivatives of `f` that do not vanish. Needs the `examples` extra: `pip install -e '.[dev,examples]'`. |
 
 ## Development
 

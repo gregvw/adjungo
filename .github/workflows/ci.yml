@@ -31,7 +31,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install -e ".[dev,examples]"
 
       # NUMERICS.md C-11.1: the linked backend is part of the certification
       # record. Development machines here link Apple Accelerate while CI links
@@ -83,7 +83,7 @@ jobs:
           # C-11.4: the declared floor. A job pinned below it installs a
           # package whose own metadata refuses that interpreter.
           python-version: "3.13"
-      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -e ".[dev,examples]"
 
       # AGENTS.md forbids root-level test_*.py. They are not tests, and one of
       # them previously raised at import and broke bare `pytest` collection.

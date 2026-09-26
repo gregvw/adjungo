@@ -11,6 +11,8 @@ rather than carrying its own copy of the code, so documentation drift becomes
 a test failure.
 """
 
+import importlib.util
+import itertools
 import pathlib
 import re
 
@@ -693,3 +695,380 @@ def test_reuse_example_module_runs_as_a_script(capsys):
     out = capsys.readouterr().out
     assert "predicted factorizations" in out
     assert "observed  factorizations" in out
+
+
+# ---------------------------------------------------------------------------
+# examples/rocket_ascent.py and the sympy derivation layer
+#
+# This example differs from the two above in three ways that need separate
+# checks: its derivative callbacks are differentiated by sympy rather than
+# written out, its dynamics have a closed-form solution under a constant
+# control, and its objective carries the C-9.3 quadrature factors itself.
+# ---------------------------------------------------------------------------
+
+requires_sympy = pytest.mark.skipif(
+    importlib.util.find_spec("sympy") is None,
+    reason=(
+        "examples/symbolic.py needs the `examples` extra; install with "
+        "`pip install -e '.[dev,examples]'`. CI installs it, and "
+        "tests/test_documentation.py asserts that it does, so this skip "
+        "cannot go unnoticed there."
+    ),
+)
+
+
+def _perturbed_burn(n_steps: int, seed: int) -> np.ndarray:
+    """A physically meaningful control: the constant burn, jittered.
+
+    Standard normal controls would be negative burn rates, which the model
+    has no meaning for -- thrust would reverse and mass would grow. The
+    derivative claims are about the discrete map and hold at any admissible
+    point, so the point chosen is one the problem admits.
+    """
+    from examples.rocket_ascent import CONSTANT_BURN
+
+    rng = np.random.default_rng(seed)
+    jitter = rng.standard_normal((n_steps, 4, 1))
+    return CONSTANT_BURN * (1.0 + 0.3 * jitter)
+
+
+def _reference_solution(optimizer, u, n_steps):
+    """The monolithic reference solve, at a tolerance this problem can reach.
+
+    ``reference_solve`` measures ``||R||_inf`` against an absolute default of
+    1e-13. That suits an O(1) problem; here the residual entries scale like
+    ``h * max|f| ~ 7.5 s * 1e3 m/s ~ 7.5e3``, whose unit roundoff is about
+    1.7e-12, so the default is below the floating-point floor and Newton
+    stalls at 1.4e-12 with a RuntimeError. The tableau is explicit, so the
+    Newton iteration is exact and that stall is the rounding-limited exact
+    solution.
+
+    1e-10 is about sixty times that roundoff -- comfortably reachable -- and
+    1.3e-14 in relative terms, two orders below the 1e-11 relative budget the
+    comparisons below use.
+    """
+    from adjungo.validation import reference_solve
+    from examples.rocket_ascent import T_FINAL, Y0
+
+    return reference_solve(
+        Y0,
+        u,
+        (0.0, T_FINAL),
+        n_steps,
+        optimizer.problem,
+        optimizer.method,
+        tol=1e-10,
+    )
+
+
+@requires_sympy
+def test_symbolic_derivatives_match_hand_derivation():
+    """The generated callbacks equal derivatives taken by hand.
+
+    This is the check that makes the sympy layer usable. ``f`` is small
+    enough here to differentiate on paper, so the two paths are genuinely
+    independent: an error in the contraction convention, a transpose, or a
+    dropped term would separate them. The contractions follow the ``Problem``
+    docstrings, ``F_yy_action(y, u, t, v)_{ij} = sum_l v_l d2 f_l/dy_i dy_j``.
+
+    The agreement is exact, not approximate. Both paths evaluate the same
+    elementary expressions in the same order, so nothing rounds differently;
+    the comparison is therefore against 0.0 rather than a tolerance.
+    """
+    from examples.rocket_ascent import EXHAUST_VELOCITY, GRAVITY, rocket_dynamics
+
+    dynamics = rocket_dynamics()
+    assert dynamics.state_dim == 3
+    assert dynamics.control_dim == 1
+
+    rng = np.random.default_rng(17)
+    for _ in range(5):
+        altitude, velocity = rng.uniform(0.0, 5000.0), rng.uniform(-100.0, 900.0)
+        mass = rng.uniform(25.0, 100.0)
+        y = np.array([altitude, velocity, mass])
+        u = np.array([rng.uniform(0.1, 3.0)])
+        v = rng.standard_normal(3)
+        ve, z, m = EXHAUST_VELOCITY, u[0], mass
+
+        f_hand = np.array([velocity, ve * z / m - GRAVITY, -z])
+        F_hand = np.array(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, -ve * z / m**2],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+        G_hand = np.array([[0.0], [ve / m], [-1.0]])
+
+        # Only v1 * ve * z / m carries any second derivative.
+        F_yy_hand = np.zeros((3, 3))
+        F_yy_hand[2, 2] = 2.0 * v[1] * ve * z / m**3
+        F_yu_hand = np.array([[0.0], [0.0], [-v[1] * ve / m**2]])
+        F_uu_hand = np.zeros((1, 1))
+
+        assert np.array_equal(dynamics.f(y, u, 0.0), f_hand)
+        assert np.array_equal(dynamics.F(y, u, 0.0), F_hand)
+        assert np.array_equal(dynamics.G(y, u, 0.0), G_hand)
+        assert np.array_equal(dynamics.F_yy_action(y, u, 0.0, v), F_yy_hand)
+        assert np.array_equal(dynamics.F_yu_action(y, u, 0.0, v), F_yu_hand)
+        assert np.array_equal(dynamics.F_uu_action(y, u, 0.0, v), F_uu_hand)
+
+
+@requires_sympy
+def test_symbolic_dynamics_refuses_an_unbound_parameter():
+    """A symbol that is neither state, control nor time cannot be evaluated.
+
+    Per C-7 this is refused at construction rather than surfacing later as a
+    lambdify ``TypeError`` about a missing argument, or worse, as a callback
+    that silently closes over whatever the name resolves to.
+    """
+    import sympy as sp
+
+    from examples.symbolic import SymbolicDynamics
+
+    y, u, t, forgotten = sp.symbols("y u t forgotten", real=True)
+    with pytest.raises(ValueError, match="neither state, control nor time"):
+        SymbolicDynamics(sp.Matrix([forgotten * y + u]), [y], [u], t)
+
+
+@requires_sympy
+def test_constant_burn_matches_the_tsiolkovsky_closed_form():
+    """C-14.1 tier 2: the forward solve against a closed-form anchor.
+
+    Under a constant burn rate the model integrates in elementary functions,
+    and ``constant_burn_state`` shares no code with ``adjungo.stepping``. The
+    residual here is rk4's truncation error, not rounding: at ``N = 60`` over
+    a 60 s horizon the altitude error is about 6e-4 m in 1.8e4 m. The bound
+    is a relative 1e-7, roughly three times the observed error, and it is a
+    discretization budget -- the next test is what pins the rate.
+    """
+    from examples.rocket_ascent import (
+        N_STEPS,
+        T_FINAL,
+        build_optimizer,
+        constant_burn_state,
+        initial_control,
+    )
+
+    computed = build_optimizer().trajectory(initial_control()).Y[-1][0]
+    exact = constant_burn_state(T_FINAL)
+
+    assert exact[2] == pytest.approx(20.0), "the constant burn should use all fuel"
+    relative = np.abs(computed - exact) / np.maximum(np.abs(exact), 1.0)
+    assert np.max(relative) < 1e-7, (
+        f"N={N_STEPS} solve differs from the closed form by {relative}"
+    )
+
+
+@requires_sympy
+def test_rocket_forward_solve_attains_fourth_order():
+    """C-4: refine the mesh and recover rk4's order against the closed form.
+
+    This refines the mesh and is therefore an order-of-accuracy claim, not a
+    derivative claim; AGENTS.md requires the two to be different tests. The
+    oracle is the closed form, so the measured quantity is true
+    discretization error rather than a difference between two discrete
+    solutions.
+    """
+    from adjungo.methods.runge_kutta import rk4
+    from examples.rocket_ascent import (
+        CONSTANT_BURN,
+        T_FINAL,
+        build_optimizer,
+        constant_burn_state,
+    )
+
+    exact = constant_burn_state(T_FINAL)[0]
+    errors = []
+    for n_steps in (15, 30, 60, 120):
+        control = np.full((n_steps, rk4().s, 1), CONSTANT_BURN)
+        final = build_optimizer(n_steps).trajectory(control).Y[-1][0][0]
+        errors.append(abs(final - exact))
+
+    rates = [np.log2(a / b) for a, b in itertools.pairwise(errors)]
+    # Observed 3.96, 3.99, 4.00. The floor admits the coarsest mesh's
+    # pre-asymptotic deficit; a first- or second-order defect would give
+    # rates near 1 or 2 and fail.
+    assert min(rates) > 3.8, f"observed orders {rates} from errors {errors}"
+    assert errors[-1] < 1e-4
+
+
+@requires_sympy
+def test_rocket_gradient_matches_the_independent_reference():
+    """The gradient of an objective that carries its own quadrature factors.
+
+    The other two examples' control terms are plain sums over stages. This
+    one multiplies by ``h * w_k`` per C-9.3, so a gradient that dropped or
+    doubled those factors would still look plausible. The reference assembles
+    the same discrete gradient independently of ``adjungo.stepping``.
+    """
+    from examples.rocket_ascent import T_FINAL, Y0, build_optimizer
+
+    n_steps = 8
+    optimizer = build_optimizer(n_steps)
+    u = _perturbed_burn(n_steps, seed=5)
+
+    grad_pkg = optimizer.gradient(u)
+    grad_ref = reference_gradient(
+        Y0,
+        u,
+        (0.0, T_FINAL),
+        n_steps,
+        optimizer.problem,
+        optimizer.method,
+        optimizer.objective,
+        solution=_reference_solution(optimizer, u, n_steps),
+    )
+
+    assert np.max(np.abs(grad_ref)) > 1e-3, "degenerate case"
+    # Two independent assemblies of one discrete quantity: the difference is
+    # rounding, so the budget matches the other examples' 1e-11 relative.
+    err = np.max(np.abs(grad_pkg - grad_ref)) / max(
+        float(np.max(np.abs(grad_ref))), 1.0
+    )
+    assert err < 1e-11, f"rocket gradient off by {err:.3e}"
+
+
+@requires_sympy
+def test_rocket_hvp_matches_the_independent_reference():
+    """The exact Hessian on dynamics whose ``F_yy`` and ``F_yu`` are nonzero.
+
+    ``d2f/dm2`` and ``d2f/dm dz`` are both nonzero here because of the
+    ``ve z / m`` term, so a dropped second-derivative contraction changes the
+    operator. In the affine example it could not.
+    """
+    from examples.rocket_ascent import T_FINAL, Y0, build_optimizer
+
+    n_steps = 6
+    optimizer = build_optimizer(n_steps)
+    u = _perturbed_burn(n_steps, seed=23)
+    rng = np.random.default_rng(29)
+    v = rng.standard_normal(u.shape)
+
+    H_ref = reference_hessian(
+        Y0,
+        u,
+        (0.0, T_FINAL),
+        n_steps,
+        optimizer.problem,
+        optimizer.method,
+        optimizer.objective,
+        solution=_reference_solution(optimizer, u, n_steps),
+    )
+    hv_ref = (H_ref @ v.ravel()).reshape(v.shape)
+    hv_pkg = optimizer.hessian_vector_product(u, v)
+
+    assert np.max(np.abs(hv_ref)) > 1e-3, "degenerate case"
+    err = np.max(np.abs(hv_pkg - hv_ref)) / max(float(np.max(np.abs(hv_ref))), 1.0)
+    assert err < 1e-11, f"rocket HVP off by {err:.3e}"
+
+
+@requires_sympy
+def test_the_optimum_buys_energy_with_almost_no_altitude():
+    """The claim the docstring makes about the answer, held as an assertion.
+
+    The bounds are deliberately loose. They are not an accuracy claim about a
+    computed number -- the optimum of a nonconvex problem reached by a
+    trust-region iteration is not a quantity to pin -- but the qualitative
+    result is the whole point of the example, and it would not survive a
+    wrong gradient.
+    """
+    from examples.rocket_ascent import (
+        CONSTANT_BURN,
+        DRY_MASS,
+        TARGET_ALTITUDE,
+        _energy,
+        initial_control,
+        solve,
+    )
+
+    n_steps = 60
+    optimizer, result, u_optimal = solve(n_steps)
+
+    assert np.linalg.norm(result.jac) < 1e-6, "did not reach a stationary point"
+
+    before = _energy(initial_control(n_steps), n_steps)
+    after = _energy(u_optimal, n_steps)
+    assert after < 0.9 * before, f"energy only moved {before:.1f} -> {after:.1f}"
+
+    trajectory = optimizer.trajectory(u_optimal)
+    miss = abs(trajectory.Y[-1][0][0] - TARGET_ALTITUDE)
+    assert miss < 1.0, f"altitude missed by {miss:.3f} m"
+
+    # The shape of the answer: throttle up early, shut down before T.
+    assert u_optimal.max() > 1.5 * u_optimal.mean()
+    assert u_optimal[-1, -1, 0] < 0.1 * u_optimal.max()
+
+    # The run stays inside the physical region. See the example's ENVELOPE
+    # note: this is observed, not imposed. The lower bound is a tolerance
+    # rather than an exact zero because the optimum sits *on* z = 0 over the
+    # final steps, where the trust-region iterate lands within rounding of
+    # the boundary from either side -- the observed minimum is about 5e-10
+    # here, and C-11.3 forbids pinning that sign across BLAS backends. A
+    # burn that had gone physically negative would be O(CONSTANT_BURN).
+    assert trajectory.Y[:, 0, 2].min() > DRY_MASS
+    assert u_optimal.min() > -1e-6 * CONSTANT_BURN
+
+
+@requires_sympy
+def test_the_closed_form_refuses_a_rate_that_exhausts_the_mass():
+    """C-7: no silent sentinel where the model stops meaning anything.
+
+    Past ``m = 0`` the logarithm's argument is negative and numpy would
+    return a nan, which a caller could plot without noticing.
+    """
+    from examples.rocket_ascent import INITIAL_MASS, constant_burn_state
+
+    with pytest.raises(ValueError, match="exhausts all mass"):
+        constant_burn_state(60.0, rate=INITIAL_MASS / 30.0)
+
+
+@requires_sympy
+def test_rocket_example_main_runs(capsys):
+    """The example executes end to end and reports what it claims to."""
+    from examples.rocket_ascent import main
+
+    main()
+    out = capsys.readouterr().out
+    assert "Forward solve against the closed form" in out
+    assert "minimum mass in flight" in out
+
+
+def test_each_example_documents_an_invocation_that_resolves():
+    """The ``Run directly::`` line of every example must name something real.
+
+    The examples are not uniform: ``rocket_ascent`` imports a sibling module
+    and so must be run with ``-m``, while the others are run by path. A
+    renamed file or a copied-and-not-edited header would leave a reader with
+    a command that fails, which is the same defect class the README quoting
+    machinery exists to prevent.
+    """
+    directory = pathlib.Path(__file__).resolve().parents[1] / "examples"
+    checked = 0
+    for path in sorted(directory.glob("*.py")):
+        text = path.read_text()
+        if "Run directly::" not in text:
+            # symbolic.py is a helper, not an example; it says so instead.
+            assert "Run the examples that use this module" in text, path.name
+            continue
+        command = text.split("Run directly::", 1)[1].split("\n\n")[1].strip()
+        assert command.startswith(".venv/bin/python"), command
+        target = command.split()[-1]
+
+        # The mechanism, not just the spelling: running a file by path puts
+        # ``examples/`` on ``sys.path`` rather than the repository root, so a
+        # module that imports a sibling can only be run with ``-m``.
+        if re.search(r"^from examples\.", text, re.MULTILINE):
+            assert "-m" in command.split(), (
+                f"{path.name} imports a sibling module, so the documented "
+                f"command must use -m; it is {command!r}"
+            )
+
+        if "-m" in command.split():
+            assert importlib.util.find_spec(target) is not None, command
+            assert target.replace(".", "/") + ".py" == f"examples/{path.name}"
+        else:
+            assert (directory.parent / target).is_file(), command
+            assert target == f"examples/{path.name}"
+        checked += 1
+    assert checked == 4, f"expected four runnable examples, found {checked}"

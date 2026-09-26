@@ -566,6 +566,40 @@ def test_the_ci_matrix_exercises_the_declared_python_floor():
     )
 
 
+def test_ci_installs_every_extra_the_suite_can_skip_on():
+    """A skip that CI also takes is a test that never runs anywhere.
+
+    ``tests/test_examples.py`` skips the rocket example when sympy is
+    absent, so that a contributor who installed only ``[dev]`` gets a skip
+    rather than a collection error. That courtesy becomes a hole the moment
+    CI takes the same skip: the example, its closed-form anchor and its
+    independent-reference comparisons would all report green while never
+    executing. Every optional-dependency group must therefore appear in
+    every CI install line.
+
+    This is the same failure mode as R-12, one layer down: there the check
+    existed and had not run; here the check would run and decline.
+    """
+    extras = set(
+        tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+            "optional-dependencies"
+        ]
+    )
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    installs = re.findall(r"pip install -e [\"']\.\[([^\]]*)\]", workflow)
+    assert installs, "no editable install with extras found in ci.yml"
+
+    for requested in installs:
+        named = {name.strip() for name in requested.split(",")}
+        missing = extras - named
+        assert not missing, (
+            f"ci.yml installs .[{requested}] but pyproject declares {sorted(extras)}; "
+            f"{sorted(missing)} would be absent, so every test guarded on it "
+            "would silently skip in CI."
+        )
+
+
 def test_the_tool_targets_are_the_declared_floor():
     """C-11.4: mypy and ruff check the language level the package promises.
 
