@@ -136,8 +136,10 @@ from one stage time to the next, so nothing is shared within a solve. But on a
 fixed mesh the matrix at each stage time is the same on every call, whatever
 the control. The first gradient therefore takes one factorisation per implicit
 stage solve, and every later gradient or Hessian-vector product takes none.
-The same exact comparison guards every reuse, so a coefficient that changes
-between calls is refused. See `NUMERICS.md` C-17.6.
+The same exact comparison guards every reuse. So a coefficient that changes
+between calls is refused when a later solve assembles a matrix at a stage time
+already stored. An evaluation repeated at an unchanged control is served from
+the optimizer's cache and checks nothing. See `NUMERICS.md` C-17.6.
 
 ### Not yet implemented
 

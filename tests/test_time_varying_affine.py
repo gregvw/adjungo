@@ -65,7 +65,10 @@ from adjungo.methods.runge_kutta import (
     sdirk3,
 )
 from adjungo.solvers import newton as newton_module
+from adjungo.solvers.dirk import DIRKStageSolver
 from adjungo.solvers.factorization import DeclaredStructureViolation
+from adjungo.solvers.implicit import ImplicitStageSolver
+from adjungo.solvers.sdirk import SDIRKStageSolver
 from adjungo.validation.reference import reference_gradient, reference_hessian
 from tests.problems import (
     AnchorObjective,
@@ -998,8 +1001,10 @@ def test_reuse_across_calls_reproduces_a_fresh_solve_exactly(factory) -> None:
 def test_a_coefficient_that_drifts_between_calls_is_refused(factory) -> None:
     """C-17.3 makes determinism in ``t`` a caller obligation. Reuse across
     calls would turn a violation into a stale factorization, so the C-15.2
-    comparison must refuse it -- and it can, because the two matrices it
-    compares now both exist: one from the earlier call, one from this one."""
+    comparison must refuse it. It can, when the later evaluation is at a
+    different control: that runs a new forward solve, whose matrix at each
+    stage time is compared with the one stored on the first call. The
+    boundary of this guard is the next test."""
     scale = np.array([1.0])
 
     def m_drifting(t: float) -> np.ndarray:
@@ -1059,3 +1064,57 @@ def test_a_matrix_coefficient_closing_over_the_control_is_caught_next_call() -> 
     current[0] = 0.45
     with pytest.raises(DeclaredStructureViolation):
         opt.gradient(np.array([[[0.45]]]))
+
+
+
+def test_drift_is_not_seen_by_an_evaluation_served_from_the_cache() -> None:
+    """The boundary C-17.6 states, held so that it cannot drift from the code.
+
+    The comparison runs only when a factorization is requested. Repeating an
+    evaluation at an unchanged control returns the optimizer's cached
+    trajectory and adjoint and assembles nothing, so a coefficient that
+    drifted in between goes unseen and the earlier gradient comes back. That
+    is a violation of the caller's C-17.3 obligation, recorded rather than
+    hardened against. If the cache ever re-checks coefficients, this test
+    fails and the clause must be rewritten with it.
+    """
+    scale = np.array([1.0])
+
+    def m_drifting(t: float) -> np.ndarray:
+        return M_0 + scale[0] * np.sin(1.7 * t) * M_1
+
+    problem = TimeVaryingAffineDynamics(
+        m_drifting, C_of_t, b_of_t, state_dim=NX, control_dim=NU
+    )
+    opt, u, _method = build(sdirk2, problem=problem)
+    first = opt.gradient(u)
+
+    scale[0] = 1.25
+    assert np.array_equal(opt.gradient(u), first)
+
+
+def test_existing_positional_constructor_calls_keep_their_meaning() -> None:
+    """``reuse_across_calls`` is keyword-only and comes last.
+
+    Inserted mid-signature, it took the place of an existing argument:
+    ``SDIRKStageSolver(False, 1.0)`` meant ``y_scale=1.0`` and instead enabled
+    stage-time keying, which on a nonlinear problem raises from the store.
+    The values below are chosen to differ from every default, so that a
+    shifted argument is visible.
+    """
+    sdirk = SDIRKStageSolver(False, 2.0, False)
+    dirk = DIRKStageSolver(2.0, False, False)
+    coupled = ImplicitStageSolver(2.0, False, False)
+    for solver in (sdirk, dirk, coupled):
+        assert solver.y_scale == 2.0
+        assert solver.needs_newton is False
+        assert solver.key_by_stage_time is False
+        assert solver.factorizations.reuse_enabled is False
+
+    for build_solver in (
+        lambda: SDIRKStageSolver(False, 2.0, False, True),
+        lambda: DIRKStageSolver(2.0, False, False, True),
+        lambda: ImplicitStageSolver(2.0, False, False, True),
+    ):
+        with pytest.raises(TypeError):
+            build_solver()

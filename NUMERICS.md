@@ -1763,10 +1763,10 @@ coefficient *samples* on the solve mesh, rather than invoke callables, is
 
 C-17.6 narrows the residue for `M` on implicit routes, and only there. An `M`
 that reads the control is refused on the *next* evaluation at a different
-control, because the matrix at each stage time is then compared with the one
-factored on the previous call. The first evaluation is still silently wrong.
-Nothing changes for `C` or `b`, which are never factored, or for explicit
-methods.
+control. That evaluation runs a new forward solve, and each matrix it assembles
+at a stage time is compared with the one stored when that time was first
+factored. The first evaluation is still silently wrong. Nothing changes for
+`C` or `b`, which are never factored, or for explicit methods.
 
 ### C-17.2 Zero curvature does not imply a constant Jacobian
 
@@ -1811,9 +1811,14 @@ so a coefficient that drifted on that call would seed the adjoint with a matrix
 the forward solve never used, undetected. Determinism is an obligation, not a
 verified fact.
 
-Across calls it is now verified for `M` on implicit routes: C-17.6 compares
-the matrix at each stage time with the one factored on the previous call, and
-refuses drift rather than reusing a stale factorization.
+C-17.6 adds a partial guard for `M` on implicit routes, not a verification of
+determinism. The comparison runs only when a factorization is requested: when
+a new forward solve assembles a matrix at a stage time the store already holds.
+Drift is refused there, rather than answered with a stale factorization.
+
+It runs nowhere else. Repeating an evaluation at an unchanged control returns
+the optimizer's cached trajectory and adjoint and assembles nothing, so drift
+between those calls goes unseen. Determinism remains the caller's obligation.
 
 Two further obligations are enforced rather than documented:
 
@@ -1947,9 +1952,20 @@ Jacobian implies it.
   first call whose matrix at some stage time differs from the earlier one.
   That is the second licence recorded in [C-15.1](#c-15).
 
-**A guard gained.** The comparison needs two matrices, and across calls both
-now exist. So C-17.3's determinism obligation is verified for `M` on implicit
-routes, and C-17.1's closure residue is narrowed as that clause records.
+**A guard gained, and its boundary.** The comparison needs two matrices, and
+across calls both can now exist.
+
+- When a new forward solve assembles a matrix at a stage time already stored,
+  a drifted `M` is refused instead of reused.
+- That covers the case where it matters for reuse: a later solve at a
+  different control. It is also how C-17.1's closure residue narrows.
+- It is not a general verification of C-17.3. Nothing is compared unless a
+  factorization is requested, and an evaluation repeated at an unchanged
+  control returns the cached trajectory without assembling anything.
+
+`test_a_coefficient_that_drifts_between_calls_is_refused` holds the first
+statement, and `test_drift_is_not_seen_by_an_evaluation_served_from_the_cache`
+holds the boundary.
 
 **Certified count.** Measured on the C-17.4 fixture over three evaluations at
 distinct controls: two gradients, then a Hessian-vector product.
@@ -1980,17 +1996,22 @@ about `2·N·(implicit stage solves per step)·m²` doubles, where `m` is `n`, o
 have.
 
 **Injection evidence** — `OBSERVED`. Each defect introduced alone, under the
-[R-11](#r-11) procedure, against a baseline of 889 passed:
+[R-11](#r-11) procedure, against a baseline of 891 passed:
 
 | Defect | Failures |
 |---|---|
-| the solvers drop the stage time from the key, with reuse still on | 66 |
+| the solvers drop the stage time from the key, with reuse still on | 67 |
 | the factory does not pass `reuse_across_calls` to the solver | 21 |
 | the store stops comparing before it reuses | 17 |
 | the deduction ignores control dependence | 7 |
 | the deduction ignores state affinity | 7 |
 | the repeated-solve prediction never claims zero | 5 |
-| SDIRK keys by the step time instead of the stage time | 25 |
+| SDIRK keys by the step time instead of the stage time | 26 |
+| `reuse_across_calls` inserted mid-signature, shifting positional arguments | 1 |
+
+The last row was found in review, not by this campaign. A new argument placed
+before existing ones silently re-binds every positional call. It is now
+keyword-only and comes last in all three solvers.
 
 Evidence: `tests/test_time_varying_affine.py`, section "Reuse across calls".
 

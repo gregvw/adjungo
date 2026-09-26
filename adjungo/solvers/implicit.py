@@ -125,8 +125,9 @@ class ImplicitStageSolver(StageDispatchMixin, StageSolver):
         self,
         y_scale: float = 1.0,
         reuse_across_steps: bool = False,
-        reuse_across_calls: bool = False,
         needs_newton: bool = True,
+        *,
+        reuse_across_calls: bool = False,
     ) -> None:
         self.y_scale = y_scale
         #: Whether stage equations are solved by iteration. Set from
