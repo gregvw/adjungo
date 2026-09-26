@@ -919,10 +919,19 @@ Two properties make this safe rather than merely faster.
    `f`. **The tableau belongs in that bound.** Omitting it understates the
    useful range badly: implicit midpoint has `‖A‖_∞ = ½`, so `y' = −1.5 y` at
    `h = 1` contracts by exactly `0.75` per sweep while `hL = 1.5` would predict
-   growth. Where the condition does fail the sweep amplifies superlinearly — on
-   the Van der Pol fixture of `examples/nonlinear_implicit_control.py` at
-   `h = 1.2`, two unguarded sweeps reach `3e+72` and three reach `1e+252`,
-   producing a singular Newton Jacobian and a `LinAlgError`.
+   growth.
+
+   **That condition is sufficient, not necessary**, so failing it predicts
+   nothing either. It bounds a norm of the iteration matrix, and for a
+   non-normal one the bound is pessimistic: implicit midpoint at `h = 1` with
+   `f(y) = My`, `M = [[−¼, 2], [0, −¼]]`, gives `h‖A‖_∞L = 9/8 > 1` while the
+   iteration matrix has spectral radius `⅛`, and the defects fall.
+
+   Some sweeps do amplify, and that is the case this code must survive. As
+   measured on the Van der Pol fixture of
+   `examples/nonlinear_implicit_control.py` at `h = 1.2`, two unguarded sweeps
+   reach `3e+72` and three reach `1e+252`, producing a singular Newton
+   Jacobian and a `LinAlgError`.
 
    Neither `L` nor the region visited is known to this code, so no such bound
    is evaluated. A sweep is kept only while it is *observed* to reduce the
@@ -971,9 +980,11 @@ nothing here relies on it.
 The reach gained is finite and is not claimed to be unlimited. At amplitude 3.0
 and `h = 1.24` both starting points still refuse.
 
-`OBSERVED` — `tests/test_reference_initial_guess.py`, fourteen tests.
-Injection campaign per [C-14.2](#c-14) against a 915-test baseline: sixteen
-injections, fifteen detected at 1–3 failures each. Both directions of item 3
+`OBSERVED` — `tests/test_reference_initial_guess.py`, fifteen tests. Two of
+them carry no repository code: they pin the two statements above about the
+bound, because both were stated wrongly here before being corrected. Injection
+campaign per [C-14.2](#c-14) at the 915-test baseline current when it was run:
+sixteen injections, fifteen detected at 1–3 failures each. Both directions of item 3
 are covered — removing the predictor guard fails a test, and widening it over
 either the residual evaluation or the Newton update fails a test.
 

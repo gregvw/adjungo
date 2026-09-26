@@ -26,6 +26,7 @@ gap is left open knowingly rather than argued away.
 
 from __future__ import annotations
 
+import itertools
 import math
 
 import numpy as np
@@ -532,3 +533,55 @@ def test_the_contraction_bound_carries_the_tableau() -> None:
         f"expected every sweep to contract by {h * a_norm * lipschitz}, "
         f"measured {ratios}"
     )
+
+
+def test_the_contraction_bound_is_sufficient_and_not_necessary() -> None:
+    """Failing ``h ||A|| L < 1`` does not mean the sweep amplifies.
+
+    The bound is a norm estimate of the iteration matrix
+    ``K = h A (x) M``, and for a non-normal ``K`` a norm badly overstates
+    what the iteration does. This fixture is the counterexample: implicit
+    midpoint at ``h = 1`` with ``M = [[-1/4, 2], [0, -1/4]]`` has
+    ``h ||A||_inf L = 9/8 > 1`` while ``rho(K) = 1/8``, and every measured
+    defect falls.
+
+    It exists so that "the condition is sufficient" is not quietly upgraded
+    to "the condition decides", which would make the amplification claim in
+    C-14.3 an implication it cannot support. The genuine amplification
+    recorded there is an observation on one fixture, not a consequence of
+    this bound failing.
+    """
+    A = np.array([[0.5]])
+    h = 1.0
+    M = np.array([[-0.25, 2.0], [0.0, -0.25]])
+    lipschitz = float(np.abs(M).sum(axis=1).max())
+    a_norm = float(np.abs(A).sum(axis=1).max())
+    assert h * a_norm * lipschitz > 1.0, "fixture must fail the sufficient bound"
+
+    K = h * A[0, 0] * M
+    spectral_radius = float(max(abs(np.linalg.eigvals(K))))
+    assert spectral_radius < 1.0, "fixture must still converge asymptotically"
+
+    explicit = np.array([1.0, 1.0])
+    Zn = explicit.copy()
+    defects = []
+    for _ in range(8):
+        defects.append(float(np.max(np.abs(Zn - explicit - K @ Zn))))
+        Zn = explicit + K @ Zn
+
+    assert all(b < a for a, b in itertools.pairwise(defects)), (
+        f"defects did not fall monotonically despite rho(K)={spectral_radius}: "
+        f"{defects}"
+    )
+    # The contrast is the point: the norm bound permits growth by 1.125 per
+    # sweep, and the iteration instead shrinks by roughly rho(K) = 1/8. The
+    # observed average factor is ~0.17, between the two and far from the
+    # bound, so 0.25 separates "contracts" from "does what the bound allows"
+    # with the whole of that gap to spare.
+    observed = (defects[-1] / defects[0]) ** (1.0 / (len(defects) - 1))
+    assert observed < 0.25, (
+        f"observed contraction factor {observed:.4f} does not sit below the "
+        f"norm bound {h * a_norm * lipschitz:.4f}, so this fixture does not "
+        f"demonstrate that the bound is pessimistic"
+    )
+    assert h * a_norm * lipschitz > 1.0

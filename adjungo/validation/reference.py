@@ -317,9 +317,16 @@ def _swept_guess(
     ``||A||_inf = 1/2``, so ``y' = -1.5 y`` at ``h = 1`` contracts by exactly
     ``0.75`` per sweep even though ``h L = 1.5``.
 
-    Where the condition fails the sweep amplifies, and quickly: on the Van
-    der Pol fixture of ``examples/nonlinear_implicit_control.py`` at
-    ``h=1.2`` two sweeps reach ``3e+72`` and three reach ``1e+252``.
+    That bound is sufficient and not necessary, so failing it predicts
+    nothing. It is a norm bound on the iteration matrix, and for a
+    non-normal one it is pessimistic: implicit midpoint at ``h=1`` with
+    ``f(y) = My``, ``M = [[-1/4, 2], [0, -1/4]]``, has ``h||A||L = 9/8`` yet
+    an iteration matrix of spectral radius ``1/8``, and its defects fall.
+
+    Some sweeps really do amplify, which is the case this code has to
+    survive. Measured, on the Van der Pol fixture of
+    ``examples/nonlinear_implicit_control.py`` at ``h=1.2``: two unguarded
+    sweeps reach ``3e+72`` and three reach ``1e+252``.
 
     Neither constant is available here -- ``L`` is a property of a caller's
     callback on a region not known in advance -- so no such bound is
