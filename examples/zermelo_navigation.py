@@ -68,11 +68,14 @@ the state. Stationarity ``∂H/∂θ = 0`` then gives
 
     \\tan θ^*(t) = (V/h)\\,(T - t),
 
-and ``∂²H/∂θ² = V\\cos θ + (V/h)(T-t)\\,V\\sin θ > 0`` on ``(-π/2, π/2)``, so
-this minimises ``H`` as the minimum principle requires. Differentiating gives
-Zermelo's navigation formula ``\\dot θ = -(V/h)\\cos^2 θ``, which is what the
-general formula reduces to for a current with ``∂u_c/∂y = V/h`` and every
-other derivative zero.
+and at ``θ^*`` itself ``∂²H/∂θ² = V\\sqrt{1 + [(V/h)(T-t)]^2} > 0``, so this
+minimises ``H`` as the minimum principle requires. That positivity is a
+statement about the *stationary* heading, not about the whole interval: at
+this module's parameters, ``t = 0`` and ``θ = -1`` give ``-1.624``, since a
+boat pointed into the current has the opposite curvature. Differentiating
+``θ^*`` gives Zermelo's navigation formula ``\\dot θ = -(V/h)\\cos^2 θ``,
+which is what the general formula reduces to for a current with
+``∂u_c/∂y = V/h`` and every other derivative zero.
 
 Substituting ``θ^*`` and integrating in ``s = (V/h)(T-t)`` closes the
 trajectory in elementary functions; see :func:`optimal_position`.
@@ -91,39 +94,64 @@ stays at its terminal ``-1``, and the stage adjoint carries
     \\qquad
     λ_{n,y} = λ_{n+1,y} - h\\,(V/h).
 
-The nodal value is therefore exact for any consistent tableau. The *stage*
-value matches ``λ_y(t_n + c_i h)`` if and only if
+The nodal value is therefore exact for any consistent tableau. So is the
+stage value -- but at Hager's transformed abscissa
+
+.. math::
+
+    \\bar c_i = 1 - \\frac{\\sum_j b_j a_{ji}}{b_i},
+
+rather than at ``c_i``: rearranging the first line gives exactly
+``Λ_{n,i,y} = λ_y(t_n + \\bar c_i h)``. Since the gradient is
+``h b_i Gᵀ Λ_{n,i}`` with ``G = (-V\\sin θ, V\\cos θ)`` -- which depends on
+the heading alone, not on the state -- it vanishes exactly when
+``\\tan θ_{n,i} = Λ_{n,i,y} / Λ_{n,i,x}``, that is when the *control* is
+sampled at ``\\bar c``. Sampling ``θ^*`` at ``\\bar c`` annihilates the
+gradient for every shipped tableau, to rounding, which is the mechanism
+stated in checkable form.
+
+The continuous ``θ^*`` is sampled at ``c``, so it is discretely stationary
+precisely when ``\\bar c = c``, that is when
 
 .. math::
 
     \\sum_j b_j a_{ji} = b_i\\,(1 - c_i),
 
-Butcher's simplifying assumption ``D(1)`` -- equivalently, the condition for
-the discrete adjoint of a Runge-Kutta scheme to be a consistent Runge-Kutta
-scheme (Hager, *Numer. Math.* 87 (2000) 247-282). Since the gradient is
-``h b_i Gᵀ Λ_{n,i}`` and ``G = (-V\\sin θ, V\\cos θ)``, it vanishes exactly
-when ``\\tan θ = Λ_y/Λ_x``.
+Butcher's simplifying assumption ``D(1)`` (Hager, *Numer. Math.* 87 (2000)
+247-282, equations (33) and (52)). ``D(1)`` says the forward and adjoint stage
+*times* coincide. It does not say that a tableau violating it has an
+inconsistent adjoint: explicit Euler violates ``D(1)``, and its discrete
+adjoint is implicit Euler -- perfectly consistent, and exact for this costate,
+merely evaluated at ``\\bar c = 1`` instead of ``c = 0``.
 
 So for this problem the continuous ``θ^*`` is a stationary point of the
 *discrete* problem, on every mesh, to rounding -- but only for tableaux
 satisfying ``D(1)``. Over the eight shipped tableaux, on the parameters this
-module defines, at ``N = 16``, :func:`adjoint_consistency_defect` predicts
+module defines, at ``N = 16``, :func:`satisfies_adjoint_consistency` predicts
 which, and ``main`` reprints the table::
 
-    tableau                D(1) defect   |dJ/dtheta| at theta*
-    heun                     0.000e+00               2.082e-17
-    rk4                      0.000e+00               2.776e-17
-    implicit_midpoint        0.000e+00               5.551e-17
-    gauss2                   0.000e+00               2.776e-17
-    explicit_euler           1.000e+00               1.567e-02
-    sdirk2                   8.579e-02               1.357e-03
-    sdirk3                   3.800e-01               6.006e-03
-    implicit_trapezoid       2.500e-01               3.955e-03
+    tableau              D(1) defect  |dJ/dtheta| at c   at c_bar
+    heun                   0.000e+00          2.082e-17  2.082e-17
+    rk4                    0.000e+00          2.776e-17  2.776e-17
+    implicit_midpoint      0.000e+00          5.551e-17  5.551e-17
+    gauss2                 0.000e+00          2.776e-17  2.776e-17
+    explicit_euler         1.000e+00          1.567e-02  4.163e-17
+    sdirk2                 1.277e-01          1.357e-03  2.776e-17
+    sdirk3                 2.277e-01          6.006e-03  5.551e-17
+    implicit_trapezoid     3.333e-01          3.955e-03  2.776e-17
 
-The four small entries are rounding, not zero, and their last digits depend on
-the BLAS in use; C-11.3 forbids pinning them and the test does not. What is
-being claimed is the *gap* -- fourteen orders of magnitude, and on which side
-of it each tableau falls.
+The small entries are rounding, not zero, and their last digits depend on the
+BLAS in use; C-11.3 forbids pinning them and the tests do not. What is being
+claimed is the *gap* -- fourteen orders of magnitude -- and which side of it
+each tableau falls on.
+
+The ``D(1)`` defect is itself a cancelling sum, not a stored structural zero,
+so it may not be compared against ``0.0`` either. Writing Gauss's
+``sqrt(3)/6`` as the mathematically identical ``1/(2 sqrt(3))`` moves it by
+one unit in the last place, which would reclassify a tableau that had not
+changed. :func:`satisfies_adjoint_consistency` therefore scales the residual
+by the magnitude of the terms that formed it and allows a few roundings; see
+:data:`ADJOINT_CONSISTENCY_BUDGET`.
 
 That is worth more than a mesh study. It is a closed-form anchor (C-14.1 tier
 2) that binds the adjoint's *stage* weights ``b_j a_{ji} / b_i`` -- the part
@@ -265,23 +293,73 @@ def navigation_defect(t: NDArray | float, dt: float = 1e-5) -> float:
     )
 
 
-def adjoint_consistency_defect(method: GLMethod) -> float:
-    """``max_i |Σ_j b_j a_{ji} - b_i (1 - c_i)|``: Butcher's ``D(1)``, as a defect.
+#: Rounding budget for the ``D(1)`` residual, relative to the magnitude of the
+#: terms that formed it. The residual is a cancelling sum of ``s + 2`` products
+#: of stored coefficients, so a handful of unit roundoffs separate two
+#: algebraically identical spellings of the same tableau; eight leaves room
+#: over that. Measured: every shipped tableau satisfying ``D(1)`` gives exactly
+#: 0.0, Gauss rewritten as ``1/(2 sqrt(3))`` gives 0.120 roundoffs, and the
+#: smallest genuine violation among the shipped tableaux is 1.277e-01 --
+#: fourteen orders of magnitude above this budget. Nothing here is close.
+ADJOINT_CONSISTENCY_BUDGET = 8 * np.finfo(float).eps
 
-    Zero exactly when the discrete adjoint reproduces a costate that is linear
-    in ``t`` at the *stage* abscissae, which for this problem is the whole of
-    the optimality condition. See the module docstring for the derivation and
-    for the measured table this predicts.
+
+def adjoint_consistency_defect(method: GLMethod) -> float:
+    """Relative ``D(1)`` residual: ``Σ_j b_j a_{ji} - b_i (1 - c_i)``, scaled.
+
+    Each component is divided by the sum of the magnitudes of the terms that
+    formed it, ``Σ_j |b_j a_{ji}| + |b_i|(1 + |c_i|)``. That is the scale which
+    sets the component's rounding: this is a difference that can cancel, so
+    the roundings are of the *terms* and survive into a smaller result, and
+    dividing by the result instead would make an exact zero look infinitely
+    wrong.
+
+    Use :func:`satisfies_adjoint_consistency` to classify. Comparing the
+    returned value against ``0.0`` would pin an association, which C-11.3
+    forbids -- the shipped Gauss coefficients give exactly zero, but spelling
+    ``sqrt(3)/6`` as ``1/(2 sqrt(3))`` does not.
     """
+    a = np.asarray(method.A, dtype=float)
     b = np.asarray(method.B, dtype=float).ravel()
-    return float(
-        np.max(
-            np.abs(
-                b @ np.asarray(method.A, dtype=float)
-                - b * (1.0 - np.asarray(method.c, dtype=float).ravel())
-            )
+    c = np.asarray(method.c, dtype=float).ravel()
+    residual = np.abs(b @ a - b * (1.0 - c))
+    scale = np.abs(b) @ np.abs(a) + np.abs(b) * (1.0 + np.abs(c))
+    return float(np.max(np.where(scale > 0.0, residual / np.where(scale > 0.0, scale, 1.0), residual)))
+
+
+def satisfies_adjoint_consistency(method: GLMethod) -> bool:
+    """Whether the forward and adjoint stage times coincide, to rounding.
+
+    Equivalently ``\\bar c = c`` for :func:`transformed_abscissae`, which for
+    this problem is exactly the condition that the continuous optimal heading
+    is stationary for the discrete problem.
+    """
+    return adjoint_consistency_defect(method) <= ADJOINT_CONSISTENCY_BUDGET
+
+
+def transformed_abscissae(method: GLMethod) -> NDArray:
+    """Hager's ``\\bar c_i = 1 - (Σ_j b_j a_{ji}) / b_i``, the adjoint's stage times.
+
+    The discrete adjoint of a Runge-Kutta scheme is again a Runge-Kutta
+    scheme, but on these abscissae (Hager, *Numer. Math.* 87 (2000) 247-282,
+    equations (33) and (52)). For this problem the stage adjoint carries the
+    continuous costate exactly at ``t_n + \\bar c_i h``, whatever the tableau;
+    ``D(1)`` is the statement that those times are the forward ones.
+
+    Raises:
+        ValueError: if any ``b_i`` vanishes, where the transformed tableau is
+            undefined. Returning a filled-in value would be the sentinel C-7
+            forbids.
+    """
+    a = np.asarray(method.A, dtype=float)
+    b = np.asarray(method.B, dtype=float).ravel()
+    if np.any(b == 0.0):
+        raise ValueError(
+            f"the adjoint abscissae divide by b, which vanishes at stages "
+            f"{np.flatnonzero(b == 0.0).tolist()}; the transformed tableau is "
+            f"not defined for this method."
         )
-    )
+    return 1.0 - (b @ a) / b
 
 
 # ---------------------------------------------------------------------------
@@ -342,16 +420,26 @@ def build_optimizer(
     )
 
 
-def stage_times(n_steps: int = N_STEPS, method_factory=rk4) -> NDArray:
-    """Absolute time at every stage, shape ``(n_steps, s)``."""
+def stage_times(
+    n_steps: int = N_STEPS, method_factory=rk4, abscissae: NDArray | None = None
+) -> NDArray:
+    """Absolute time at every stage, shape ``(n_steps, s)``.
+
+    ``abscissae`` defaults to the tableau's own ``c``. Passing
+    :func:`transformed_abscissae` instead gives the times the *adjoint*
+    evaluates at, which is what makes the mechanism above checkable.
+    """
     method = method_factory()
     h = T_FINAL / n_steps
-    return np.arange(n_steps)[:, None] * h + h * np.asarray(method.c)[None, :]
+    c = method.c if abscissae is None else abscissae
+    return np.arange(n_steps)[:, None] * h + h * np.asarray(c, dtype=float)[None, :]
 
 
-def optimal_control(n_steps: int = N_STEPS, method_factory=rk4) -> NDArray:
+def optimal_control(
+    n_steps: int = N_STEPS, method_factory=rk4, abscissae: NDArray | None = None
+) -> NDArray:
     """``θ*`` sampled at the stage abscissae, shape ``(n_steps, s, 1)``."""
-    return optimal_heading(stage_times(n_steps, method_factory))[:, :, None]
+    return optimal_heading(stage_times(n_steps, method_factory, abscissae))[:, :, None]
 
 
 def solve(n_steps: int = N_STEPS, method_factory=rk4):
@@ -400,9 +488,11 @@ def main() -> None:
     print()
 
     print("Is the continuous theta* stationary for the DISCRETE problem, N = 16?")
-    print("  D(1) holds exactly when the discrete adjoint carries a linear")
-    print("  costate at the stage abscissae, which is all this problem asks.")
-    print(f"    {'tableau':<20}{'D(1) defect':>14}{'|dJ/dtheta| at theta*':>24}")
+    print("  The stage adjoint carries the exact costate at Hager's c_bar.")
+    print("  D(1) says c_bar = c, and only then is theta*, sampled at c, optimal.")
+    print(
+        f"    {'tableau':<20}{'D(1) defect':>13}{'|dJ| at c':>12}{'|dJ| at c_bar':>15}"
+    )
     for name in (
         "heun",
         "rk4",
@@ -415,9 +505,13 @@ def main() -> None:
     ):
         factory = getattr(runge_kutta, name)
         optimizer = build_optimizer(16, factory)
-        gradient = np.abs(optimizer.gradient(optimal_control(16, factory))).max()
+        bar = transformed_abscissae(factory())
+        at_c = np.abs(optimizer.gradient(optimal_control(16, factory))).max()
+        at_bar = np.abs(
+            optimizer.gradient(optimal_control(16, factory, bar))
+        ).max()
         defect = adjoint_consistency_defect(factory())
-        print(f"    {name:<20}{defect:>14.3e}{gradient:>24.3e}")
+        print(f"    {name:<20}{defect:>13.3e}{at_c:>12.3e}{at_bar:>15.3e}")
     print()
 
     print("The value still carries truncation error, and refines at rk4's order:")

@@ -2110,9 +2110,28 @@ def test_zermelo_heading_satisfies_pontryagin_against_an_independent_costate():
         f"theta* is not stationary for the Hamiltonian: "
         f"{np.max(np.abs(stationarity)):.3e}"
     )
-    # Observed minimum 1.2000. A maximum of H would satisfy the same
-    # first-order condition and be the wrong answer.
-    assert np.min(curvature) > 0.1, f"not a minimum of H: {np.min(curvature)}"
+
+    # At theta* the curvature collapses to V*sqrt(1 + s^2) with
+    # s = (V/h)(T - t), which is positive and bounded below by V. Asserting
+    # the closed form rather than a bare sign keeps this a statement about
+    # *this* stationary point: positivity is not a property of the interval.
+    # At t = 0, theta = -1 the same expression is -1.624, because a boat
+    # pointed into the current has the opposite curvature.
+    s = BOAT_SPEED / SHEAR_HEIGHT * (T_FINAL - times)
+    expected = BOAT_SPEED * np.hypot(1.0, s)
+    assert np.max(np.abs(curvature - expected)) < 1e-11, (
+        f"curvature at theta* does not match V*sqrt(1+s^2): "
+        f"{np.max(np.abs(curvature - expected)):.3e}"
+    )
+    assert np.min(expected) >= BOAT_SPEED > 0.0
+
+    off_optimum = -lam_x[0] * BOAT_SPEED * np.cos(-1.0) - (
+        lam_y[0] * BOAT_SPEED * np.sin(-1.0)
+    )
+    assert off_optimum < 0.0, (
+        "H is not convex in theta across the interval, so the minimum "
+        "principle has to be invoked at theta*, not on (-pi/2, pi/2)"
+    )
 
 
 @requires_sympy
@@ -2191,9 +2210,9 @@ def test_zermelo_closed_form_control_is_discretely_stationary_exactly_under_d1()
     """
     from adjungo.methods import runge_kutta
     from examples.zermelo_navigation import (
-        adjoint_consistency_defect,
         build_optimizer,
         optimal_control,
+        satisfies_adjoint_consistency,
     )
 
     satisfied, violated = [], []
@@ -2208,7 +2227,7 @@ def test_zermelo_closed_form_control_is_discretely_stationary_exactly_under_d1()
         "implicit_trapezoid",
     ):
         factory = getattr(runge_kutta, name)
-        defect = adjoint_consistency_defect(factory())
+        holds = satisfies_adjoint_consistency(factory())
         for n_steps in (8, 16):
             gradient = float(
                 np.max(
@@ -2219,7 +2238,7 @@ def test_zermelo_closed_form_control_is_discretely_stationary_exactly_under_d1()
                     )
                 )
             )
-            (satisfied if defect == 0.0 else violated).append((name, gradient))
+            (satisfied if holds else violated).append((name, gradient))
 
     assert satisfied and violated, "the split must exercise both branches"
     worst_satisfied = max(g for _, g in satisfied)
@@ -2237,6 +2256,128 @@ def test_zermelo_closed_form_control_is_discretely_stationary_exactly_under_d1()
         f"a tableau violating D(1) was stationary anyway, so the predicate is "
         f"not what is being tested: {violated}"
     )
+
+
+@requires_sympy
+def test_zermelo_stage_adjoint_is_exact_at_the_transformed_abscissae():
+    """The mechanism behind D(1), stated so it can fail on its own.
+
+    ``D(1)`` is not "the adjoint is consistent" -- explicit Euler violates it
+    and its discrete adjoint is implicit Euler, which is perfectly consistent.
+    What the adjoint does is evaluate at Hager's ``c_bar`` instead of ``c``.
+    For this problem the stage adjoint carries the exact costate there
+    whatever the tableau, so sampling ``theta*`` at ``c_bar`` annihilates the
+    gradient for *every* method, including the four that violate ``D(1)`` and
+    are visibly nonstationary at ``c``.
+    """
+    from adjungo.methods import runge_kutta
+    from examples.zermelo_navigation import (
+        build_optimizer,
+        optimal_control,
+        satisfies_adjoint_consistency,
+        transformed_abscissae,
+    )
+
+    saw_violation = False
+    for name in (
+        "heun",
+        "rk4",
+        "implicit_midpoint",
+        "gauss2",
+        "explicit_euler",
+        "sdirk2",
+        "sdirk3",
+        "implicit_trapezoid",
+    ):
+        factory = getattr(runge_kutta, name)
+        method = factory()
+        bar = transformed_abscissae(method)
+        optimizer = build_optimizer(16, factory)
+        at_bar = float(
+            np.max(np.abs(optimizer.gradient(optimal_control(16, factory, bar))))
+        )
+        # Same basis as the D(1) test: a generic control puts |dJ/dtheta| at
+        # about 8e-2, so 1e-12 is a relative 1e-11. Observed worst 5.6e-17.
+        assert at_bar < 1e-12, (
+            f"{name}: the stage adjoint should be exact at c_bar, got {at_bar:.3e}"
+        )
+
+        if satisfies_adjoint_consistency(method):
+            assert np.allclose(bar, np.asarray(method.c, dtype=float), atol=1e-14), (
+                f"{name} satisfies D(1), so c_bar must equal c: {bar} vs {method.c}"
+            )
+        else:
+            saw_violation = True
+            at_c = float(
+                np.max(np.abs(optimizer.gradient(optimal_control(16, factory))))
+            )
+            assert at_c > 1e-4, (
+                f"{name} violates D(1) but was stationary at c anyway: {at_c:.3e}"
+            )
+    assert saw_violation, "the contrast needs at least one D(1) violation"
+
+
+@requires_sympy
+def test_zermelo_d1_predicate_survives_rewriting_a_tableau_coefficient():
+    """C-11.3 on the predicate itself: it may not pin an association.
+
+    The ``D(1)`` residual is a cancelling sum of stored coefficients, not a
+    structural zero of the kind that routes a solver. Gauss's ``sqrt(3)/6``
+    and ``1/(2 sqrt(3))`` are the same number and differ by one unit in the
+    last place, which moves the residual off zero without changing the
+    tableau. A predicate testing ``== 0.0`` reclassifies the method and then
+    demands a gradient it cannot have; this asserts the scaled budget does
+    not.
+    """
+    from adjungo.core.method import GLMethod, StageType
+    from examples.zermelo_navigation import (
+        adjoint_consistency_defect,
+        build_optimizer,
+        optimal_control,
+        satisfies_adjoint_consistency,
+    )
+
+    def gauss2_spelled(offset: float, shift: float = 0.0) -> GLMethod:
+        return GLMethod(
+            A=np.array([[0.25, 0.25 - offset], [0.25 + offset, 0.25]]),
+            U=np.array([[1.0], [1.0]]),
+            B=np.array([[0.5, 0.5]]),
+            V=np.array([[1.0]]),
+            c=np.array([0.5 - offset + shift, 0.5 + offset]),
+            declared_stage_type=StageType.IMPLICIT,
+        )
+
+    shipped = np.sqrt(3.0) / 6.0
+    rewritten = 1.0 / (2.0 * np.sqrt(3.0))
+    assert shipped != rewritten, (
+        "this machine evaluates the two spellings identically, so the "
+        "regression cannot bite; it needs a one-ulp difference"
+    )
+
+    for offset in (shipped, rewritten):
+        method = gauss2_spelled(offset)
+        assert satisfies_adjoint_consistency(method), (
+            f"gauss2 written with offset {offset!r} was classified as "
+            f"violating D(1); defect {adjoint_consistency_defect(method):.3e}"
+        )
+        gradient = float(
+            np.max(
+                np.abs(
+                    build_optimizer(16, lambda m=method: m).gradient(
+                        optimal_control(16, lambda m=method: m)
+                    )
+                )
+            )
+        )
+        assert gradient < 1e-12, f"offset {offset!r} gave gradient {gradient:.3e}"
+
+    # The budget must still be far too small to excuse a real violation --
+    # and the violation has to be a real one. Moving ``offset`` will not do
+    # it: the family A = [[1/4, 1/4-t], [1/4+t, 1/4]] with c = (1/2-t, 1/2+t)
+    # satisfies D(1) identically in ``t``, as sympy confirms the residual is
+    # exactly zero there. Shifting ``c`` alone breaks the pairing, and gives
+    # a relative defect of 5.0e-07, some 2.8e8 times the budget.
+    assert not satisfies_adjoint_consistency(gauss2_spelled(shipped, shift=1e-6))
 
 
 @requires_sympy
