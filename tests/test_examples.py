@@ -1136,7 +1136,7 @@ def test_each_example_documents_an_invocation_that_resolves():
             assert (directory.parent / target).is_file(), command
             assert target == f"examples/{path.name}"
         checked += 1
-    assert checked == 6, f"expected six runnable examples, found {checked}"
+    assert checked == 7, f"expected seven runnable examples, found {checked}"
 
 
 @requires_sympy
@@ -1988,3 +1988,452 @@ def test_pendulum_main_runs(capsys):
     assert "exact period" in out
     assert "rate" in out
     assert "theta(T)" in out
+
+
+# ---------------------------------------------------------------------------
+# Zermelo navigation: the first example whose field is nonlinear in the control
+#
+# Everything above enters ``f`` additively through the control, so ``F_uu``
+# vanishes identically and nothing has ever driven it. Here the heading enters
+# through ``cos`` and ``sin``. It is also the only nonvanishing second
+# derivative the problem has, which turns the usual "is this term right?"
+# question into "is this term there at all?".
+#
+# The sharper claim this example supports is that the *continuous* optimal
+# heading is a stationary point of the *discrete* problem, on any mesh, to
+# rounding -- but only for tableaux satisfying Butcher's D(1). That binds the
+# discrete adjoint's stage weights to a predicate computed from the tableau
+# alone. See the module docstring for the derivation.
+# ---------------------------------------------------------------------------
+
+
+@requires_sympy
+def test_zermelo_closed_form_solves_the_equations_of_motion():
+    """The claimed trajectory satisfies ``y' = f(y, theta*)``, by differencing.
+
+    An oracle nobody checks is not an oracle. ``optimal_position`` is compared
+    against the vector field through a central difference, so the residual is
+    ``O(dt^2)`` rather than zero; asserting that it *scales* that way tests the
+    closed form without pinning a value that would only certify a step size.
+    """
+    from examples.zermelo_navigation import (
+        BOAT_SPEED,
+        SHEAR_HEIGHT,
+        optimal_heading,
+        optimal_position,
+    )
+
+    times = np.linspace(0.3, 1.2, 7)
+    residuals = []
+    for dt in (1e-3, 5e-4, 2.5e-4):
+        slope = (optimal_position(times + dt) - optimal_position(times - dt)) / (
+            2.0 * dt
+        )
+        heading = optimal_heading(times)
+        height = optimal_position(times)[1]
+        field = np.stack(
+            [
+                BOAT_SPEED * np.cos(heading) + BOAT_SPEED * height / SHEAR_HEIGHT,
+                BOAT_SPEED * np.sin(heading),
+            ]
+        )
+        residuals.append(float(np.max(np.abs(slope - field))))
+
+    # Measured 5.101e-07, 1.275e-07, 3.188e-08: halving dt quarters the
+    # residual. The window admits second order and excludes both first order
+    # (ratio 2) and an exact agreement that would mean the difference is not
+    # seeing the trajectory at all.
+    for coarse, fine in itertools.pairwise(residuals):
+        assert 3.5 < coarse / fine < 4.5, f"not second order: {residuals}"
+
+
+@requires_sympy
+def test_zermelo_heading_obeys_the_navigation_formula():
+    """``dtheta/dt = -(V/h) cos^2(theta)``, Zermelo's formula for this current.
+
+    The general navigation formula keeps four derivatives of the current; a
+    linear shear leaves only ``du_c/dy``. Checking the reduction is what makes
+    the closed-form heading a statement about *this* flow rather than an
+    arbitrary arctangent.
+    """
+    from examples.zermelo_navigation import T_FINAL, navigation_defect
+
+    times = np.linspace(0.0, T_FINAL, 9)
+    coarse = navigation_defect(times, dt=1e-3)
+    fine = navigation_defect(times, dt=5e-4)
+    # Same second-order differencing as above, measured 1.03e-06 and 2.57e-07.
+    assert 3.5 < coarse / fine < 4.5, f"not second order: {coarse}, {fine}"
+
+
+@requires_sympy
+def test_zermelo_heading_satisfies_pontryagin_against_an_independent_costate():
+    """``tan theta* = lambda_y / lambda_x`` for a costate integrated elsewhere.
+
+    ``optimal_heading`` is an arctangent written down from a hand derivation.
+    This integrates the costate equations numerically instead, with
+    ``solve_ivp`` and no reference to the example's algebra, and checks both
+    the stationarity of the Hamiltonian and that the stationary point is the
+    *minimum* the minimum principle requires.
+    """
+    from scipy.integrate import solve_ivp
+
+    from examples.zermelo_navigation import (
+        BOAT_SPEED,
+        SHEAR_HEIGHT,
+        T_FINAL,
+        optimal_heading,
+    )
+
+    costate = solve_ivp(
+        lambda t, lam: [0.0, -lam[0] * BOAT_SPEED / SHEAR_HEIGHT],
+        (T_FINAL, 0.0),
+        [-1.0, 0.0],
+        rtol=1e-12,
+        atol=1e-14,
+        dense_output=True,
+    )
+    times = np.linspace(0.0, T_FINAL, 11)
+    lam_x, lam_y = costate.sol(times)
+    heading = optimal_heading(times)
+
+    stationarity = -lam_x * BOAT_SPEED * np.sin(heading) + (
+        lam_y * BOAT_SPEED * np.cos(heading)
+    )
+    curvature = -lam_x * BOAT_SPEED * np.cos(heading) - (
+        lam_y * BOAT_SPEED * np.sin(heading)
+    )
+
+    # dH/dtheta is a difference of two terms of size ~BOAT_SPEED, so its
+    # rounding floor is a few eps times that; the integrator's own 1e-12
+    # tolerance dominates. Observed 8.9e-16.
+    assert np.max(np.abs(stationarity)) < 1e-11, (
+        f"theta* is not stationary for the Hamiltonian: "
+        f"{np.max(np.abs(stationarity)):.3e}"
+    )
+    # Observed minimum 1.2000. A maximum of H would satisfy the same
+    # first-order condition and be the wrong answer.
+    assert np.min(curvature) > 0.1, f"not a minimum of H: {np.min(curvature)}"
+
+
+@requires_sympy
+def test_zermelo_second_derivative_in_the_control_is_the_entire_hessian():
+    """``F_uu`` is nonzero, ``F_yy`` and ``F_yu`` are not, and the cost is flat.
+
+    The example's claim is that zeroing ``F_uu_action`` does not perturb the
+    Hessian here but annihilates it. That is worth asserting directly: it is
+    what makes this problem a test of the second-derivative path rather than a
+    test that happens to include one.
+    """
+    from examples.zermelo_navigation import (
+        BOAT_SPEED,
+        T_FINAL,
+        Y0,
+        build_optimizer,
+        zermelo_dynamics,
+    )
+
+    dynamics = zermelo_dynamics()
+    rng = np.random.default_rng(17)
+    seen = 0.0
+    for _ in range(64):
+        state = rng.uniform(-2.0, 2.0, 2)
+        control = rng.uniform(-np.pi, np.pi, 1)
+        time = rng.uniform(0.0, T_FINAL)
+        seed = rng.standard_normal(2)
+        assert np.array_equal(
+            np.asarray(dynamics.F_yy_action(state, control, time, seed)),
+            np.zeros((2, 2)),
+        ), "f is linear in the state, so F_yy must vanish identically"
+        assert np.array_equal(
+            np.asarray(dynamics.F_yu_action(state, control, time, seed)),
+            np.zeros((2, 1)),
+        ), "the current does not involve the heading, so F_yu must vanish"
+        seen = max(
+            seen,
+            float(
+                np.max(
+                    np.abs(dynamics.F_uu_action(state, control, time, seed))
+                )
+            ),
+        )
+    # The largest attainable value is BOAT_SPEED * |seed|; anything near zero
+    # would make every other assertion here vacuous.
+    assert seen > 0.5 * BOAT_SPEED, f"F_uu never got off the floor: {seen:.3e}"
+
+    n_steps = 6
+    optimizer = build_optimizer(n_steps)
+    stages = optimizer.method.s
+    u = rng.uniform(0.2, 1.2, (n_steps, stages, 1))
+    direction = rng.standard_normal((n_steps, stages, 1))
+    live = optimizer.hessian_vector_product(u, direction)
+    assert np.max(np.abs(live)) > 1e-3, "degenerate Hessian, nothing to lose"
+
+    optimizer.problem.F_uu_action = lambda y, u_, t, v: np.zeros((1, 1))
+    assert np.array_equal(
+        optimizer.hessian_vector_product(u, direction), np.zeros_like(live)
+    ), (
+        "with F_uu removed the Hessian should be exactly zero here: every "
+        "other second-derivative block of this problem already is"
+    )
+    assert Y0.shape == (2,)
+
+
+@requires_sympy
+def test_zermelo_closed_form_control_is_discretely_stationary_exactly_under_d1():
+    """The strongest oracle here: a closed form that is *discretely* optimal.
+
+    ``d/dtheta`` of the discrete objective at the continuous ``theta*`` is
+    rounding for every tableau satisfying Butcher's ``D(1)``, and visibly
+    nonzero for every tableau violating it. The mesh does not enter, so this
+    is not a discretisation statement: it pins the discrete adjoint's stage
+    weights ``b_j a_ji / b_i``, which a duality test cannot separate from the
+    tangent's.
+    """
+    from adjungo.methods import runge_kutta
+    from examples.zermelo_navigation import (
+        adjoint_consistency_defect,
+        build_optimizer,
+        optimal_control,
+    )
+
+    satisfied, violated = [], []
+    for name in (
+        "heun",
+        "rk4",
+        "implicit_midpoint",
+        "gauss2",
+        "explicit_euler",
+        "sdirk2",
+        "sdirk3",
+        "implicit_trapezoid",
+    ):
+        factory = getattr(runge_kutta, name)
+        defect = adjoint_consistency_defect(factory())
+        for n_steps in (8, 16):
+            gradient = float(
+                np.max(
+                    np.abs(
+                        build_optimizer(n_steps, factory).gradient(
+                            optimal_control(n_steps, factory)
+                        )
+                    )
+                )
+            )
+            (satisfied if defect == 0.0 else violated).append((name, gradient))
+
+    assert satisfied and violated, "the split must exercise both branches"
+    worst_satisfied = max(g for _, g in satisfied)
+    best_violated = min(g for _, g in violated)
+
+    # A generic control puts |dJ/dtheta| at about 8e-2 here, so 1e-12 is a
+    # relative 1e-11. Observed worst over the D(1) tableaux was 5.6e-17, and
+    # the smallest violation was 1.4e-03. The claim is the gap and which side
+    # each tableau falls on, not the rounding digits, which are BLAS-dependent
+    # and may not be pinned (C-11.3).
+    assert worst_satisfied < 1e-12, (
+        f"a D(1) tableau failed to make theta* stationary: {satisfied}"
+    )
+    assert best_violated > 1e-4, (
+        f"a tableau violating D(1) was stationary anyway, so the predicate is "
+        f"not what is being tested: {violated}"
+    )
+
+
+@requires_sympy
+def test_zermelo_symbolic_derivatives_match_hand_derivation():
+    """All five generated callbacks against derivatives taken on paper.
+
+    ``f`` and ``F_uu`` are sums whose terms can cancel, so they are scaled by
+    the sum of the term magnitudes rather than by the result; see
+    ``_agrees_by_derivation``. Worst observed deviation over 2000 sampled
+    points was 1.66 unit roundoffs, inside the 8-roundoff budget.
+    """
+    from examples.zermelo_navigation import (
+        BOAT_SPEED,
+        SHEAR_HEIGHT,
+        T_FINAL,
+        zermelo_dynamics,
+    )
+
+    dynamics = zermelo_dynamics()
+    rng = np.random.default_rng(29)
+    for _ in range(2000):
+        state = rng.uniform(-2.0, 2.0, 2)
+        angle = rng.uniform(-np.pi, np.pi)
+        control = np.array([angle])
+        time = rng.uniform(0.0, T_FINAL)
+        seed = rng.standard_normal(2)
+        sin, cos = np.sin(angle), np.cos(angle)
+
+        _agrees_by_derivation(
+            dynamics.f(state, control, time),
+            np.array(
+                [BOAT_SPEED * cos + BOAT_SPEED * state[1] / SHEAR_HEIGHT,
+                 BOAT_SPEED * sin]
+            ),
+            "f",
+            scale=np.array(
+                [abs(BOAT_SPEED * cos) + abs(BOAT_SPEED * state[1] / SHEAR_HEIGHT),
+                 abs(BOAT_SPEED * sin)]
+            ),
+        )
+        _agrees_by_derivation(
+            dynamics.F(state, control, time),
+            np.array([[0.0, BOAT_SPEED / SHEAR_HEIGHT], [0.0, 0.0]]),
+            "F",
+        )
+        _agrees_by_derivation(
+            dynamics.G(state, control, time),
+            np.array([[-BOAT_SPEED * sin], [BOAT_SPEED * cos]]),
+            "G",
+        )
+        _agrees_by_derivation(
+            np.asarray(
+                dynamics.F_uu_action(state, control, time, seed)
+            ).reshape(1, 1),
+            np.array([[-BOAT_SPEED * (seed[0] * cos + seed[1] * sin)]]),
+            "F_uu_action",
+            scale=np.array(
+                [[abs(BOAT_SPEED * seed[0] * cos) + abs(BOAT_SPEED * seed[1] * sin)]]
+            ),
+        )
+
+
+@requires_sympy
+def test_zermelo_gradient_matches_the_independent_reference():
+    """C-2 against the strongest oracle (C-14.1.1), on a control-nonlinear field.
+
+    ``reference_gradient`` rebuilds the discrete problem from the monolithic
+    residual and shares no code with ``adjungo/stepping/``. Budget is the
+    ``1e-11`` relative the other examples use; observed here about ``6e-17``.
+    """
+    from examples.zermelo_navigation import T_FINAL, Y0, build_optimizer
+
+    n_steps = 5
+    optimizer = build_optimizer(n_steps)
+    method = optimizer.method
+    u = np.random.default_rng(11).uniform(0.2, 1.2, (n_steps, method.s, 1))
+
+    grad_ref = reference_gradient(
+        Y0, u, (0.0, T_FINAL), n_steps,
+        optimizer.problem, method, optimizer.objective,
+    )
+    assert np.max(np.abs(grad_ref)) > 1e-3, "degenerate case"
+
+    err = np.max(np.abs(optimizer.gradient(u) - grad_ref)) / max(
+        float(np.max(np.abs(grad_ref))), 1.0
+    )
+    assert err < 1e-11, f"zermelo gradient off by {err:.3e}"
+
+
+@requires_sympy
+def test_zermelo_hvp_matches_the_independent_reference():
+    """The exact Hessian where every block but ``F_uu`` vanishes.
+
+    The reference assembles the dense reduced Hessian independently, so this
+    checks the one curvature term this problem has. Observed disagreement was
+    ``5.6e-17`` relative; the budget is the usual ``1e-11``.
+    """
+    from examples.zermelo_navigation import T_FINAL, Y0, build_optimizer
+
+    n_steps = 5
+    optimizer = build_optimizer(n_steps)
+    method = optimizer.method
+    rng = np.random.default_rng(23)
+    u = rng.uniform(0.2, 1.2, (n_steps, method.s, 1))
+    direction = rng.standard_normal((n_steps, method.s, 1))
+
+    dense = reference_hessian(
+        Y0, u, (0.0, T_FINAL), n_steps,
+        optimizer.problem, method, optimizer.objective,
+    )
+    assert np.max(np.abs(dense)) > 1e-3, "degenerate case"
+
+    expected = (dense @ direction.reshape(-1)).reshape(direction.shape)
+    err = np.max(np.abs(optimizer.hessian_vector_product(u, direction) - expected))
+    err /= max(float(np.max(np.abs(expected))), 1.0)
+    assert err < 1e-11, f"zermelo HVP off by {err:.3e}"
+
+
+@requires_sympy
+def test_zermelo_discrete_optimum_converges_to_the_continuous_one_at_order_four():
+    """C-4, and the other half of the story the stationarity test tells.
+
+    The optimal *heading* is recovered exactly on every mesh, so the only
+    thing left to refine is the optimal *value*. It converges at rk4's order.
+    Both bounds are asserted: a rate far above four would mean the error
+    measure has gone degenerate, not that the method improved.
+    """
+    from examples.zermelo_navigation import (
+        build_optimizer,
+        maximum_range,
+        optimal_control,
+    )
+
+    best = maximum_range()
+    errors = [
+        abs(-build_optimizer(n).objective_value(optimal_control(n)) - best)
+        for n in (8, 16, 32, 64)
+    ]
+    rates = [
+        float(np.log2(coarse / fine))
+        for coarse, fine in itertools.pairwise(errors)
+    ]
+    # Measured 3.99, 4.00, 4.00 from 1.289e-07 down to 3.165e-11.
+    assert all(3.7 < rate < 4.3 for rate in rates), f"rates {rates} from {errors}"
+
+
+@requires_sympy
+def test_zermelo_optimizer_recovers_the_closed_form_control():
+    """The optimizer, started dead downstream, finds the closed-form heading.
+
+    The heading is defined modulo ``2 pi``, so the problem has a stationary
+    point on every branch and the start selects one. This asserts that the
+    branch reached from ``theta = 0`` is the one the closed form describes,
+    and that the range attained beats steering straight downstream -- which
+    from ``y = 0`` collects nothing from the current at all.
+    """
+    from examples.zermelo_navigation import (
+        BOAT_SPEED,
+        N_STEPS,
+        T_FINAL,
+        maximum_range,
+        optimal_control,
+        solve,
+    )
+
+    optimizer, result, control = solve()
+    assert result.nit > 0
+
+    # Limited by the optimizer's own gtol of 1e-10, not by discretisation:
+    # theta* is stationary to rounding at every mesh. Observed 5.4e-11.
+    deviation = float(np.max(np.abs(control - optimal_control())))
+    assert deviation < 1e-7, f"optimizer landed elsewhere: {deviation:.3e}"
+
+    attained = -result.fun
+    straight = BOAT_SPEED * T_FINAL
+    assert attained > straight * 1.5, (
+        f"the current should be worth a good deal more than this: "
+        f"{attained:.6f} against {straight:.6f}"
+    )
+    # Truncation at N = N_STEPS, which the order study above refines.
+    assert abs(attained - maximum_range()) < 1e-6, (
+        f"discrete optimum {attained:.9f} against continuous "
+        f"{maximum_range():.9f}"
+    )
+    assert optimizer.trajectory(control).Y[-1][0][1] > 0.0, (
+        "the boat should climb into the faster water, not descend"
+    )
+    assert N_STEPS > 0
+
+
+@requires_sympy
+def test_zermelo_main_runs(capsys):
+    """The documented command produces the tables the docstring quotes."""
+    from examples.zermelo_navigation import main
+
+    main()
+    out = capsys.readouterr().out
+    assert "D(1) defect" in out
+    assert "steering optimally" in out
+    assert "order" in out

@@ -322,7 +322,7 @@ The library is organized into several modules:
 
 ## Examples
 
-All six are executed by the test suite, and each is checked against the
+All seven are executed by the test suite, and each is checked against the
 independently assembled reference rather than merely run.
 
 | Example | What it demonstrates |
@@ -333,6 +333,7 @@ independently assembled reference rather than merely run.
 | [`rocket_ascent.py`](examples/rocket_ascent.py) | Derivative callbacks differentiated by sympy rather than written out, via [`examples/symbolic.py`](examples/symbolic.py), and checked against hand-derived ones. A Tsiolkovsky rocket ascent with a closed-form solution under constant burn, an objective that carries the C-9.3 stage quadrature itself, and second derivatives of `f` that do not vanish. Needs the `examples` extra: `pip install -e '.[dev,examples]'`. |
 | [`double_integrator.py`](examples/double_integrator.py) | The only example that knows its own answer. A linear-quadratic tracking problem checked against two references: a backward Riccati recursion on an independently assembled step map, and the closed-form solution of the continuous optimality conditions. For the undamped problem these coincide *exactly* — `u*` is linear in `t` and rk4's weights are Simpson's rule — so adding linear drag makes the costate exponential and recovers a fourth-order mesh study of the **optimum**, not of a solve. |
 | [`pendulum_swing_up.py`](examples/pendulum_swing_up.py) | The only example whose *nonlinear* dynamics have a closed-form solution. A torque-driven pendulum, swung from hanging to inverted under `gauss2`. Undriven and undamped it librates exactly as a Jacobi elliptic function, with a period a third longer than the small-angle `2π/ω₀`, so the fourth-order mesh study could not pass on a linearised `sin θ`. It also conserves `E = ½ω² + ω₀²(1 − cos θ)`, a first integral that constrains every point rather than one endpoint — and separates the methods: over 32× the integration time `rk4` lets the energy error grow 27-fold where symplectic `gauss2` holds it to 1.003. The swing-up optimum itself has no closed form, and none is claimed. Needs the `examples` extra. |
+| [`zermelo_navigation.py`](examples/zermelo_navigation.py) | The only example whose field is **nonlinear in the control**, and the only one that drives `F_uu`. A boat of fixed speed steers through a linear shear current to reach as far downstream as it can in a fixed time. Because `f` is linear in the state and the cost is terminal and linear, `F_yy`, `F_yu` and every `d2J` block vanish identically: removing `F_uu_action` does not perturb the Hessian, it zeroes it. Pontryagin gives `tan θ*(t) = (V/h)(T − t)`, Zermelo's navigation formula `θ̇ = −(V/h)cos²θ`, and the trajectory in elementary functions. The costate never consults the state, so that closed-form heading is stationary for the **discrete** problem too, on any mesh, to rounding — but only for tableaux satisfying Butcher's `D(1)`, `Σⱼbⱼaⱼᵢ = bᵢ(1−cᵢ)`. Four shipped tableaux satisfy it and four do not, and the example predicts which from the tableau alone. That binds the discrete adjoint's stage weights, which a duality test cannot separate from the tangent's. Needs the `examples` extra. |
 
 ## Development
 
