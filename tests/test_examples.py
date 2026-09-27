@@ -781,8 +781,23 @@ def _reference_solution(optimizer, u, n_steps):
 DERIVATION_BUDGET = 8 * np.finfo(float).eps
 
 
-def _agrees_by_derivation(generated: np.ndarray, hand: np.ndarray, name: str) -> None:
-    """Compare a generated derivative with a hand-written one, entry by kind."""
+def _agrees_by_derivation(
+    generated: np.ndarray,
+    hand: np.ndarray,
+    name: str,
+    scale: np.ndarray | None = None,
+) -> None:
+    """Compare a generated derivative with a hand-written one, entry by kind.
+
+    ``scale`` is the magnitude that sets each entry's rounding. It defaults to
+    ``|hand|``, which is right for a product or quotient: reassociating one
+    changes the result by a few units in its own last place. It is wrong for a
+    sum that cancels, where the roundings are of the *terms* and survive into a
+    smaller result. ``f`` for the pendulum is such a sum -- at one sampled
+    point the terms are 3.7 in magnitude and total 0.113, a condition number of
+    33 -- so those callers pass the sum of the term magnitudes instead. The
+    observed deviations are then within ``2 * eps`` of it.
+    """
     generated = np.asarray(generated, dtype=float)
     assert generated.shape == hand.shape, (
         f"{name}: generated shape {generated.shape}, hand-derived {hand.shape}"
@@ -797,7 +812,8 @@ def _agrees_by_derivation(generated: np.ndarray, hand: np.ndarray, name: str) ->
     computed = ~structural
     if not computed.any():
         return
-    deviation = np.abs(generated[computed] - hand[computed]) / np.abs(hand[computed])
+    denominator = np.abs(hand if scale is None else np.asarray(scale, dtype=float))
+    deviation = np.abs(generated[computed] - hand[computed]) / denominator[computed]
     assert np.max(deviation) <= DERIVATION_BUDGET, (
         f"{name}: generated and hand-derived entries differ by "
         f"{np.max(deviation):.3e} relative, over the "
@@ -1120,7 +1136,7 @@ def test_each_example_documents_an_invocation_that_resolves():
             assert (directory.parent / target).is_file(), command
             assert target == f"examples/{path.name}"
         checked += 1
-    assert checked == 5, f"expected five runnable examples, found {checked}"
+    assert checked == 6, f"expected six runnable examples, found {checked}"
 
 
 @requires_sympy
@@ -1517,3 +1533,424 @@ def test_double_integrator_main_runs(capsys):
     out = capsys.readouterr().out
     assert "The discrete optimum *is* the continuous one" in out
     assert "order" in out
+
+
+# ---------------------------------------------------------------------------
+# examples/pendulum_swing_up.py
+#
+# The first example here whose *nonlinear* dynamics have a closed-form
+# solution, so it reaches the second tier of the C-14.1 oracle hierarchy where
+# nonlinear_implicit_control.py reaches only the first. Two oracles of
+# different kinds need separate checks: a pointwise closed form, and a first
+# integral that constrains every point of every undriven trajectory.
+#
+# Both describe the undriven, undamped pendulum. The controlled problem
+# carries drag and torque and conserves nothing; its derivatives are checked
+# against the independent discrete reference, as everywhere else.
+# ---------------------------------------------------------------------------
+
+
+#: Half-width of the central difference used to check the closed form against
+#: the ODE it solves. The truncation error of a central difference is
+#: ``(dt^2 / 6) |y'''|``, and ``|theta'''| <= w0^2 * max|omega| ~ 3.7`` here,
+#: so this spacing is good for about ``6e-9``. Rounding contributes about
+#: ``eps * |y| / dt ~ 2e-12``, far below it. The budget below leaves more
+#: than a decade over the truncation term.
+_ODE_STEP = 1e-4
+_ODE_BUDGET = 1e-7
+
+
+@requires_sympy
+def test_the_libration_closed_form_solves_the_pendulum_equation():
+    """The oracle is checked before anything is checked against it.
+
+    ``libration`` is asserted to be the exact undriven motion, and every
+    other closed-form test in this section trusts it. Its defining property
+    is that it satisfies ``theta' = omega`` and ``omega' = -w0^2 sin theta``,
+    which is verified here by differencing the closed form itself -- no
+    adjungo code takes part, so a stepping bug cannot make this pass.
+
+    Sampled away from the turning points, where ``omega`` passes through zero
+    and a relative comparison would divide by it.
+    """
+    from examples.pendulum_swing_up import (
+        NATURAL_FREQUENCY,
+        libration,
+        libration_period,
+    )
+
+    period = libration_period()
+    t = np.linspace(0.05 * period, 0.95 * period, 41)
+
+    theta, omega = libration(t)
+    theta_plus, omega_plus = libration(t + _ODE_STEP)
+    theta_minus, omega_minus = libration(t - _ODE_STEP)
+
+    d_theta = (theta_plus - theta_minus) / (2.0 * _ODE_STEP)
+    d_omega = (omega_plus - omega_minus) / (2.0 * _ODE_STEP)
+
+    assert np.max(np.abs(d_theta - omega)) < _ODE_BUDGET
+    assert np.max(
+        np.abs(d_omega + NATURAL_FREQUENCY**2 * np.sin(theta))
+    ) < _ODE_BUDGET
+
+    # The residual must be truncation, not luck: halving the step must cut it
+    # by about four. A closed form that solved a *different* equation would
+    # leave an O(1) residual that refinement does not touch.
+    coarse = np.max(np.abs(d_theta - omega))
+    theta_p2, _ = libration(t + 2 * _ODE_STEP)
+    theta_m2, _ = libration(t - 2 * _ODE_STEP)
+    doubled = np.max(np.abs((theta_p2 - theta_m2) / (4.0 * _ODE_STEP) - omega))
+    assert 3.5 < doubled / coarse < 4.5, (
+        f"residual scaled by {doubled / coarse:.2f} when the step doubled, "
+        f"not the 4 that identifies it as central-difference truncation"
+    )
+
+
+@requires_sympy
+def test_the_libration_is_released_from_rest_and_returns():
+    """Boundary values that follow from ``sn(K) = 1``, ``cn(K) = 0``.
+
+    These are exact identities of the elliptic functions, not approximations,
+    so ``theta`` is compared bit for bit. ``omega`` is a product that rounds,
+    and carries a few-ULP budget instead.
+    """
+    from examples.pendulum_swing_up import (
+        VALIDATION_AMPLITUDE,
+        libration,
+        libration_period,
+    )
+
+    period = libration_period()
+    theta_0, omega_0 = libration(0.0)
+    theta_half, omega_half = libration(period / 2.0)
+
+    assert theta_0 == VALIDATION_AMPLITUDE
+    assert theta_half == -VALIDATION_AMPLITUDE
+    # Released from rest, and at rest again at the opposite turning point.
+    assert abs(omega_0) < 8 * np.finfo(float).eps
+    assert abs(omega_half) < 8 * np.finfo(float).eps
+
+
+@requires_sympy
+def test_the_libration_conserves_the_first_integral_it_claims_to():
+    """``E`` is constant along the closed form, and equals ``2 w0^2 k^2``.
+
+    The second claim is the sharper one: it is the identity
+    ``sn^2 + cn^2 = 1`` in disguise, so agreement is a statement about the
+    elliptic functions rather than about the pendulum. Both hold to rounding,
+    which is why the budget is a small multiple of eps and not a discretisation
+    tolerance -- nothing here is discretised.
+    """
+    from examples.pendulum_swing_up import (
+        NATURAL_FREQUENCY,
+        VALIDATION_AMPLITUDE,
+        energy,
+        libration,
+        libration_period,
+    )
+
+    t = np.linspace(0.0, 2.0 * libration_period(), 501)
+    theta, omega = libration(t)
+    values = 0.5 * omega**2 + NATURAL_FREQUENCY**2 * (1.0 - np.cos(theta))
+
+    closed_form = (
+        2.0 * NATURAL_FREQUENCY**2 * np.sin(VALIDATION_AMPLITUDE / 2.0) ** 2
+    )
+    assert np.max(np.abs(values - closed_form)) < 16 * np.finfo(float).eps
+    # The module's own helper agrees with the expression spelled out above.
+    assert energy(np.array([VALIDATION_AMPLITUDE, 0.0])) == pytest.approx(
+        closed_form, abs=8 * np.finfo(float).eps
+    )
+
+
+@requires_sympy
+def test_the_libration_period_is_not_the_small_angle_period():
+    """What makes this a nonlinear check rather than a linear one.
+
+    At the validation amplitude the true period exceeds ``2 pi / w0`` by a
+    third. A solve that quietly linearised ``sin theta`` would drift out of
+    phase by far more than its discretisation error, so the order study below
+    could not pass on a linearised field.
+
+    The small-amplitude limit pins the formula independently: the classical
+    expansion is ``T / T_0 = 1 + theta_0^2 / 16 + O(theta_0^4)``, and at
+    ``1e-3`` and ``1e-4`` rad the computed ratio reproduces that leading
+    correction to the digits the next term leaves free.
+    """
+    from examples.pendulum_swing_up import (
+        NATURAL_FREQUENCY,
+        libration_period,
+    )
+
+    small_angle = 2.0 * np.pi / NATURAL_FREQUENCY
+    assert libration_period() / small_angle > 1.3
+
+    for amplitude in (1e-3, 1e-4):
+        predicted = 1.0 + amplitude**2 / 16.0
+        ratio = libration_period(amplitude) / small_angle
+        # The neglected term is O(theta_0^4); compare against it, not against
+        # a fixed tolerance that would pass for any formula at 1e-4 rad.
+        assert abs(ratio - predicted) < amplitude**4
+
+
+@requires_sympy
+def test_libration_refuses_an_amplitude_off_the_librating_branch():
+    """C-7: outside ``(0, pi)`` there is no libration to return.
+
+    At ``pi`` the modulus reaches one, ``K`` diverges and the motion is the
+    separatrix; beyond it the pendulum rotates and never turns. Returning the
+    elliptic expression anyway would hand back a number for a motion it does
+    not describe.
+    """
+    from examples.pendulum_swing_up import libration
+
+    for amplitude in (0.0, -1.0, np.pi, np.pi + 0.1, 10.0):
+        with pytest.raises(ValueError, match="librating"):
+            libration(0.0, amplitude=amplitude)
+
+
+@requires_sympy
+def test_the_undriven_solve_attains_fourth_order_against_the_closed_form():
+    """C-4 on a nonlinear field, against a closed form rather than a reference.
+
+    This is the claim the example exists to support. ``rk4`` is order four, and
+    the observed rates are 4.11 and 4.08; the floor below allows for the
+    ``O(h^5)`` terms still visible at these meshes without admitting order
+    three.
+
+    The comparison is over the whole arc, not at the endpoint. Half a period
+    ends at a turning point where ``d theta / dt = 0``, and sampling there
+    corrupts the measurement in either direction: ``theta`` alone becomes
+    superconvergent (4.92, 4.98, 5.00, because a phase error reaches it only
+    at second order), while ``max(theta, omega)`` becomes erratic (4.89, 3.49,
+    3.80). The whole arc gives 4.11, 4.08, 4.04.
+
+    Both bounds are therefore asserted. A rate below four would mean the
+    method is not achieving its order; a rate near five would mean this is no
+    longer measuring the method's order at all, but the extra accuracy of a
+    degenerate sampling point. Only the second catches the endpoint variant,
+    which otherwise passes a one-sided test by looking *better* than order
+    four.
+    """
+    from examples.pendulum_swing_up import _libration_error
+
+    errors = [_libration_error(n) for n in (10, 20, 40)]
+    assert errors[0] < 1e-3, (
+        f"coarse mesh is not yet in the asymptotic regime: {errors[0]:.3e}"
+    )
+    for coarse, fine in itertools.pairwise(errors):
+        rate = np.log2(coarse / fine)
+        assert 3.7 < rate < 4.6, (
+            f"observed order {rate:.3f}; fourth order with the O(h^5) terms "
+            f"still visible at these meshes lies between the bounds, and a "
+            f"rate above them means the error is being sampled somewhere "
+            f"degenerate rather than over the whole arc"
+        )
+
+
+@requires_sympy
+def test_gauss2_holds_the_energy_error_bounded_where_rk4_drifts():
+    """The first integral as an oracle, and the two methods it separates.
+
+    Gauss--Legendre collocation is symplectic, so its energy error oscillates
+    within a bound set by the step size however long the integration runs;
+    ``rk4`` is not, and its error grows with elapsed time. Both are measured
+    the same way -- the largest ``|E(t) - E(0)|`` the run ever attains -- so
+    the contrast cannot come from the choice of statistic.
+
+    Thirty-two-fold more integration time multiplies that error by about 27
+    for ``rk4`` and by 1.003 for ``gauss2``. The thresholds are set well
+    inside that gap rather than at the observed values, which are not a
+    contract.
+    """
+    from examples.pendulum_swing_up import _energy_contrast
+
+    growth = {label: ratio for label, ratio, _ in _energy_contrast()}
+
+    assert growth["rk4"] > 10.0, (
+        f"rk4 energy error grew by only {growth['rk4']:.2f}x over 32x the "
+        f"integration time; the drift this example exhibits is gone"
+    )
+    assert growth["gauss2"] < 1.5, (
+        f"gauss2 energy error grew by {growth['gauss2']:.2f}x; a symplectic "
+        f"method must hold it bounded"
+    )
+
+
+@requires_sympy
+def test_pendulum_symbolic_derivatives_match_hand_derivation():
+    """All five generated callbacks against derivatives taken by hand.
+
+    ``f`` is two lines, so the hand forms are genuinely independent rather
+    than a transcription. ``F_yy`` is the entry that matters: it is the only
+    nonvanishing second derivative, it is exactly the term a linearised
+    pendulum would drop, and it is what the HVP test below exercises.
+    """
+    from examples.pendulum_swing_up import DRAG, NATURAL_FREQUENCY, pendulum_dynamics
+
+    dynamics = pendulum_dynamics(DRAG)
+    assert dynamics.state_dim == 2
+    assert dynamics.control_dim == 1
+
+    rng = np.random.default_rng(29)
+    for _ in range(5):
+        theta, omega = rng.uniform(-np.pi, np.pi), rng.uniform(-3.0, 3.0)
+        y = np.array([theta, omega])
+        u = np.array([rng.uniform(-2.0, 2.0)])
+        v = rng.standard_normal(2)
+        w0 = NATURAL_FREQUENCY
+
+        f_hand = np.array([omega, -(w0**2) * np.sin(theta) - DRAG * omega + u[0]])
+        F_hand = np.array([[0.0, 1.0], [-(w0**2) * np.cos(theta), -DRAG]])
+        G_hand = np.array([[0.0], [1.0]])
+
+        # f[1] is a sum of three terms that can cancel, so its rounding is set
+        # by their magnitudes rather than by the result. f[0] = omega is exact.
+        f_scale = np.array(
+            [
+                abs(omega),
+                (w0**2) * abs(np.sin(theta)) + DRAG * abs(omega) + abs(u[0]),
+            ]
+        )
+
+        # Only -v1 w0^2 sin(theta) survives two derivatives, and only in theta.
+        F_yy_hand = np.array([[v[1] * w0**2 * np.sin(theta), 0.0], [0.0, 0.0]])
+        # f is affine in u with constant coefficients, so these vanish.
+        F_yu_hand = np.zeros((2, 1))
+        F_uu_hand = np.zeros((1, 1))
+
+        _agrees_by_derivation(dynamics.f(y, u, 0.0), f_hand, "f", scale=f_scale)
+        _agrees_by_derivation(dynamics.F(y, u, 0.0), F_hand, "F")
+        _agrees_by_derivation(dynamics.G(y, u, 0.0), G_hand, "G")
+        _agrees_by_derivation(dynamics.F_yy_action(y, u, 0.0, v), F_yy_hand, "F_yy")
+        _agrees_by_derivation(dynamics.F_yu_action(y, u, 0.0, v), F_yu_hand, "F_yu")
+        _agrees_by_derivation(dynamics.F_uu_action(y, u, 0.0, v), F_uu_hand, "F_uu")
+
+
+@requires_sympy
+def test_the_pendulum_jacobian_actually_depends_on_the_state():
+    """Without this, the reuse gate below would be vacuous.
+
+    ``F`` carries ``-w0^2 cos theta``, so no factorisation may be reused
+    across stages, steps or calls (C-15.1). A problem whose Jacobian happened
+    to be constant would let a reuse bug through the derivative tests
+    unnoticed, so the dependence is asserted rather than assumed.
+    """
+    from examples.pendulum_swing_up import DRAG, pendulum_dynamics
+
+    dynamics = pendulum_dynamics(DRAG)
+    u, t = np.array([0.3]), 0.0
+    at_zero = dynamics.F(np.array([0.0, 0.0]), u, t)
+    at_one = dynamics.F(np.array([1.0, 0.0]), u, t)
+
+    assert not np.allclose(at_zero, at_one), (
+        "the Jacobian does not vary with theta; this example no longer "
+        "exercises the state-dependent path it was written for"
+    )
+    # Varying omega alone must not move it: the drag term is linear.
+    assert np.array_equal(at_zero, dynamics.F(np.array([0.0, 2.0]), u, t))
+
+
+@requires_sympy
+def test_pendulum_gradient_matches_the_independent_reference():
+    """C-2 on the controlled problem, against the strongest oracle (C-14.1.1).
+
+    ``reference_gradient`` rebuilds the discrete problem from the monolithic
+    residual and shares no code with ``adjungo/stepping/``. The budget is the
+    ``1e-11`` relative used by the other examples; the observed disagreement
+    here is about ``6e-16``.
+    """
+    from examples.pendulum_swing_up import T_FINAL, build_optimizer
+    from examples.pendulum_swing_up import Y0 as PENDULUM_Y0
+
+    n_steps = 6
+    optimizer = build_optimizer(n_steps=n_steps)
+    method = optimizer.method
+    u = 0.5 * np.random.default_rng(5).standard_normal((n_steps, method.s, 1))
+
+    grad_ref = reference_gradient(
+        PENDULUM_Y0, u, (0.0, T_FINAL), n_steps,
+        optimizer.problem, method, optimizer.objective,
+    )
+    assert np.max(np.abs(grad_ref)) > 1e-3, "degenerate case"
+
+    err = np.max(np.abs(optimizer.gradient(u) - grad_ref)) / max(
+        float(np.max(np.abs(grad_ref))), 1.0
+    )
+    assert err < 1e-11, f"pendulum gradient off by {err:.3e}"
+
+
+@requires_sympy
+def test_pendulum_hvp_matches_the_independent_reference():
+    """The exact Hessian where ``F_yy`` does not vanish.
+
+    ``-w0^2 sin theta`` has a nonzero second derivative, so a dropped
+    ``F_yy_action`` term changes this comparison. The affine examples cannot
+    detect that; this one can, and the Van der Pol example is the only other
+    that does.
+    """
+    from examples.pendulum_swing_up import T_FINAL, build_optimizer
+    from examples.pendulum_swing_up import Y0 as PENDULUM_Y0
+
+    n_steps = 5
+    optimizer = build_optimizer(n_steps=n_steps)
+    method = optimizer.method
+    u = 0.5 * np.random.default_rng(13).standard_normal((n_steps, method.s, 1))
+
+    H_ref = reference_hessian(
+        PENDULUM_Y0, u, (0.0, T_FINAL), n_steps,
+        optimizer.problem, method, optimizer.objective,
+    ).reshape(u.size, u.size)
+
+    hessp = optimizer.scipy_hessp()
+    H_pkg = np.column_stack(
+        [hessp(u.ravel(), e) for e in np.eye(u.size)]
+    )
+
+    scale = max(float(np.max(np.abs(H_ref))), 1.0)
+    assert float(np.max(np.abs(H_pkg - H_ref))) / scale < 1e-11
+    # Symmetry is necessary, never sufficient (C-14.1.5), but an asymmetric
+    # result would mean the two contraction orders disagree.
+    assert np.max(np.abs(H_pkg - H_pkg.T)) / scale < 1e-11
+
+
+@requires_sympy
+def test_the_swing_up_reaches_the_inverted_state():
+    """The example must solve the problem it advertises.
+
+    No closed form is claimed for the optimum and none is asserted. What is
+    asserted is that the solve converges, beats doing nothing by a wide
+    margin, and arrives near enough to ``theta = pi`` that the pendulum has
+    genuinely been brought up rather than left swinging.
+    """
+    from examples.pendulum_swing_up import TARGET, solve
+
+    optimizer, result, control = solve(n_steps=20)
+
+    assert result.success, result.message
+    do_nothing = optimizer.objective_value(np.zeros_like(control))
+    assert result.fun < 0.01 * do_nothing, (
+        f"objective {result.fun:.4f} barely improved on {do_nothing:.4f}"
+    )
+
+    final = optimizer.trajectory(control).Y[-1][0]
+    assert abs(final[0] - TARGET[0]) < 0.05, f"theta(T) = {final[0]:.4f}, not near pi"
+    assert abs(final[1] - TARGET[1]) < 0.10, f"omega(T) = {final[1]:.4f}, not near rest"
+
+    # It is a swing-up, not a lift: the torque available cannot hold the
+    # pendulum against gravity at the midpoint of a direct push, so the
+    # trajectory must pass through angles beyond the target on the way.
+    assert np.max(np.abs(control)) < 5.0, "unbounded-looking torque"
+
+
+@requires_sympy
+def test_pendulum_main_runs(capsys):
+    """``.venv/bin/python -m examples.pendulum_swing_up`` must work."""
+    from examples.pendulum_swing_up import main
+
+    main()
+    out = capsys.readouterr().out
+    assert "exact period" in out
+    assert "rate" in out
+    assert "theta(T)" in out

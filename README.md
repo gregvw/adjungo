@@ -322,7 +322,7 @@ The library is organized into several modules:
 
 ## Examples
 
-All five are executed by the test suite, and each is checked against the
+All six are executed by the test suite, and each is checked against the
 independently assembled reference rather than merely run.
 
 | Example | What it demonstrates |
@@ -332,6 +332,7 @@ independently assembled reference rather than merely run.
 | [`factorization_reuse_counts.py`](examples/factorization_reuse_counts.py) | Declaration-gated factorisation reuse, counted rather than timed. One factorisation for the whole solve when `jacobian_constant=True` is declared, against one per stage per Newton iteration per step when it is not — with an identical gradient either way. |
 | [`rocket_ascent.py`](examples/rocket_ascent.py) | Derivative callbacks differentiated by sympy rather than written out, via [`examples/symbolic.py`](examples/symbolic.py), and checked against hand-derived ones. A Tsiolkovsky rocket ascent with a closed-form solution under constant burn, an objective that carries the C-9.3 stage quadrature itself, and second derivatives of `f` that do not vanish. Needs the `examples` extra: `pip install -e '.[dev,examples]'`. |
 | [`double_integrator.py`](examples/double_integrator.py) | The only example that knows its own answer. A linear-quadratic tracking problem checked against two references: a backward Riccati recursion on an independently assembled step map, and the closed-form solution of the continuous optimality conditions. For the undamped problem these coincide *exactly* — `u*` is linear in `t` and rk4's weights are Simpson's rule — so adding linear drag makes the costate exponential and recovers a fourth-order mesh study of the **optimum**, not of a solve. |
+| [`pendulum_swing_up.py`](examples/pendulum_swing_up.py) | The only example whose *nonlinear* dynamics have a closed-form solution. A torque-driven pendulum, swung from hanging to inverted under `gauss2`. Undriven and undamped it librates exactly as a Jacobi elliptic function, with a period a third longer than the small-angle `2π/ω₀`, so the fourth-order mesh study could not pass on a linearised `sin θ`. It also conserves `E = ½ω² + ω₀²(1 − cos θ)`, a first integral that constrains every point rather than one endpoint — and separates the methods: over 32× the integration time `rk4` lets the energy error grow 27-fold where symplectic `gauss2` holds it to 1.003. The swing-up optimum itself has no closed form, and none is claimed. Needs the `examples` extra. |
 
 ## Development
 
