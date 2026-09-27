@@ -66,8 +66,13 @@ It also distinguishes the methods, and the example measures that rather than
 asserting it. ``rk4`` does not conserve ``E``; its error grows in proportion
 to the elapsed time. ``gauss2`` is Gauss--Legendre collocation and therefore
 symplectic (Hairer, Lubich & Wanner, *Geometric Numerical Integration*,
-Thm. VI.4.2), so its energy error stays bounded however long the integration
-runs. Measured the same way for both -- the largest energy error the run ever
+Thm. VI.4.2). Backward error analysis (ibid., Ch. IX) then gives *near*
+conservation: the method solves a nearby modified Hamiltonian almost exactly,
+so the energy error stays within an ``O(h^p)`` band over intervals
+exponentially long in ``1/h``, given a small enough step and a trajectory
+confined to a compact region. That is a strong finite-time statement, not an
+unconditional one, and the example claims only what it measures: with the same
+statistic applied to both methods -- the largest energy error the run ever
 attains -- a thirty-two-fold increase in the integration time multiplies that
 error by about 27 for ``rk4`` and by 1.003 for ``gauss2``.
 
@@ -158,14 +163,30 @@ def libration(t: NDArray | float, amplitude: float = VALIDATION_AMPLITUDE):
     to ``ω(t) = -2 ω₀ k cn(K - ω₀t, m)``, with no square root left to cancel.
 
     At ``t = 0`` this gives ``sn(K) = 1`` and ``cn(K) = 0``, so ``θ = amplitude``
-    and ``ω = 0`` as required. Valid for ``|amplitude| < π``; at ``π`` the
-    modulus reaches one, the period diverges and the motion is the separatrix.
+    and ``ω = 0`` as required.
+
+    The domain is ``(0, π)``. At ``π`` the modulus reaches one, ``K`` diverges
+    and the motion is the separatrix, so there is genuinely nothing to return.
+    The other two exclusions are narrower than that. Beyond ``π`` the pendulum
+    released from rest still *librates* -- its energy ``ω₀²(1 - cos θ₀)`` is
+    below the separatrix value ``2ω₀²`` for every ``θ₀`` outside a neighbourhood
+    of ``π`` -- but about ``2π`` rather than about zero, and this formula cannot
+    say so: ``k = sin(θ₀/2)`` and ``2 arcsin k`` do not invert each other there,
+    so asking for ``π + 0.1`` would silently return the motion of amplitude
+    ``π - 0.1``. Negative amplitudes the formula does handle, by mirror
+    symmetry; they are excluded to keep one convention for the amplitude rather
+    than because the motion is undefined. Returning an aliased trajectory would
+    be the sentinel C-7 forbids, so all three are refused.
     """
     if not 0.0 < amplitude < np.pi:
         raise ValueError(
-            f"amplitude must lie in (0, pi) for a librating solution, got "
-            f"{amplitude}. At pi the pendulum is on the separatrix and the "
-            f"period is infinite."
+            f"amplitude must lie in (0, pi), got {amplitude}. At pi the "
+            f"pendulum is on the separatrix and the period is infinite. "
+            f"Beyond pi it still librates, but about 2*pi, and k = "
+            f"sin(amplitude/2) no longer identifies that motion -- this "
+            f"formula would return the amplitude reflected back into (0, pi). "
+            f"Negative amplitudes are the mirror image of positive ones and "
+            f"are excluded by convention, not by the physics."
         )
     k = np.sin(amplitude / 2.0)
     m = k * k

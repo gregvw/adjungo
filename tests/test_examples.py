@@ -1611,11 +1611,17 @@ def test_the_libration_closed_form_solves_the_pendulum_equation():
 def test_the_libration_is_released_from_rest_and_returns():
     """Boundary values that follow from ``sn(K) = 1``, ``cn(K) = 0``.
 
-    These are exact identities of the elliptic functions, not approximations,
-    so ``theta`` is compared bit for bit. ``omega`` is a product that rounds,
-    and carries a few-ULP budget instead.
+    Those are exact identities of the elliptic functions, but their
+    floating-point evaluation is not exact, and C-11.3 forbids pinning it.
+    ``theta`` comes back through ``2 arcsin(k sn)`` with ``k = sin(a/2)``, a
+    round trip whose agreement with ``a`` depends on the platform's libm: on
+    this machine it is exact at 0.5, 1.0, 2.0 and 2.5 rad and off by one ULP
+    at 3.0, all within the helper's own domain. A few ULP is the honest
+    budget. ``omega`` vanishes rather than returning a value, so it carries an
+    absolute budget scaled by the natural frequency instead.
     """
     from examples.pendulum_swing_up import (
+        NATURAL_FREQUENCY,
         VALIDATION_AMPLITUDE,
         libration,
         libration_period,
@@ -1625,11 +1631,15 @@ def test_the_libration_is_released_from_rest_and_returns():
     theta_0, omega_0 = libration(0.0)
     theta_half, omega_half = libration(period / 2.0)
 
-    assert theta_0 == VALIDATION_AMPLITUDE
-    assert theta_half == -VALIDATION_AMPLITUDE
+    ulp = np.spacing(VALIDATION_AMPLITUDE)
+    assert abs(theta_0 - VALIDATION_AMPLITUDE) <= 4 * ulp
+    assert abs(theta_half + VALIDATION_AMPLITUDE) <= 4 * ulp
+
     # Released from rest, and at rest again at the opposite turning point.
-    assert abs(omega_0) < 8 * np.finfo(float).eps
-    assert abs(omega_half) < 8 * np.finfo(float).eps
+    # The scale is the peak speed 2*w0*k, which these are a rounding of.
+    speed = 2.0 * NATURAL_FREQUENCY * np.sin(VALIDATION_AMPLITUDE / 2.0)
+    assert abs(omega_0) <= 8 * np.finfo(float).eps * speed
+    assert abs(omega_half) <= 8 * np.finfo(float).eps * speed
 
 
 @requires_sympy
@@ -1674,9 +1684,16 @@ def test_the_libration_period_is_not_the_small_angle_period():
     could not pass on a linearised field.
 
     The small-amplitude limit pins the formula independently: the classical
-    expansion is ``T / T_0 = 1 + theta_0^2 / 16 + O(theta_0^4)``, and at
-    ``1e-3`` and ``1e-4`` rad the computed ratio reproduces that leading
-    correction to the digits the next term leaves free.
+    expansion is ``T / T_0 = 1 + theta_0^2 / 16 + 11 theta_0^4 / 3072 + ...``,
+    and at ``1e-3`` and ``1e-4`` rad the computed ratio reproduces that leading
+    correction.
+
+    The budget carries both of its terms. ``theta_0^4`` covers the neglected
+    expansion term, which it exceeds by a factor of 280. Alone it would be
+    ``1e-16`` at ``1e-4`` rad -- below one ULP of the ratio, 2.22e-16 -- and
+    would then be pinning an association rather than a correction: computing
+    the same ratio as ``2 K(m) / pi`` moves it one ULP and fails. C-11.3
+    forbids that, so a rounding floor is added.
     """
     from examples.pendulum_swing_up import (
         NATURAL_FREQUENCY,
@@ -1689,24 +1706,36 @@ def test_the_libration_period_is_not_the_small_angle_period():
     for amplitude in (1e-3, 1e-4):
         predicted = 1.0 + amplitude**2 / 16.0
         ratio = libration_period(amplitude) / small_angle
-        # The neglected term is O(theta_0^4); compare against it, not against
-        # a fixed tolerance that would pass for any formula at 1e-4 rad.
-        assert abs(ratio - predicted) < amplitude**4
+        budget = amplitude**4 + 8 * np.finfo(float).eps
+        assert abs(ratio - predicted) < budget, (
+            f"at {amplitude:.0e} rad the ratio deviates from the expansion by "
+            f"{abs(ratio - predicted):.3e}, over the {budget:.3e} budget"
+        )
 
 
 @requires_sympy
 def test_libration_refuses_an_amplitude_off_the_librating_branch():
-    """C-7: outside ``(0, pi)`` there is no libration to return.
+    """C-7: outside ``(0, pi)`` this formula has no motion to describe.
 
-    At ``pi`` the modulus reaches one, ``K`` diverges and the motion is the
-    separatrix; beyond it the pendulum rotates and never turns. Returning the
-    elliptic expression anyway would hand back a number for a motion it does
-    not describe.
+    Only ``pi`` itself is a physical boundary: the modulus reaches one, ``K``
+    diverges, and the motion is the separatrix. The other two exclusions are
+    narrower, and the docstring here previously got them wrong by saying the
+    pendulum rotates beyond ``pi``. It does not. Released from rest at
+    ``pi + 0.1`` its energy is 3.3716 against a separatrix value of 3.3800, so
+    it librates -- about ``2 pi`` rather than about zero. What fails is the
+    parameterisation: ``k = sin(theta_0/2)`` is not injective there, and
+    ``2 arcsin k`` reflects ``pi + 0.1`` back to ``pi - 0.1``, so the helper
+    would return a real trajectory of the wrong amplitude. Negative amplitudes
+    it would handle correctly by mirror symmetry, and are excluded to keep one
+    convention for the amplitude.
+
+    A silently aliased trajectory is exactly the sentinel C-7 forbids, which
+    is why all three are refused rather than only the separatrix.
     """
     from examples.pendulum_swing_up import libration
 
     for amplitude in (0.0, -1.0, np.pi, np.pi + 0.1, 10.0):
-        with pytest.raises(ValueError, match="librating"):
+        with pytest.raises(ValueError, match=r"\(0, pi\)"):
             libration(0.0, amplitude=amplitude)
 
 
@@ -1753,16 +1782,21 @@ def test_the_undriven_solve_attains_fourth_order_against_the_closed_form():
 def test_gauss2_holds_the_energy_error_bounded_where_rk4_drifts():
     """The first integral as an oracle, and the two methods it separates.
 
-    Gauss--Legendre collocation is symplectic, so its energy error oscillates
-    within a bound set by the step size however long the integration runs;
-    ``rk4`` is not, and its error grows with elapsed time. Both are measured
-    the same way -- the largest ``|E(t) - E(0)|`` the run ever attains -- so
-    the contrast cannot come from the choice of statistic.
+    Gauss--Legendre collocation is symplectic, so backward error analysis
+    applies: it solves a nearby modified Hamiltonian almost exactly, and the
+    energy error stays within an ``O(h^p)`` band over intervals exponentially
+    long in ``1/h``, given a small enough step and a trajectory in a compact
+    region (Hairer, Lubich & Wanner, *Geometric Numerical Integration*,
+    Ch. IX). That is a finite-time statement under hypotheses, not a promise
+    that the error is bounded forever, and this test asserts only the 32-period
+    observation it actually makes. ``rk4`` is not symplectic and its error
+    grows with elapsed time.
 
+    Both are measured the same way -- the largest ``|E(t) - E(0)|`` the run
+    ever attains -- so the contrast cannot come from the choice of statistic.
     Thirty-two-fold more integration time multiplies that error by about 27
-    for ``rk4`` and by 1.003 for ``gauss2``. The thresholds are set well
-    inside that gap rather than at the observed values, which are not a
-    contract.
+    for ``rk4`` and by 1.003 for ``gauss2``. The thresholds sit well inside
+    that gap rather than at the observed values, which are not a contract.
     """
     from examples.pendulum_swing_up import _energy_contrast
 
