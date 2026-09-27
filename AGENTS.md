@@ -66,6 +66,18 @@ second, so the interpreter will silently execute the previous bytecode. This has
 already produced a false result in this repository; see NUMERICS.md R-11 for the
 mechanism and for why the quiet failure direction is the dangerous one.
 
+Restore the source **in a `finally`**, and confirm it with `git status` before
+you trust any later measurement. Many of the probe scripts left around from
+earlier sessions are one-way injectors: they mutate a source file and print a
+line describing the defect, with no restore step. The printed line is a label,
+not a report of what was done. One of them — `p_base.py`, which adds a
+`.base` descent to `adjungo/core/affine.py` and prints
+`injected: .base descent restored` — was rerun during an unrelated diagnosis
+and left installed for the better part of an hour, during which ten failures in
+`tests/test_coefficient_immutability.py` were attributed to someone else's
+work. Never run a script you have not read against the working tree, and treat
+an unexplained modification as yours until the timestamps say otherwise.
+
 `pytest` collection is configured in `pyproject.toml` under
 `[tool.pytest.ini_options]` with `testpaths = ["tests"]`. Bare `pytest` and
 `pytest tests/` must report identical counts.

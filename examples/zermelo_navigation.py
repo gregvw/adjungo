@@ -83,6 +83,11 @@ trajectory in elementary functions; see :func:`optimal_position`.
 A sharper oracle than usual
 ---------------------------
 
+What this section derives at this problem's parameters is the general anchor
+recorded as ``NUMERICS.md`` C-14.4, whose unit-level witness is
+``tests/test_adjoint_stage_times.py``. The version here is an instance, kept
+because the navigation problem is where the consequence is visible.
+
 Because the costate above never consults the state, **no discretisation error
 can reach it**. Working the discrete adjoint out by hand: with ``M = ∂f/∂y``
 constant and ``Mᵀv = (0, (V/h)v_x)``, the ``x``-component of every adjoint

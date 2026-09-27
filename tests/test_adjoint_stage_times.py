@@ -1,5 +1,10 @@
 """The stage adjoint carries the costate at Hager's transformed abscissa.
 
+The contract clause this implements is NUMERICS.md C-14.4, a tier-2 anchor
+under C-14.1; C-13 item 10 records it as a property a C++ port must preserve.
+What follows is the derivation and the fixture, not a second statement of the
+clause.
+
 ``examples/zermelo_navigation.py`` observes a consequence of this: for that
 problem the continuous optimal heading is a stationary point of the discrete
 problem exactly when the tableau satisfies ``D(1)``. That is an end-to-end

@@ -831,6 +831,15 @@ Recorded under C-1. A port that changes any of these produces different numbers:
    grows. Recorded because the cost argument is not visible from the code, which
    simply performs the cheap version.
 
+10. **The stage time the adjoint carries** — [C-14.4](#c-14). The weighted
+    adjoint of item 2 is not a sample of the costate at `c_k`. It is one at
+    Hager's `c̄_k = 1 − (Σ_j b_j a_jk)/b_k`, and the two coincide only under
+    Butcher's `D(1)`. A port that keeps item 2's indexing keeps this
+    automatically, so nothing new has to be implemented; it is recorded
+    because the property is the sharpest available check *on* that indexing,
+    and a port that reinvents the recursion should reproduce the anchor rather
+    than trust a duality test.
+
 ### What a port must *not* preserve
 
 The list above is semantics: changing any of it changes the numbers. The
@@ -1087,6 +1096,85 @@ it is the narrow one — the acceptance test guarantees that what returns is a
 root of the correct discrete system. It does **not** guarantee it is the same
 root, so degrading the predictor is not purely a question of cost, and this
 clause does not claim that it is.
+
+### C-14.4 Closed-form anchor for adjoint stage times — `DERIVED`
+
+A tier-2 anchor under [C-14.1](#c-14) which settles *where in the step* the
+stage adjoint lives. Recorded here rather than left in a test docstring
+because a port must preserve it; see [C-13](#c-13) item 10.
+
+**Hypotheses.** A one-step Runge-Kutta tableau in GLM form (`r = 1`),
+consistent (`Σ_j b_j = 1`); a state Jacobian `M = ∂f/∂y` that is constant and
+**nilpotent of index two**, `M² = 0`; and a terminal-only linear cost
+`J = wᵀ y(T)`. Nothing is assumed about the control: `f` may be arbitrarily
+nonlinear in `u`.
+
+**Statement.** `exp(−Mᵀ s) = I − Mᵀ s`, so the continuous costate
+
+```
+λ(t) = w + (T − t) Mᵀ w
+```
+
+is affine and consults neither the state nor the control. The discrete adjoint
+reproduces it. Every `μ_j` returned by a stage solve lies in the range of `Mᵀ`,
+so `Mᵀ μ_j = 0` and the stage equation collapses to `μ_i = h b_i Mᵀ λ^{n+1}`.
+Substituting into the weighted adjoint of [C-13](#c-13) item 2,
+
+```
+λ^n        = λ(t_n)                                          (from Σ_j b_j = 1)
+Λ^n_k      = b_k λ^{n+1} + h (Σ_j b_j a_jk) Mᵀ λ^{n+1}
+           = b_k λ(t_n + c̄_k h)
+∇_{u^n_k}J = h b_k G(u^n_k)ᵀ λ(t_n + c̄_k h)
+```
+
+with `c̄_k = 1 − (Σ_j b_j a_jk) / b_k`, Hager's transformed abscissa
+(W. W. Hager, *Numer. Math.* **87** (2000) 247–282, equations (33) and (52)).
+`D(1)` — Butcher's `Σ_j b_j a_jk = b_k (1 − c_k)` — is exactly `c̄ = c`.
+
+**Why it is worth an anchor.** A stage *time* is not an asymptotic quantity, so
+this holds at `N = 1` as tightly as at `N = 21` and no mesh study can confuse a
+misplaced adjoint stage with truncation error. Four of the eight shipped
+tableaux violate `D(1)`, so the `c`-sampled reference is a live negative
+control rather than a restatement. A duality test cannot establish any of it:
+per [C-14.1](#c-14) item 4 it passes when the tangent and the adjoint share a
+mistake.
+
+**Three qualifications, none of which the anchor may be read past.**
+
+1. The sampling form requires `b_k ≠ 0`. The division-free identity above is
+   the general statement; a helper that computes `c̄` must refuse a vanishing
+   weight rather than substitute a value for it ([C-7](#c-7)).
+2. `D(1)` is a statement about stage *times*, not about adjoint consistency.
+   Explicit Euler violates it and its discrete adjoint is implicit Euler —
+   consistent, and exact for this costate, merely evaluated at `c̄ = 1`. Nor
+   does this clause claim that a general nonlinear stage adjoint is an exact
+   sample of any continuous costate; that is a property of these hypotheses.
+   The *forward* callbacks are still evaluated at `c`, and `c̄` never enters the
+   implementation.
+3. The nilpotency that makes the anchor exact is also a blind spot. `Mᵀ`
+   annihilates the coupling term `A[j,i] μ_j` inside each solver's triangular
+   back-substitution, so transposing that coefficient is invisible under this
+   anchor. Its complementary evidence is the tier-1 monolithic reference of
+   [C-14.1](#c-14) and [C-13](#c-13) item 2.
+
+`OBSERVED` — `tests/test_adjoint_stage_times.py`,
+`test_stage_adjoint_is_the_costate_at_the_transformed_abscissa` and
+`test_gradient_matches_the_closed_form_at_the_transformed_abscissa`, 43 tests.
+Measured over 800 configurations — five `(κ, w)` fixtures of the shear field
+`ẏ₀ = κ y₁ + cos θ`, `ẏ₁ = sin θ` on `t ∈ [0, 1.3]`, all eight shipped
+tableaux, `N ∈ {1, 2, 3, 8, 21}`, four control seeds — the nodal adjoint, both
+stage forms and the gradient agree to at most `5.69` unit roundoffs in the max
+norm, taken relative to the sum of the magnitudes of the terms forming each
+reference. The asserted budget is `32`. Sampling at `c` instead of `c̄` is wrong
+by at least `5.26e-03` on the three fixtures retained in the suite.
+
+Injection campaign per [C-14.2](#c-14) at the 1017-test baseline current when
+it was run: fourteen defects across the adjoint driver, all four stage solvers
+and the gradient assembler, eleven detected. The three undetected are one
+defect class — qualification 3 above — and fail 46, 34 and 27 tests elsewhere
+in the suite for the explicit, SDIRK and DIRK routes. Transposing the driver's
+own weight `Σ_j a_jk μ_j`, which `Mᵀ` does not filter, fails 15 tests in that
+module.
 
 ---
 
