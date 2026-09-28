@@ -537,6 +537,95 @@ because the first version of the population checked it only through accuracy.
 The SDIRK solver's zero test was made exact for uniformity but is not injected,
 because it is unreachable: the SDIRK class requires a nonzero diagonal.
 
+### C-8.4 Partitioned methods — `OPEN`, draft, unimplemented
+
+C-8.1 applies one coefficient array `A` to the whole state, as `A ⊗ I`. A
+**partitioned** method applies a *different* array to each of two complementary
+state blocks. This is not expressible under C-8.2 and is not a matter of adding
+history: carrying more external values generalises the state representation,
+never the component dependence of the coefficients.
+
+Nothing below is certified. C-6.1 is unchanged and `GLMOptimizer` still refuses
+these methods under C-6.2. This clause fixes the conventions a milestone would
+have to implement, so that the mathematics is settled before any code claims it.
+
+**Proposed domain.** The equations below are written for a general two-block
+partition, but the milestone they are drafted for is deliberately narrower: two
+canonical partitions `(q, p)` and **separable** Hamiltonians
+`H(q, p, u, t) = T(p) + V(q, u, t)`, so that `f^q` depends only on `p` and `f^p`
+only on `q`, `u` and `t`. Symplectic
+Euler and Störmer–Verlet first; one Blanes–Moan composition afterward. A
+non-separable Hamiltonian, more than two partitions, or a general additive
+splitting lies outside the proposed domain and requires amending this clause,
+not merely supplying another tableau.
+
+**Step form.** The state splits as `y = (y^q, y^p)` with `f = (f^q, f^p)`. A
+method is a pair of arrays `(A^q, A^p)` over a **common** stage index, common
+weights `b`, and a single abscissa vector `c`:
+
+```
+Z_i^q = y^q_n + h Σ_j A^q_ij f^q(Z_j, u_j, t_n + c_j h)
+Z_i^p = y^p_n + h Σ_j A^p_ij f^p(Z_j, u_j, t_n + c_j h)
+y^q_{n+1} = y^q_n + h Σ_i b_i f^q(Z_i, u_i, t_n + c_i h)
+y^p_{n+1} = y^p_n + h Σ_i b_i f^p(Z_i, u_i, t_n + c_i h)
+```
+
+Each `f` argument is the **whole** stage vector `Z_j = (Z_j^q, Z_j^p)`; only the
+coefficients are partitioned, not the coupling.
+
+**Sampling: an abscissa is not a row sum.** Time and control are sampled at
+`t_n + c_i h` from the single declared `c`. The row sums
+
+```
+σ^q_i = Σ_j A^q_ij        σ^p_i = Σ_j A^p_ij
+```
+
+are a *different* quantity and are **not** required to equal `c_i` or each
+other. Störmer–Verlet as Lobatto IIIA–IIIB has `c = (0, 1)` while
+`σ^q = (0, 1)` and `σ^p = (1/2, 1/2)`; symplectic Euler has `c = (0)` while
+`σ^q = 0`, `σ^p = 1`. Internal consistency (`σ = c`) is an additional property
+some partitioned methods lack, not part of the definition. **A convention
+requiring the partitions to share row sums would exclude both of the methods
+this clause exists to admit.**
+
+`OBSERVED` — the `c = (0, 1)` convention above, with `A^q = [[0,0],[1/2,1/2]]`,
+`A^p = [[1/2,0],[1/2,0]]` and `b = (1/2, 1/2)`, reproduces the direct
+Störmer–Verlet recurrence on `q'' = -(q - x₀(t))` from rest, `q(0) = v(0) = 0`,
+with `x₀(t) = t/T - sin(2πt/T)/2π`, `ω = 1`, `T = 30π`, to `2.0e-16`, `6.7e-16`
+and `9.8e-16` (max componentwise over `q` and `v` at `T`) at 4, 16 and 64 steps
+per period. Budget: a few ULP of the `O(1)` terminal state, no truncation claim.
+
+**Paired symplectic condition — `DERIVED`.** With `D = diag(b)`,
+
+```
+D A^p + (A^q)ᵀ D = b bᵀ        equivalently   b_i A^p_ij + b_j A^q_ji = b_i b_j
+```
+
+**Conjugate exchange — `DERIVED`.** Define, for common and **nonzero** weights,
+
+```
+C(A) = 𝟙 bᵀ − D⁻¹ Aᵀ D
+```
+
+Substituting `(A^q)ᵀ D = b bᵀ − D A^p` and `D⁻¹ b = 𝟙` gives
+
+```
+C(A^q) = A^p        C(A^p) = A^q
+```
+
+so conjugation **exchanges the members of the pair**; neither member is
+individually fixed. Measured in exact arithmetic:
+`C(A^q) − A^q = [[1]]` for symplectic Euler and `[[1/2, 0], [0, −1/2]]` for
+Verlet, while `C(A^q) − A^p = 0` for both.
+
+The familiar unpartitioned statement — that a symplectic tableau is its own
+conjugate — is the degenerate case `A^q = A^p`, where the exchange collapses to
+a fixed point. **It does not generalise without the exchange made explicit.**
+
+The displayed `D⁻¹` form assumes common, nonzero weights. It is a statement
+about tableau algebra and carries no claim about stage-time sampling; C-14.4 is
+a separate result under its own hypotheses and is not extended by this clause.
+
 ---
 
 <a id="c-9"></a>
@@ -839,6 +928,20 @@ Recorded under C-1. A port that changes any of these produces different numbers:
     because the property is the sharpest available check *on* that indexing,
     and a port that reinvents the recursion should reproduce the anchor rather
     than trust a duality test.
+11. **The partitioned adjoint stays division-free** — [C-8.4](#c-8). Should a
+    partitioned family be built, its adjoint must be assembled by transposing
+    the stage residual, exactly as item 2 does, and never by forming the
+    `D⁻¹ Aᵀ D` of C-8.4's conjugate exchange. The exchange is tableau algebra
+    stated for common, nonzero weights; the recursion has no such restriction,
+    and a port that implements the closed form instead of the transpose
+    inherits a division by `b_i` that the method itself does not require.
+    Compositions with a vanishing weight are ordinary members of the family.
+
+    The same item-2 discipline governs where the Jacobians are evaluated: the
+    adjoint of a partitioned step uses `∂f/∂Z` at the **forward** stages, per
+    partition and per stage index. Conjugation relates coefficient arrays, not
+    stage data, so it licenses no rearrangement of which Jacobian multiplies
+    which weighted sum.
 
 ### What a port must *not* preserve
 
@@ -1175,6 +1278,101 @@ defect class — qualification 3 above — and fail 46, 34 and 27 tests elsewher
 in the suite for the explicit, SDIRK and DIRK routes. Transposing the driver's
 own weight `Σ_j a_jk μ_j`, which `Mᵀ` does not filter, fails 15 tests in that
 module.
+
+### C-14.5 Certification cases for a partitioned family — `OPEN`, draft
+
+Should the [C-8.4](#c-8) family be built, it must be certified on **three
+separate properties**. They fail for different reasons and a single witness
+that conflates them will pass for the wrong one.
+
+**Status of the evidence below.** The measurements recorded here are
+preliminary mathematical evidence, obtained from standalone probes against the
+closed forms and the existing certified methods. They establish the conventions
+and fix the shape of the acceptance cases. **No implementation exists, so no
+injection campaign under [C-14.2](#c-14) has been run for this family**, and
+none is expected until the milestone delivers code to inject into. Certification
+remains pending in full.
+
+**1. Symplecticity — structural, no mesh.** The paired condition and the
+conjugate exchange of [C-8.4](#c-8) are identities in the tableau; no mesh is
+involved and none may be introduced. Check them **symbolically** on the ideal
+coefficients, where they hold exactly. A check on *stored floating-point*
+coefficients is a different measurement and carries a justified rounding budget
+per [C-11.3](#c-11): for a composition such as Blanes–Moan, the stored
+paired condition cancels arithmetically rather than vanishing structurally.
+[C-8.3](#c-8) governs exact *dispatch* structure and does not override C-11.3
+here. Apply the conjugate-exchange check only where the weights are nonzero,
+per C-8.4.
+
+**2. Fixed-mesh derivative exactness — [C-2](#c-2).** The oracle order of
+[C-14.1](#c-14) applies unchanged and in its stated order: the **independently
+assembled discrete reference is primary**, for gradients *and* HVPs, extended
+to assemble the partitioned residual. The fixed-mesh ε-sweep is tier 3 and
+stands alongside it, never in place of it. Per [C-2](#c-2) and [C-4](#c-4) the
+mesh is held fixed here; a discrepancy is never explained by refinement.
+
+**3. Continuous accuracy under refinement — [C-4](#c-4).** Two requirements,
+because the natural application witness is degenerate.
+
+*State the requirement on the terminal residual norm, not the objective.* For a
+terminal least-squares excitation `J ∝ ‖r‖²` whose optimum has `r = 0`, a
+method with `‖r‖ = O(hᵖ)` gives `J = O(h²ᵖ)`. A clause written on `J` therefore
+demands twice the method's order and is satisfied by the wrong evidence: it
+would certify second-order Verlet by observing fourth-order decay in `J`.
+
+*Detune the horizon.* `OBSERVED` — driven oscillator `q' = v`,
+`v' = -(q - x₀(t))`, `ω = 1`, from rest, `x₀(τ) = τ + Σ_{k=1}^{8} θ_k sin(kπτ)`
+with `τ = t/T`, terminal residual `r = (q(T) - 1, v(T))`, `θ` chosen at each
+mesh as the minimum-norm solution of that mesh's own discrete residual, then
+evaluated against a closed-form continuous oracle:
+
+| horizon | continuous `rank R` | `‖d‖` |
+|---|---|---|
+| `T = 2π·15` (resonant) | 1 | `0.0` |
+| `T = 2π·15.25` (detuned) | 2 | `1.476e-02` |
+
+At the resonant horizon `ωT` is an exact multiple of `2π`; the bare ramp is
+already an exact solution, every even mode lies exactly in the nullspace, and
+the position row of `R` vanishes identically. The optimum is a seven-dimensional
+affine set containing `θ = 0`, and *any* method that stays near it scores
+arbitrarily well for a reason that is not accuracy. **Retain this case only as a
+labelled structural check on the degeneracy itself.**
+
+At the detuned horizon, with 60, 120 and 240 steps, the terminal residual norm
+against the oracle is:
+
+| method | 60 | 120 | 240 | observed order |
+|---|---|---|---|---|
+| Verlet | `3.379e-04` | `8.381e-05` | `2.091e-05` | 2.01, 2.00 |
+| `implicit_trapezoid` | `1.842e-04` | `4.577e-05` | `1.143e-05` | 2.01, 2.00 |
+| `rk4` | `1.810e-02` | `6.046e-06` | `3.581e-07` | — |
+
+The oracle is the exact `z(T) = i e^{-iT} ∫₀ᵀ e^{it} x₀(t) dt`, where
+`z = q + i v` reduces the pair to `z' = -i z + i x₀` at `ω = 1` from `z(0) = 0`.
+It is validated columnwise — the ramp offset `d` and all eight sine-mode columns
+of `R`, which is the whole affine map the fits use — against `gauss2` at 32, 64,
+128 and 256 steps per period. The max discrepancy over those columns falls
+`5.55e-05`, `3.48e-06`, `2.17e-07`, `1.36e-08`, reduction factors `15.97`,
+`15.99`, `16.00`. The integral satisfies the stated ODE and initial condition
+directly; that is what establishes it. The observed fourth-order decay
+corroborates the `gauss2` comparison — it does not independently prove the
+oracle correct or bound the remaining error. The `1.36e-08` at the finest
+reference mesh is a measured discrepancy, not a bound.
+
+**What this evidence does and does not support.** At every mesh and for every
+method above, the *discrete* residual falls to `~1e-18`. That is a property of
+these particular fits, not of optimization in general: the basis carries eight
+free coefficients against a rank-2 discrete map, so an unconstrained affine
+least-squares problem attains its zero exactly. **Optimizers do not universally
+zero their objectives**, and no such claim is made here.
+
+What differs between the methods is only the *true* residual, so eliminating
+dissipation does not eliminate objective error; the dispersive part remains, and
+in this study converges at the method's order. The defensible comparison is
+narrow: at 60 steps second-order Verlet is `53.6×` closer in residual amplitude
+than fourth-order `rk4`, or `2.87e+03` in the quadratic objective. That is an
+observed accuracy comparison on one coarse-mesh fixture, and it is **not**
+grounds to weaken requirement 3.
 
 ---
 
