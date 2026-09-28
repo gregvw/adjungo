@@ -231,7 +231,7 @@ Stated here so that this document cannot be read as advertising.
 | Automatic differentiation of user callbacks | Not planned. The caller supplies derivatives. |
 | Additive / IMEX splitting | Tableaux retained in `methods/experimental/`; refused. |
 | `r > 1` multistep | Tableaux retained; refused. Needs a certified starting procedure. |
-| Partitioned methods (PRK, Nystrom) | Not built. |
+| Partitioned methods (PRK, Nystrom) | Not built, and not certified. Conventions, proposed domain, the paired symplectic condition and the conjugate exchange are drafted in `NUMERICS.md` C-8.4; certification cases in C-14.5. Both are `OPEN` and await a ruling. `GLMOptimizer` refuses these methods under C-6.2. |
 | Sparse or matrix-free linear algebra | Not built. `algebra/protocols.py` is the seam it would enter through. |
 | Reuse for a *varying* Jacobian (modified Newton, lagged Jacobian) | Not built. The refusal is narrower than it first appears and is stated precisely below. |
 | Sparse or specialised factorization of `K` | Not built. Eligibility is a property of the **assembled matrix**, never of the tableau: `K = I - h(A (x) I)blockdiag(F_j)` is not symmetric for a general `F`, so no tableau classification can establish that Cholesky applies. |
