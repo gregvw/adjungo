@@ -1,3 +1,17 @@
+> **SUPERSEDED — historical record, not current documentation.**
+>
+> This file is an ad-hoc report written during earlier development. It lived in
+> `tests/`, referenced from nothing, and its counts describe a tree that no
+> longer exists: the suite it measured had 98 tests, and the `xfail` it installed
+> on `test_adjoint_sensitivity_finite_difference` was removed when U-M1.3 cured
+> the defect. That test is now an ordinary passing comparison
+> (`tests/test_nonlinear_and_sensitivities.py:288`).
+>
+> The durable rule it established — an assertion must be able to fail — is in
+> [`AGENTS.md`](../../AGENTS.md) and
+> [`NUMERICS.md`](../../NUMERICS.md) C-14.2. Read this file for the episode, not
+> for the numbers.
+
 # Assertion audit
 
 Plan unit U-M0.5. A sweep of `tests/` for assertions that cannot fail.

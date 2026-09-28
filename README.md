@@ -147,6 +147,12 @@ the optimizer's cache and checks nothing. See `NUMERICS.md` C-17.6.
   Jacobian). Reuse under a declared-constant Jacobian is implemented and is
   described above; what is missing is reuse where the matrix genuinely
   changes and a stale one would be used deliberately.
+- **Partitioned methods** (partitioned Runge–Kutta, Nyström), which apply a
+  different coefficient array to each of two state blocks. A GLM applies one
+  array to the whole state as `A ⊗ I`, so symplectic Euler and Störmer–Verlet
+  are not expressible — there is no partitioned method object to construct.
+  Conventions, the proposed domain and the certification cases are drafted in
+  `NUMERICS.md` C-8.4 and C-14.5, both `OPEN`. Nothing is implemented.
 - Nonlinear control parametrisation, sparse operators, and checkpointing.
 
 ## Installation
@@ -304,6 +310,9 @@ The library is organized into several modules:
 - `adjungo.stepping`: Forward/backward stepping algorithms
 - `adjungo.optimization`: Gradient and Hessian assembly
 - `adjungo.methods`: Standard method tableaux library
+- `adjungo.validation`: The independently assembled reference the Validation
+  section above describes. It shares no code with `stepping` or `optimization`,
+  which is the property that makes it an oracle rather than a second opinion.
 - `adjungo.utils`: Utility functions
 
 ## Documentation
@@ -314,6 +323,7 @@ The library is organized into several modules:
 | [`AGENTS.md`](AGENTS.md) | Paths, commands and local conventions for working in this repository. |
 | [`docs/architecture.md`](docs/architecture.md) | Module map, the four sweeps, the `glm_opt.tex`-to-code symbol map, an explicit list of what is **not** built, and what a C++ reimplementation must preserve. |
 | [`docs/adjoint_sensitivity_insight.md`](docs/adjoint_sensitivity_insight.md) | Why the adjoint and adjoint-sensitivity solves are linear and share one factorization, and the stage-index trap that makes a wrong version look correct. |
+| [`docs/evidence/coefficient_immutability.md`](docs/evidence/coefficient_immutability.md) | The failure history and injection table behind C-15.7's coefficient-custody rules. Cited from the clause; kept out of it because the narrative is long and the clause is normative. |
 | [`docs/glm_opt.tex`](docs/glm_opt.tex) | The mathematical derivation the code implements. |
 | [`docs/runge_kutta_opt.tex`](docs/runge_kutta_opt.tex) | The Runge-Kutta special case, second-order conditions. Ten of its equations carried the same stage-index defect as the code (precedent R-5) and were corrected; its correction notice records what changed and why. |
 | [`docs/multistep_opt.tex`](docs/multistep_opt.tex) | Multistep optimality conditions. The corresponding solver path is **refused**; this is theory, not a description of working code. |

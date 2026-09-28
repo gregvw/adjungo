@@ -1,8 +1,9 @@
 # Historical reports — archive and accounting checklist
 
 The original 17 reports in this directory were written during earlier development and kept
-in the repository root. They are **superseded**. Each now carries a banner
-saying so.
+in the repository root; `ASSERTION_AUDIT.md` joined them later, from `tests/`,
+where it was referenced from nothing. They are **superseded**. Each now carries
+a banner saying so.
 
 This file is the accounting required before any of them may be deleted. For
 every report it records where its durable content now lives, and — just as
@@ -49,6 +50,7 @@ than lost.
 | `ADJOINT_FIXES_SUMMARY.md` | The stage adjoint carries the step size `h`; omitting it from the terminal and coupling terms is a defect, not a scaling choice. | `NUMERICS.md` C-8.1 (placement of `h`) and C-13 item 1. | A scalar anchor `dy/dt = u`, `J = ½y(T)² + ½u²` with derivative `2.0`. The anchor idea was promoted; this instance's indexing is not fully stated. Closed-form anchors now live in `tests/`. |
 | `ADJOINT_SENSITIVITY_IMPLEMENTED.md` | The second-order adjoint is a second backward sweep with the same operator and a different right-hand side. | `NUMERICS.md` R-6; implemented in `adjungo/stepping/sensitivity.py`. | Hessian finite-difference discrepancies of `6.7e-4`–`3e-3`: no random direction, objective, mesh or tolerance recorded. |
 | `ADJOINT_SIGN_ISSUE.md` | The sign conflict between the Lagrangian as stated and the terminal/recursion/gradient relations derived from it. | **Fixed in `docs/glm_opt.tex`** — the Lagrangian now adjoins constraints with a minus sign, and a "Sign convention (corrected)" paragraph explains why `Aᴴμ = Bᴴλ` is invariant under the flip while the relations carrying `∂J` are not. Matches `adjungo/stepping/adjoint.py` and `adjungo/optimization/gradient.py`. | Diagnostic vectors for `dy/dt = −y + u`, `h = 0.333`: the objective and initial state are not fully stated. |
+| `ASSERTION_AUDIT.md` | An assertion that computes a reference and then checks only `is not None` has never tested anything; this repository shipped one, and it concealed a `delta_Lambda` wrong by 97%. | The rule is in [`AGENTS.md`](../../AGENTS.md) ("Assertions must be able to fail") and `NUMERICS.md` C-14.2, which requires a test to be shown failing against a broken implementation. The cured test is `tests/test_nonlinear_and_sensitivities.py::test_adjoint_sensitivity_finite_difference`. | The suite counts (`8 failed, 89 passed, 1 skipped`) and the `xfail(strict=True)` bookkeeping, which describe a 98-test tree that no longer exists. Held in `tests/` rather than here until 2026-09-28, referenced from nothing. |
 | `BUG_REPORT.md` | A catalogue of early defects. | The ones with an identified mechanism are `NUMERICS.md` R-1 … R-6. | The observation that an integration objective stayed at exactly `5.0` across a gradient step. No root cause was ever established and no reproducer survives. Recorded here as a debugging episode only; see the note below. |
 | `CODEX_VS_CLAUDE_COMPARISON.md` | The recommendation to merge adjoint work with multistep work. | Superseded by a stronger policy: `r > 1` is refused outright under `NUMERICS.md` C-6.2, not deferred. | Nothing durable beyond that. |
 | `FORWARD_SENSITIVITY_IMPLEMENTED.md` | The tangent recursion uses `F_j` — the Jacobian of the stage being differentiated *with respect to* — where the adjoint recursion uses `F_k` factored out of the whole weighted sum. | `NUMERICS.md` C-13 item 2, which states the asymmetry explicitly. | Agreement figures without a stated mesh. |
