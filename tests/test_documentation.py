@@ -218,6 +218,7 @@ def test_certified_families_agree_with_the_code():
         "Fully implicit (dense `A`)": StageType.IMPLICIT,
         "Linear multistep, `r > 1`": None,
         "IMEX / additive splitting": None,
+        "Partitioned (PRK, Nyström)": None,
     }
 
     rows = [
@@ -743,6 +744,59 @@ def test_architecture_symbol_map_resolves():
     assert not unresolved, (
         "docs/architecture.md maps glm_opt.tex symbols onto attributes that do "
         "not exist: " + ", ".join(sorted(set(unresolved)))
+    )
+
+
+def test_architecture_states_the_current_c13_item_count():
+    """The C-13 length quoted by architecture.md is recomputed, not trusted.
+
+    ``docs/architecture.md`` opens its C++ section by telling a reimplementer
+    how long the normative carry-forward list is, then restates it at greater
+    length. The two counts differ on purpose -- the restatement folds in
+    implementation lessons C-13 does not carry -- so a reader has no way to
+    notice when the quoted C-13 figure stops matching C-13.
+
+    It stopped matching twice, in consecutive commits: C-14.4 appended item 10
+    and the partitioned-adjoint clause appended item 11, while the sentence
+    still said nine. Nothing failed, because appending to a list at the end
+    breaks no cross-reference and changes no behaviour. The count is the only
+    part of that sentence a machine can check, so it is checked here.
+    """
+    numerics = _numerics_text()
+    clause = numerics[numerics.index('<a id="c-13">'): numerics.index('<a id="c-14">')]
+    items = re.findall(r"^(\d+)\. \*\*", clause, re.MULTILINE)
+
+    assert items, "C-13 has no numbered items; the clause's shape has changed"
+    # Appending an item is the expected edit; a gap means one was renumbered or
+    # removed, which would silently invalidate the "C-13 item N" citations in
+    # NUMERICS.md and docs/.
+    assert [int(n) for n in items] == list(range(1, len(items) + 1)), (
+        f"C-13's numbering is not contiguous from 1: {items}. Existing "
+        "'C-13 item N' citations now point at the wrong item."
+    )
+
+    WORDS = {
+        1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+        7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven",
+        12: "twelve", 13: "thirteen", 14: "fourteen", 15: "fifteen",
+        16: "sixteen", 17: "seventeen", 18: "eighteen", 19: "nineteen",
+        20: "twenty",
+    }
+    expected = WORDS.get(len(items), str(len(items)))
+
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    stated = re.search(
+        r"C-13 is the normative list\s+of what must carry forward; it currently has (\S+) items",
+        architecture,
+    )
+    assert stated, (
+        "docs/architecture.md no longer states how many items C-13 has in the "
+        "form this test recognises. Restore the sentence or update the pattern."
+    )
+    assert stated.group(1) == expected, (
+        f"docs/architecture.md says C-13 has {stated.group(1)} items; it has "
+        f"{len(items)} ({expected}). Appending a C-13 item does not break any "
+        "cross-reference, so this sentence is where the drift shows up."
     )
 
 

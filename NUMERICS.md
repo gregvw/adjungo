@@ -292,6 +292,7 @@ forward solve, gradient, **and** Hessian-vector product for it, against the
 | Fully implicit (dense `A`) | **certified** — M3 (`gauss2`) |
 | Linear multistep, `r > 1` | **not supported** |
 | IMEX / additive splitting | **not supported** |
+| Partitioned (PRK, Nyström) | **not supported** — conventions drafted in [C-8.4](#c-8), certification cases in [C-14.5](#c-14); both `OPEN` |
 
 `OBSERVED` — each certified method above is exercised, on the
 [C-14](#c-14-the-certification-test-population) population, by:
@@ -545,9 +546,11 @@ state blocks. This is not expressible under C-8.2 and is not a matter of adding
 history: carrying more external values generalises the state representation,
 never the component dependence of the coefficients.
 
-Nothing below is certified. C-6.1 is unchanged and `GLMOptimizer` still refuses
-these methods under C-6.2. This clause fixes the conventions a milestone would
-have to implement, so that the mathematics is settled before any code claims it.
+Nothing below is certified. C-6.1 lists this family as **not supported**. No
+representation exists — there is no partitioned method object to construct, so
+nothing can reach `GLMOptimizer` to be refused; C-6.2's last bullet would refuse
+one if there were. This clause fixes the conventions a milestone would have to
+implement, so that the mathematics is settled before any code claims it.
 
 **Proposed domain.** The equations below are written for a general two-block
 partition, but the milestone they are drafted for is deliberately narrower: two

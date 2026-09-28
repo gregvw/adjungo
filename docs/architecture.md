@@ -75,7 +75,10 @@ adjungo/
   algebra/         how linear systems are represented and solved
     protocols.py       LinearAlgebraBackend protocol.
     dense.py           The one implementation: NumPy/SciPy dense LU.
-    operators.py       Matrix-free operator wrappers.
+    operators.py       A LinearOperator wrapper. Exported from nowhere and
+                       called from nowhere: it anticipates the matrix-free
+                       route listed as not built below. Present as a sketch,
+                       not as a working seam.
 
   solvers/         one step's stage equations
     base.py            StageSolver protocol and the per-step cache.
@@ -231,8 +234,9 @@ Stated here so that this document cannot be read as advertising.
 | Automatic differentiation of user callbacks | Not planned. The caller supplies derivatives. |
 | Additive / IMEX splitting | Tableaux retained in `methods/experimental/`; refused. |
 | `r > 1` multistep | Tableaux retained; refused. Needs a certified starting procedure. |
-| Partitioned methods (PRK, Nystrom) | Not built, and not certified. Conventions, proposed domain, the paired symplectic condition and the conjugate exchange are drafted in `NUMERICS.md` C-8.4; certification cases in C-14.5. Both are `OPEN` and await a ruling. `GLMOptimizer` refuses these methods under C-6.2. |
-| Sparse or matrix-free linear algebra | Not built. `algebra/protocols.py` is the seam it would enter through. |
+| Partitioned methods (PRK, Nystrom) | Not built, and not certified. Conventions, proposed domain, the paired symplectic condition and the conjugate exchange are drafted in `NUMERICS.md` C-8.4; certification cases in C-14.5. Both are `OPEN` and await a ruling. No representation exists, so there is nothing to hand to `GLMOptimizer`; C-6.2 would refuse one if there were. |
+| Matrix-free linear algebra | Not built. `algebra/protocols.py` is the seam it would enter through; `algebra/operators.py` holds an unused `LinearOperator` sketch. |
+| Sparse linear algebra | Not built. Same seam. |
 | Reuse for a *varying* Jacobian (modified Newton, lagged Jacobian) | Not built. The refusal is narrower than it first appears and is stated precisely below. |
 | Sparse or specialised factorization of `K` | Not built. Eligibility is a property of the **assembled matrix**, never of the tableau: `K = I - h(A (x) I)blockdiag(F_j)` is not symmetric for a general `F`, so no tableau classification can establish that Cholesky applies. |
 | Nonlinear-in-control affine coefficients | Not built. `f = M(t, u)y + b(t, u)` is `state_affine` but not `jointly_affine`, so it keeps the direct stage solve and loses the curvature skip. `tests/problems.py::ConstantJacobianQuadraticControl` is the in-tree instance; no representation class owns the case. |
@@ -244,7 +248,7 @@ Stated here so that this document cannot be read as advertising.
 ## For a C++ reimplementation
 
 This Python package is a pilot study. `NUMERICS.md` C-13 is the normative list
-of what must carry forward; it currently has nine items. The twelve below are
+of what must carry forward; it currently has eleven items. The twelve below are
 that list restated for an implementer, together with the implementation
 lessons that produced it — a longer list, not a competing one. Where the two
 differ, C-13 governs.
