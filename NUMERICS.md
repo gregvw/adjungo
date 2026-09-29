@@ -51,6 +51,12 @@ For every **certified** method family (see [C-6](#c-6-envelope-enforcement)), at
 *discrete* objective the code actually evaluates. It is **not** a statement about
 the continuous optimal-control problem; that is [C-4](#c-4-continuous-accuracy).
 
+"Fixed mesh" above means the uniform mesh and single method a solve is given
+today. [C-18.2](#c-18) states the same promise for a plan — the exact
+derivatives of `J_𝒟` with `𝒟` held fixed — and states what it excludes: the
+derivative of a composed adaptive algorithm is a different contract. That clause
+is `OPEN` and unimplemented.
+
 **A derivative discrepancy is never explained by time-discretization error.**
 Discretization error changes *which* function is being differentiated; it does
 not change the fact that the adjoint must differentiate that function exactly.
@@ -436,6 +442,11 @@ y^[n]    = V y^[n-1]           +  h ( B f_stages )
 `A` or `B`.** A tableau whose external vector stores `h·f` history must respect
 this when its `V` and `B` blocks are written.
 
+The single scalar `h` above assumes one mesh and one method for the whole solve.
+[C-18.4](#c-18) restates this same placement rule per step, for a plan supplying
+`h_n` and step-indexed coefficients; that clause is `OPEN` and unimplemented,
+and the uniform case here is its degenerate instance.
+
 ### C-8.2 Shape invariants
 
 ```
@@ -629,6 +640,21 @@ The displayed `D⁻¹` form assumes common, nonzero weights. It is a statement
 about tableau algebra and carries no claim about stage-time sampling; C-14.4 is
 a separate result under its own hypotheses and is not extended by this clause.
 
+**Relation to the [C-18](#c-18) plan.** This clause partitions coefficients by
+state *component*, within a step. A plan selects a method by *step*. The axes
+are independent and neither is evidence for the other's design; see
+[C-18.1](#c-18). A partitioned method is one kind of step implementation a plan
+may carry.
+
+Partitioning does **not** require the plan's packed storage: symplectic Euler
+has `s = 1` and Verlet `s = 2` in the chosen representations, and either alone
+fits the present rectangular arrays. The plan is sequenced first for a
+practical reason only — to refactor stage storage and stage indexing once
+rather than twice, across the seams where [R-2](#r-2), [R-5](#r-5) and
+[R-9](#r-9) all lived. What is substantive is [C-18.6](#c-18): energy
+behaviour observed for these methods at constant `h` is not inherited by a
+variable-step plan.
+
 ---
 
 <a id="c-9"></a>
@@ -661,6 +687,13 @@ normative: a reimplementation that folds `h` into `w`, or applies it twice,
 produces a different discrete objective and therefore a different exact gradient.
 
 For a Runge–Kutta method in GLM form, `w_k = B[0, k]`.
+
+The sum above factors `h` outside the sum over `n` and carries no step index on
+`w_k`, because the certified envelope has one mesh and one method per solve.
+[C-18.4](#c-18) extends this *convention* to `Σ_n h_n Σ_k w_k^(n) ℓ(…)`, with
+the placement rule of this clause otherwise unchanged. Both forms are
+specification, not description: per [C-9.4](#c-9) the stage-quadrature term is
+not implemented, and C-18 does not implement it.
 
 ### C-9.4 Required derivatives
 
@@ -696,6 +729,21 @@ is *not* yet supported as well as about what is.
   `u ∈ ℝ^(N×s×ν)`. All of C-2 is stated in this layer.
 - **Adapter layer.** The optimization adapter maps a parameter vector `θ` to
   stage controls and returns derivatives in `θ`.
+
+The `(N, s, ν)` stage layout assumes one stage count for the whole solve. A
+[C-18](#c-18) plan whose steps differ in `s` requires a packed layout with
+per-step offsets ([C-18.5](#c-18)) and an adapter built against the plan rather
+than against a single `method`. A plan that varies only the nodes or the
+abscissae at fixed `s` keeps this layout and changes only the stage *times* the
+adapter samples at. That clause is `OPEN`.
+
+**Transferring an iterate across plans is not the same as enriching the control
+space.** A parametrization whose basis is defined on `[t₀, t₁]` rather than on
+the mesh — a spline or spectral basis — carries `θ` unchanged to a new plan, and
+only `P` is rebuilt. That transfers the same control *function*. It does not add
+the degrees of freedom a newly resolved local feature needs, which requires
+prolongation or projection onto a refined basis. The two are separate
+capabilities and only the first is free.
 
 ### C-10.2 Affine parametrizations — `DERIVED`, implemented
 
@@ -945,6 +993,22 @@ Recorded under C-1. A port that changes any of these produces different numbers:
     partition and per stage index. Conjugation relates coefficient arrays, not
     stage data, so it licenses no rearrangement of which Jacobian multiplies
     which weighted sum.
+
+12. **The backward sweep differentiates the executed forward objective** —
+    [C-18.2](#c-18). Should the discretization plan be built, both sweeps must
+    read one immutable plan by step index. Deterministic lookup from that plan
+    is fine; a port need not duplicate the coefficients per step. What is
+    forbidden is calling a selection or adaptation policy a second time, since
+    a policy given a different trajectory may answer differently. The obligation
+    is a port one because a language with cheaper recomputation than storage
+    invites exactly that substitution.
+
+    The failure it prevents: a mismatched backward plan need not differentiate
+    the executed objective, and need not return the gradient of anything at
+    all. Two Euler steps of `y' = u` at length `1` with `J = y(2)²/2`,
+    differentiated backward at lengths `(1, 2)`, give `(u₁+u₂, 2(u₁+u₂))`,
+    whose Jacobian `[[1,1],[2,2]]` is asymmetric. Symmetry and duality
+    corroborate; shared errors can pass them.
 
 ### What a port must *not* preserve
 
@@ -2502,6 +2566,200 @@ before existing ones silently re-binds every positional call. It is now
 keyword-only and comes last in all three solvers.
 
 Evidence: `tests/test_time_varying_affine.py`, section "Reuse across calls".
+
+---
+
+<a id="c-18"></a>
+
+## C-18 The discretization plan — `OPEN`, draft, unimplemented
+
+Everything certified today assumes **one mesh and one method for a whole
+solve**: `h = (t₁ − t₀)/N` is a scalar, `Trajectory.Z` is a dense `(N, s, n)`
+array, and the C-10 adapters are built against a single `method.s` and a single
+`c`. That assumption is not a numerical requirement; it is an early convenience
+that three prospective capabilities all need removed — variable step sizes,
+prescribed method changes across regimes, and eventually a multistep starting
+procedure.
+
+This clause fixes what replaces it. Nothing here is implemented.
+
+### C-18.1 The plan is explicit data — `OPEN`
+
+A **discretization plan** `𝒟` is the time nodes `t₀ < t₁ < … < t_N`, giving
+`h_n = t_{n+1} − t_n`, together with a method specification for each step. The
+plan determines stage times and control sampling. It is an **input**, supplied
+by the caller and fixed for the duration of a solve.
+
+**Two axes, not one.** The plan selects a method **by step**. [C-8.4](#c-8)
+partitions coefficients **by state component**, within a step. These are
+independent: a step-indexed selector cannot express Störmer–Verlet, whose two
+arrays act simultaneously and whose coupling *is* the method, and block
+coefficients cannot express a change of method between steps. A plan carrying
+partitioned step implementations uses both axes at once; neither subsumes the
+other, and neither is evidence for the other's design.
+
+### C-18.2 What the derivative is a derivative of — `OPEN`
+
+[C-2](#c-2) promises the exact derivative of the objective as discretised, at
+the mesh supplied. Under a plan that reads: adjungo returns the exact
+derivatives of
+
+```
+J_𝒟(θ)        with 𝒟 held fixed
+```
+
+This is **not** the derivative of the composed adaptive algorithm
+`θ ↦ J_{𝒟(θ)}(θ)`, which would additionally require derivatives of the step
+sizes and explicit treatment of switching boundaries. That is a different and
+larger contract, and it is not offered here. It is not thereby ill-defined;
+it is simply not this promise.
+
+An adaptation policy may therefore construct `𝒟ₖ` from the current trajectory
+and error indicators. Doing so asserts nothing false about the dynamics, and is
+**not** the failure of [R-9](#r-9): R-9 inferred a structural property of the
+problem incorrectly and consequently applied the wrong operator. Choosing a
+discretization is a choice, not an assertion.
+
+What R-9 does govern is the recording. **The backward calculation must
+differentiate the forward objective that was actually executed.** Concretely:
+the two sweeps read one immutable plan, by step index. Deterministic lookup
+from that plan is fine and duplicated per-step copies of the coefficients are
+not required; what is forbidden is *re-deciding* — calling a selection or
+adaptation policy a second time, where a policy given a different trajectory
+may answer differently.
+
+The claim stops there. **A mismatched backward plan need not differentiate the
+executed objective**, and what it returns instead need not be the gradient of
+anything: for `y' = u`, `y(0) = 0`, two Euler steps of length `1` and
+`J = y(2)²/2`, a backward sweep using lengths `(1, 2)` returns
+`(u₁+u₂, 2(u₁+u₂))`, whose Jacobian `[[1,1],[2,2]]` is not symmetric and so is
+no scalar function's gradient. Symmetry and duality are corroborating checks
+only: they can pass when both derivative paths share an error, which is exactly
+what re-running one policy in both sweeps arranges. See [C-14.1](#c-14).
+
+Changing a plan invalidates the trajectory and every factorization cache keyed
+to it.
+
+### C-18.3 Scope of the first implementation — `OPEN`
+
+The plan is built against the **existing certified `r = 1` families** and a
+**fixed state dimension `n`**, varying the nodes, the stage count and the
+coefficients from step to step. Multistep startup — the case that motivates a
+plan most obviously — is *not* in this increment: it needs a defined history
+representation and a certified starting procedure, and [C-Q4](#open-questions)
+has not settled what the external vectors hold. (A starter may carry the larger
+history representation throughout, so `r` need not change mid-solve; that is a
+design choice the starting procedure makes, not a prerequisite.) Nor is an
+adaptation policy implemented; C-18 defines what a policy may hand in, not the
+policy.
+
+### C-18.4 Where `h_n` and the step's weights enter — `OPEN`
+
+[C-8.1](#c-8)'s placement rule is unchanged in substance and restated per step:
+`h_n` is applied by the stepping code and is never absorbed into `A` or `B`.
+Indexing follows [C-18.1](#c-18) — step `n` spans `[t_n, t_{n+1}]` — so the step
+carrying `h_n` advances `y^[n]` to `y^[n+1]`:
+
+```
+Z_i     = Σ_k U^(n)_ik y_k^[n] + h_n Σ_j A^(n)_ij f(Z_j, u_j, t_n + c^(n)_j h_n)
+y^[n+1] = V^(n) y^[n]          + h_n ( B^(n) f_stages )
+```
+
+State index, stage times and interval length now share one origin. C-8.1's
+display writes the same step as `y^[n-1] → y^[n]`; the two conventions agree
+after a consistent shift of the state, step and time indices together.
+
+[C-9.3](#c-9)'s stage quadrature extends the same way, to
+`Σ_n h_n Σ_k w_k^(n) ℓ(…)`. That is an extension of a *specified* convention:
+per [C-9.4](#c-9) the stage-quadrature term is not implemented in either the
+package or the reference, and this clause does not add it. The uniform
+single-method case is the degenerate plan and must reproduce the present
+formulas exactly.
+
+### C-18.5 Storage — `OPEN`
+
+A plan whose steps have **different stage counts** cannot use the present dense
+`(N, s, n)` arrays. Stage storage becomes **packed with per-step offsets**, in
+`Trajectory.Z`, in `WeightedAdj`, in the C-10 stage-control layout, and in the
+independent reference's own index bookkeeping.
+
+This is a consequence of varying `s`, and of nothing else. Varying `h_n` alone
+does not require it; neither does varying the abscissae `c^(n)` at fixed `s`,
+which changes stage *times* and leaves every shape intact. Nor does
+partitioning: [C-8.4](#c-8)'s two target methods have `s = 1` (symplectic
+Euler) and `s = 2` (Verlet) in the chosen representations, and either alone
+fits rectangular storage. Packing is the cost of admitting different methods
+with different stage counts in one plan.
+
+**The reference's offsets must be written separately from the implementation's.**
+Sharing them is the obvious economy and it would destroy the property that makes
+[C-14.1](#c-14) tier 1 an oracle: it shares no code with `stepping/`, so it
+cannot share a mistake with it. Two independent offset calculations that agree
+is evidence; one calculation used twice is not.
+
+### C-18.6 A variable-step plan does not inherit constant-step conservation — `OPEN`
+
+`DERIVED`. A prescribed sequence of symplectic steps is symplectic at unequal
+step sizes: each step is a symplectic map and their composition is symplectic.
+
+**The near-conservation of `H` that motivates these methods does not follow.**
+That property comes from backward error analysis: for an *autonomous* system at
+*constant* `h`, a symplectic method is formally the flow of a modified
+Hamiltonian `H̃ = H + h^p H_p + …`. The series generally diverges, so the
+rigorous statement is about a suitably truncated modified Hamiltonian with a
+controlled remainder under stated hypotheses — analyticity and a step-size
+restriction — valid over correspondingly long but finite times, not an exact
+identity. At varying `h` the modified Hamiltonian differs from step to step and
+the argument does not close at all; prescribed variable steps can additionally
+excite resonances. Choosing `h_n` from the evolving state loses the guarantee
+outright without a further construction, such as a Poincaré-transformed time
+reparametrisation.
+
+The autonomy hypothesis is already absent from this project's scope.
+[C-8.4](#c-8)'s domain is `H(q, p, u, t) = T(p) + V(q, u, t)` — non-autonomous
+and controlled. For prescribed controls a symplectic method preserves the
+canonical symplectic form. It does not guarantee
+conservation of energy or the absence of artificial energy drift, and here the
+energy changes for a physical reason as well, since the control does work on
+the system. Any numerical energy claim requires its own evidence.
+
+The variable-step case is not a weakened version of this but a qualitatively
+different one. For `H = (q² + p²)/2`, velocity Verlet at `h = 1` and at
+`h = 9/5` each has a stable step matrix — traces `1` and `−31/25`, both inside
+`[−2, 2]`. Alternating them gives a product with determinant `1` and trace
+`−289/125 < −2`: still symplectic, now hyperbolic, with an exponentially
+growing mode. (Exact in rational arithmetic; `ω = 1`, `q̈ = −q`.) Symplecticity
+survives the variable steps and the energy behaviour does not.
+
+Consequently a variable-step plan **may not cite the constant-step energy
+behaviour recorded for [C-8.4](#c-8) methods**, and any energy claim under a
+plan requires its own evidence at that plan.
+
+### C-18.7 Acceptance — `OPEN`
+
+Before any new capability rides on it:
+
+1. **The degenerate plan reproduces the present results.** Uniform nodes, one
+   method, every certified family: the existing suite is the regression, and it
+   must pass unchanged. This refactor touches stage indexing and stage storage
+   simultaneously, which is where [R-2](#r-2), [R-5](#r-5) and [R-9](#r-9) all
+   lived.
+2. **Non-uniform `h_n` and prescribed method changes, including different stage
+   counts, against the [C-14.1](#c-14) tier-1 reference** — gradients and HVPs
+   both, on the [C-14](#c-14) population, with the mesh of each plan held fixed
+   per [C-2](#c-2).
+3. **Continuous refinement under [C-4](#c-4-continuous-accuracy)**, against a
+   closed-form or manufactured solution, on a plan refined as a plan. Item 2
+   compares derivatives at one fixed plan and can pass for a discretization
+   that converges to the wrong thing.
+4. **A plan change at unchanged `θ` agrees with a fresh evaluation.** Build a
+   solve, change the plan, keep the control parameters identical, and compare
+   objective, gradient and HVP against the same plan evaluated from scratch.
+   Items 2 and 3 exercise one plan per process and cannot see a stale
+   trajectory, a stale control sampling, or a factorization cache that outlived
+   the plan it was keyed to.
+5. A [C-14.2](#c-14) injection campaign. None has been run; nothing here is
+   certified.
 
 ---
 
