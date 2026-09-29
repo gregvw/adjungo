@@ -1,20 +1,23 @@
 """Solver factory and dispatch logic."""
 
-from adjungo.core.method import GLMethod, StageType
+from adjungo.core.method import StageType
+from adjungo.core.plan import StepMethod
 from adjungo.core.problem import ProblemStructure
 from adjungo.core.requirements import SolverRequirements
 from adjungo.solvers.base import StageSolver
 from adjungo.solvers.dirk import DIRKStageSolver
 from adjungo.solvers.explicit import ExplicitStageSolver
 from adjungo.solvers.implicit import ImplicitStageSolver
+from adjungo.solvers.partitioned import PartitionedStageSolver
 from adjungo.solvers.sdirk import SDIRKStageSolver
 
 
 def create_stage_solver(
-    method: GLMethod,
+    method: StepMethod,
     requirements: SolverRequirements,
     problem_structure: ProblemStructure,
     y_scale: float = 1.0,
+    n_q: int | None = None,
 ) -> StageSolver:
     """
     Decision tree following ``docs/linalg_requirements.tex`` Section 6, whose
@@ -42,10 +45,22 @@ def create_stage_solver(
         problem_structure: Problem structure information
         y_scale: Characteristic state magnitude for the C-5.1 stage
             convergence test, captured by the solver at construction
+        n_q: Size of the position block, required by and only by a
+            partitioned method. The partition belongs to the problem, not to
+            the tableau, so it is resolved by the caller and bound into the
+            solver rather than read from the method (C-8.4).
 
     Returns:
         Appropriate stage solver
     """
+
+    if method.stage_type == StageType.PARTITIONED:
+        if n_q is None:
+            raise ValueError(
+                "a partitioned method needs n_q; pass the problem's "
+                "canonical split (NUMERICS.md C-8.4)."
+            )
+        return PartitionedStageSolver(n_q=n_q)
 
     if method.stage_type == StageType.EXPLICIT:
         return ExplicitStageSolver()

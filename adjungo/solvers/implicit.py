@@ -15,15 +15,16 @@ module now implements the solve.
 """
 
 import functools
-from typing import Any
 
 import numpy as np
-import scipy.linalg
 from numpy.typing import NDArray
 
 from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
-from adjungo.solvers.base import StageSolver, StepCache
+from adjungo.solvers.base import GLMStageSolver, StepCache
+from adjungo.solvers.coupled import (
+    solve_coupled_transposed,
+)
 from adjungo.solvers.factorization import FactorizationStore
 from adjungo.solvers.newton import StageDispatchMixin, StageSolveError
 
@@ -37,46 +38,7 @@ def coupled_stage_context(step: int | None, t_n: float, h: float) -> str:
     )
 
 
-def solve_coupled(factorization: Any, rhs: NDArray) -> NDArray:
-    """Apply the coupled stage operator's inverse to a per-stage right side.
-
-    Used by the forward (tangent) sensitivity, which solves the *same*
-    linear system the forward Newton iteration converged on, with a
-    different right-hand side.
-
-    Args:
-        factorization: ``lu_factor`` result for the forward coupled Jacobian.
-        rhs: Right-hand side with shape ``(s, n)``.
-
-    Returns:
-        Solution with shape ``(s, n)``.
-    """
-    s, n = rhs.shape
-    solution = scipy.linalg.lu_solve(factorization, rhs.ravel())
-    return np.asarray(solution, dtype=float).reshape(s, n)
-
-
-def solve_coupled_transposed(factorization: Any, rhs: NDArray) -> NDArray:
-    """Apply the transposed coupled stage operator to a per-stage right side.
-
-    Shared by the first-order adjoint and the second-order (sensitivity)
-    adjoint, which solve the *same* linear system with different right-hand
-    sides. One implementation means the two cannot drift apart in how they
-    interpret the factorization's orientation.
-
-    Args:
-        factorization: ``lu_factor`` result for the forward coupled Jacobian.
-        rhs: Right-hand side with shape ``(s, n)``.
-
-    Returns:
-        Solution with shape ``(s, n)``.
-    """
-    s, n = rhs.shape
-    solution = scipy.linalg.lu_solve(factorization, rhs.ravel(), trans=1)
-    return np.asarray(solution, dtype=float).reshape(s, n)
-
-
-class ImplicitStageSolver(StageDispatchMixin, StageSolver):
+class ImplicitStageSolver(StageDispatchMixin, GLMStageSolver):
     """Solve all stages of a dense-``A`` tableau simultaneously by Newton.
 
     **Forward.** The stage equations are

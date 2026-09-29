@@ -298,7 +298,7 @@ forward solve, gradient, **and** Hessian-vector product for it, against the
 | Fully implicit (dense `A`) | **certified** — M3 (`gauss2`) |
 | Linear multistep, `r > 1` | **not supported** |
 | IMEX / additive splitting | **not supported** |
-| Partitioned (PRK, Nyström) | **not supported** — conventions [C-8.4](#c-8) and certification cases [C-14.5](#c-14) are `APPROVED`; neither is implemented, and approval of a convention is not certification of a family |
+| Partitioned (PRK, Nyström) | **certified** for `symplectic_euler` and `verlet`, on separable `H = T(p) + V(q, u, t)` only — conventions [C-8.4](#c-8), certification cases and evidence [C-14.5](#c-14). Outside that domain the solve refuses; it does not integrate approximately. Compositions (Blanes–Moan) are **not** certified |
 
 `OBSERVED` — each certified method above is exercised, on the
 [C-14](#c-14-the-certification-test-population) population, by:
@@ -549,7 +549,7 @@ because the first version of the population checked it only through accuracy.
 The SDIRK solver's zero test was made exact for uniformity but is not injected,
 because it is unreachable: the SDIRK class requires a nonzero diagonal.
 
-### C-8.4 Partitioned methods — `APPROVED`, unimplemented
+### C-8.4 Partitioned methods — `APPROVED`, implemented
 
 C-8.1 applies one coefficient array `A` to the whole state, as `A ⊗ I`. A
 **partitioned** method applies a *different* array to each of two complementary
@@ -557,11 +557,11 @@ state blocks. This is not expressible under C-8.2 and is not a matter of adding
 history: carrying more external values generalises the state representation,
 never the component dependence of the coefficients.
 
-Nothing below is certified. C-6.1 lists this family as **not supported**. No
-representation exists — there is no partitioned method object to construct, so
-nothing can reach `GLMOptimizer` to be refused; C-6.2's last bullet would refuse
-one if there were. This clause fixes the conventions a milestone would have to
-implement, so that the mathematics is settled before any code claims it.
+`symplectic_euler` and `verlet` implement this clause and are certified on the
+separable domain below; [C-6.1](#c-6) records that, and [C-14.5](#c-14) holds
+the evidence. Compositions such as Blanes–Moan are not certified. This clause
+fixes the conventions, and the mathematics was settled before any code claimed
+it.
 
 **Domain.** The equations below are written for a general two-block
 partition, but the milestone they govern is deliberately narrower: two
@@ -639,6 +639,42 @@ a fixed point. **It does not generalise without the exchange made explicit.**
 The displayed `D⁻¹` form assumes common, nonzero weights. It is a statement
 about tableau algebra and carries no claim about stage-time sampling; C-14.4 is
 a separate result under its own hypotheses and is not extended by this clause.
+
+**The domain is a hypothesis, so it is checked, and on the values used.** The
+partitioned sweeps do not integrate the coupling blocks inaccurately; they
+**drop** them by construction. A problem outside the separable domain is
+therefore refused during the solve, per [C-7](#c-7), rather than answered. Two
+independent checks do it, and neither implies the other:
+
+1. *Every `f` consumed mid-substitution must survive completion unchanged.*
+   Each value used before the whole stage vector was known is compared, by
+   exact equality, with the same `f` re-evaluated at the completed stage. A
+   tolerance would admit a problem that genuinely depends on the missing half
+   by a small amount, which is a different discrete problem and not a rounding
+   difference.
+2. *`F` block anti-diagonal and `G^q = 0`, on exact zeros.* Asserted on the
+   Jacobians the step computed with, following [C-8.3](#c-8)'s treatment of
+   structure everywhere else.
+
+Both are needed. Under symplectic Euler no `f^q` is consumed mid-substitution
+at all — its `A^q` row is empty — so an `f^q` that depends on `q` is caught
+only by (2); under Verlet the same violation is caught by (1). An `f^q` that
+depends on `u` changes no value, since `u` is known before any stage is, and is
+caught only by (2).
+
+The unwritten halves are filled with `NaN`, not zero, and that choice is
+load-bearing rather than defensive. Quadratic drag `f^p = -V'(q) - k p²` is
+non-separable, but `F^pp = -2kp` vanishes where the momentum does, so (2) is
+blind there; and if the fill makes the stage momentum exactly zero, the two
+evaluations in (1) agree bit for bit, so (1) is blind too. `NaN` never compares
+equal, so (1) refuses regardless of the arithmetic. The witness is in
+`tests/test_partitioned_methods.py`.
+
+Check (1) costs a second evaluation of `f` at every stage. That is accepted
+under [C-1](#c-1): this is a reference implementation, and a silent wrong answer
+on a problem the caller believed was separable costs more than the evaluations
+do. A port may drop the check only by taking on the obligation to establish the
+domain another way.
 
 **Relation to the [C-18](#c-18) plan.** This clause partitions coefficients by
 state *component*, within a step. A plan selects a method by *step*. The axes
@@ -1005,9 +1041,9 @@ Recorded under C-1. A port that changes any of these produces different numbers:
     because the property is the sharpest available check *on* that indexing,
     and a port that reinvents the recursion should reproduce the anchor rather
     than trust a duality test.
-11. **The partitioned adjoint stays division-free** — [C-8.4](#c-8). Should a
-    partitioned family be built, its adjoint must be assembled by transposing
-    the stage residual, exactly as item 2 does, and never by forming the
+11. **The partitioned adjoint stays division-free** — [C-8.4](#c-8). The
+    partitioned adjoint is assembled by transposing the stage residual,
+    exactly as item 2 does, and never by forming the
     `D⁻¹ Aᵀ D` of C-8.4's conjugate exchange. The exchange is tableau algebra
     stated for common, nonzero weights; the recursion has no such restriction,
     and a port that implements the closed form instead of the transpose
@@ -1372,19 +1408,22 @@ in the suite for the explicit, SDIRK and DIRK routes. Transposing the driver's
 own weight `Σ_j a_jk μ_j`, which `Mᵀ` does not filter, fails 15 tests in that
 module.
 
-### C-14.5 Certification cases for a partitioned family — `APPROVED`, unimplemented
+### C-14.5 Certification cases for a partitioned family — `APPROVED`, delivered
 
-Should the [C-8.4](#c-8) family be built, it must be certified on **three
-separate properties**. They fail for different reasons and a single witness
-that conflates them will pass for the wrong one.
+The [C-8.4](#c-8) family is certified on **three separate properties**. They
+fail for different reasons and a single witness that conflates them will pass
+for the wrong one.
 
-**Status of the evidence below.** The measurements recorded here are
-preliminary mathematical evidence, obtained from standalone probes against the
-closed forms and the existing certified methods. They establish the conventions
-and fix the shape of the acceptance cases. **No implementation exists, so no
-injection campaign under [C-14.2](#c-14) has been run for this family**, and
-none is expected until the milestone delivers code to inject into. Certification
-remains pending in full.
+**Status of the evidence below.** `symplectic_euler` and `verlet` are
+implemented, as `adjungo/core/partitioned.py` and
+`adjungo/solvers/partitioned.py`, and [C-6.1](#c-6) records them as certified
+on the separable domain. The three claims below are carried by
+`tests/test_partitioned_methods.py` and `tests/test_partitioned_refinement.py`.
+The measurements quoted were first obtained from standalone probes against the
+closed forms and the existing certified methods; the delivered implementation
+reproduces them, and each is recorded below with the setup needed to recheck
+it. The [C-14.2](#c-14) injection campaign has been run and is recorded at the
+end of this clause. Compositions such as Blanes–Moan remain uncertified.
 
 **The certification problem itself is built and validated.**
 `tests/prk_problems.py::ShakenLatticeTrap` is a separable Hamiltonian inside
@@ -1417,8 +1456,7 @@ the problem is not obviously stiff at a mesh of that order; it is a necessary
 screen on one trajectory at one control, not a conditioning certificate and not
 the refinement study below.
 
-That establishes the fixture, not the family. **C-6.1 is unchanged and still
-lists partitioned methods as not supported.**
+That establishes the fixture, not the family; the three claims below do that.
 
 **1. Symplecticity — structural, no mesh.** The paired condition and the
 conjugate exchange of [C-8.4](#c-8) are identities in the tableau; no mesh is
@@ -1500,6 +1538,62 @@ narrow: at 60 steps second-order Verlet is `53.6×` closer in residual amplitude
 than fourth-order `rk4`, or `2.87e+03` in the quadratic objective. That is an
 observed accuracy comparison on one coarse-mesh fixture, and it is **not**
 grounds to weaken requirement 3.
+
+**Delivered evidence.** Claims 1 and 2 are carried by
+`tests/test_partitioned_methods.py`, claim 3 by
+`tests/test_partitioned_refinement.py`.
+
+*Claim 1* is checked symbolically on the ideal coefficients, as required above.
+The stored-coefficient route is not asserted for either shipped method, because
+neither needs it: both tableaux are exactly representable in binary floating
+point, so the paired residual vanishes structurally. Blanes–Moan is the case
+that would need a C-11.3 budget, and it is not shipped.
+
+*Claim 2*, against the [C-14.1](#c-14) tier-1 reference extended to assemble
+the partitioned residual. Setup: `ShakenLatticeTrap` at
+`y₀ = (0.3, −0.2, 0.1, 0.05)`, `t ∈ [0.2, 1.1]`, `N = 5` uniform steps,
+`FullCostObjective(nx=4, nu=2, y_target=TRANSPORT_TARGET)`, controls from
+`make_controls(seed=5)`; errors relative, in the 2-norm:
+
+| method | stage values | gradient | HVP |
+|---|---|---|---|
+| `symplectic_euler` | `0.0` | `9.54e-17` | `2.67e-16` |
+| `verlet` | `4.16e-17` | `9.34e-17` | `1.34e-16` |
+
+The reference solves the whole stage system by Newton and never consults
+`dependency_order`, so its agreement is evidence about the substitution order
+and not only about the coefficients.
+
+*Claim 3* reproduces the detuned table above from the delivered implementation,
+to the digits shown. `rk4` is preasymptotic at 60 steps on this fixture — the
+`(60, 120)` pair reports an apparent order of `11.6` — so its order is measured
+on `(120, 240, 480)`. The resonant horizon is retained only as the labelled
+degeneracy check requirement 3 calls for; it asserts that Verlet sits at the
+rounding floor there (`7.47e-16`, `8.53e-16`, `6.14e-16`, orders `−0.19` and
+`0.47`) and so **no order can be measured**. It does not assert that every
+method scores near zero: `rk4` scores `6.64e-03` at 60 steps, because the
+degeneracy removes the ability to *discriminate*, not the ability to be wrong.
+
+**Injection campaign ([C-14.2](#c-14)).** Seventeen single-token defects were
+injected into `adjungo/solvers/partitioned.py`, `adjungo/core/partitioned.py`
+and the partitioned extension of `adjungo/validation/reference.py`, one at a
+time, each run under the [R-11](#r-11) protocol against the whole suite.
+**All seventeen were detected.** They covered both sweep directions, the
+transpose and the conjugate-half weighting in the adjoint, the `Γ` term, the
+tangent's control term and its `F` contraction, the `A^q`/`A^p` selector, the
+dependency graph's source array, the two tableaux, the symplectic residual and
+conjugate, the reference's coupling index, and the deletion of each domain
+check.
+
+Three of the seventeen were initially **undetected**, and two of those were
+real gaps that this clause's evidence now closes: replacing the `NaN` fill with
+`0.0`, and weakening the structural check from exact zero to a tolerance. Both
+were cured by adding witnesses — the quadratic-drag problem described in
+[C-8.4](#c-8), and coupling strengths `1e-14` and `−1.0`, the second of which
+also escapes a one-sided `> tol` comparison. The third was not a defect: adding
+the control term to the `q` half of the tangent sweep changes nothing, because
+`G^q = 0` is enforced structurally, so the added term is identically zero. It
+was replaced with dropping that term from the `p` half, which is detected.
 
 ---
 

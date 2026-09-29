@@ -61,10 +61,11 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from adjungo.core.partitioned import PartitionedMethod
+
 if TYPE_CHECKING:
-    from adjungo.core.method import GLMethod
     from adjungo.core.objective import Objective
-    from adjungo.core.plan import DiscretizationPlan
+    from adjungo.core.plan import DiscretizationPlan, StepMethod
     from adjungo.core.problem import Problem
 
 __all__ = [
@@ -115,12 +116,13 @@ class _Layout:
     """
 
     def __init__(
-        self, plan: DiscretizationPlan, nx: int, nu: int
+        self, plan: DiscretizationPlan, nx: int, nu: int, n_q: int | None = None
     ) -> None:
         self.plan = plan
         self.N = plan.N
         self.nx = nx
         self.nu = nu
+        self.n_q = n_q
 
         r_values = {m.r for m in plan.methods}
         if len(r_values) != 1:
@@ -141,11 +143,27 @@ class _Layout:
         self.nw = self.n_ext + self.n_int
         self.nctrl = self.total_stages * nu
 
+        self.coupling = tuple(
+            _stage_coupling(m, nx, n_q) for m in plan.methods
+        )
+
+    def coupling_at(self, n: int) -> NDArray:
+        """``(s, s, nx)`` diagonals of the stage-coupling operators.
+
+        Entry ``[i, j]`` is the diagonal of the operator multiplying
+        ``h f(Z_j)`` in the equation for ``Z_i``. For an ordinary tableau
+        that operator is ``A[i,j] I``, so every entry of the diagonal is the
+        same number and the elementwise products below reduce to the scalar
+        multiplications they replace. For a partitioned method it is
+        ``diag(A^q_ij I, A^p_ij I)`` and they do not (C-8.4).
+        """
+        return self.coupling[n]
+
     def s_at(self, n: int) -> int:
         """Stage count of step ``n``."""
         return self.plan.methods[n].s
 
-    def method_at(self, n: int) -> GLMethod:
+    def method_at(self, n: int) -> StepMethod:
         """Tableau executing step ``n``."""
         return self.plan.methods[n]
 
@@ -229,6 +247,42 @@ def _embed_initial(y0: NDArray, r: int, nx: int) -> NDArray:
     return Y0
 
 
+def _stage_coupling(
+    method: StepMethod, nx: int, n_q: int | None
+) -> NDArray:
+    """``(s, s, nx)``: the diagonal of each stage-coupling operator.
+
+    Writing the coupling as a diagonal operator rather than a scalar is what
+    lets one assembly serve both method kinds. It is not a generalisation for
+    its own sake: substituting ``A[i,j] I -> diag(A^q_ij I, A^p_ij I)`` is
+    exactly the definition of a partitioned method (C-8.4), and the only
+    place the two kinds differ in this module.
+    """
+    s = method.s
+    if isinstance(method, PartitionedMethod):
+        if n_q is None:
+            raise ValueError(
+                "the reference needs n_q for a partitioned method; the "
+                "partition belongs to the problem (NUMERICS.md C-8.4)."
+            )
+        if not 0 < n_q < nx:
+            raise ValueError(
+                f"n_q must lie strictly inside the state: got n_q={n_q} "
+                f"for nx={nx}."
+            )
+        out = np.empty((s, s, nx))
+        out[:, :, :n_q] = method.A_q[:, :, None]
+        out[:, :, n_q:] = method.A_p[:, :, None]
+        return out
+    return np.repeat(method.A[:, :, None], nx, axis=2)
+
+
+def _apply_coupling(coup: NDArray, f_st: NDArray) -> NDArray:
+    """``sum_j 𝒜_ij f_j`` for all ``i``, from the diagonals in ``coup``."""
+    applied: NDArray = np.einsum("ijn,jn->in", coup, f_st)
+    return applied
+
+
 def _residual(
     w: NDArray,
     u: NDArray,
@@ -246,7 +300,8 @@ def _residual(
 
     for n in range(lay.N):
         method = lay.method_at(n)
-        A, U, B, V = method.A, method.U, method.B, method.V
+        U, B, V = method.U, method.B, method.V
+        coup = lay.coupling_at(n)
         h = lay.h_at(n)
         s = lay.s_at(n)
         t_stage = _stage_times(lay, n)
@@ -260,7 +315,7 @@ def _residual(
             for k in range(lay.r):
                 res -= U[i, k] * Y[n, k]
             for j in range(s):
-                res -= h * A[i, j] * f_st[j]
+                res -= h * coup[i, j] * f_st[j]
             R[lay.idx_Z(n, i)] = res
 
         for l in range(lay.r):
@@ -303,7 +358,8 @@ def _dR_dw(F: NDArray, lay: _Layout) -> NDArray:
 
     for n in range(lay.N):
         method = lay.method_at(n)
-        A, U, B, V = method.A, method.U, method.B, method.V
+        U, B, V = method.U, method.B, method.V
+        coup = lay.coupling_at(n)
         h = lay.h_at(n)
         s = lay.s_at(n)
         Fn = lay.stage(F, n)
@@ -314,7 +370,7 @@ def _dR_dw(F: NDArray, lay: _Layout) -> NDArray:
             for k in range(lay.r):
                 Jw[row, lay.idx_Y(n, k)] += -U[i, k] * I_nx
             for j in range(s):
-                Jw[row, lay.idx_Z(n, j)] += -h * A[i, j] * Fn[j]
+                Jw[row, lay.idx_Z(n, j)] += -h * coup[i, j][:, None] * Fn[j]
 
         for l in range(lay.r):
             row = lay.idx_Y(n + 1, l)
@@ -332,14 +388,15 @@ def _dR_du(G: NDArray, lay: _Layout) -> NDArray:
     Ju = np.zeros((lay.nw, lay.nctrl))
     for n in range(lay.N):
         method = lay.method_at(n)
-        A, B = method.A, method.B
+        B = method.B
+        coup = lay.coupling_at(n)
         h = lay.h_at(n)
         s = lay.s_at(n)
         Gn = lay.stage(G, n)
         for j in range(s):
             col = lay.idx_u(n, j)
             for i in range(s):
-                Ju[lay.idx_Z(n, i), col] += -h * A[i, j] * Gn[j]
+                Ju[lay.idx_Z(n, i), col] += -h * coup[i, j][:, None] * Gn[j]
             for l in range(lay.r):
                 Ju[lay.idx_Y(n + 1, l), col] += -h * B[l, j] * Gn[j]
     return Ju
@@ -351,13 +408,13 @@ def _stage_defect(
     problem: Problem,
     u_step: NDArray,
     t_stage: NDArray,
-    A: NDArray,
+    coup: NDArray,
     h: float,
     s: int,
 ) -> float:
     """How far ``Zn`` is from satisfying one step's stage equations."""
     f_st = np.array([problem.f(Zn[j], u_step[j], t_stage[j]) for j in range(s)])
-    return float(np.max(np.abs(Zn - explicit - h * (A @ f_st))))
+    return float(np.max(np.abs(Zn - explicit - h * _apply_coupling(coup, f_st))))
 
 
 def _constant_guess(y0: NDArray, lay: _Layout) -> NDArray:
@@ -425,7 +482,8 @@ def _swept_guess(
 
     for n in range(lay.N):
         method = lay.method_at(n)
-        A, U, B, V = method.A, method.U, method.B, method.V
+        U, B, V = method.U, method.B, method.V
+        coup = lay.coupling_at(n)
         h = lay.h_at(n)
         s = lay.s_at(n)
         t_stage = _stage_times(lay, n)
@@ -435,14 +493,16 @@ def _swept_guess(
         )
 
         Zn = explicit
-        defect = _stage_defect(Zn, explicit, problem, un, t_stage, A, h, s)
+        defect = _stage_defect(
+            Zn, explicit, problem, un, t_stage, coup, h, s
+        )
         for _ in range(max_sweeps):
             f_st = np.array(
                 [problem.f(Zn[j], un[j], t_stage[j]) for j in range(s)]
             )
-            candidate = explicit + h * (A @ f_st)
+            candidate = explicit + h * _apply_coupling(coup, f_st)
             candidate_defect = _stage_defect(
-                candidate, explicit, problem, un, t_stage, A, h, s
+                candidate, explicit, problem, un, t_stage, coup, h, s
             )
             if not candidate_defect < defect:
                 break
@@ -537,7 +597,7 @@ def _initial_guess(
 def _resolve_plan(
     t_span: tuple[float, float] | None,
     N: int | None,
-    method: GLMethod | None,
+    method: StepMethod | None,
     plan: DiscretizationPlan | None,
 ) -> DiscretizationPlan:
     """Accept either an explicit plan or the uniform ``(t_span, N, method)``.
@@ -579,7 +639,7 @@ def reference_solve(
     t_span: tuple[float, float] | None = None,
     N: int | None = None,
     problem: Problem | None = None,
-    method: GLMethod | None = None,
+    method: StepMethod | None = None,
     tol: float = 1e-13,
     max_iter: int = 50,
     *,
@@ -624,7 +684,12 @@ def reference_solve(
     if problem is None:
         raise TypeError("reference_solve requires problem.")
     plan = _resolve_plan(t_span, N, method, plan)
-    lay = _Layout(plan, problem.state_dim, problem.control_dim)
+    lay = _Layout(
+        plan,
+        problem.state_dim,
+        problem.control_dim,
+        n_q=getattr(problem, "n_q", None),
+    )
     u = lay.pack_stage_input(u, "control")
     w = _initial_guess(u, y0, problem, lay)
 
@@ -693,7 +758,7 @@ def reference_gradient(
     t_span: tuple[float, float] | None = None,
     N: int | None = None,
     problem: Problem | None = None,
-    method: GLMethod | None = None,
+    method: StepMethod | None = None,
     objective: Objective | None = None,
     solution: ReferenceSolution | None = None,
     *,
@@ -718,7 +783,12 @@ def reference_gradient(
         raise TypeError("reference_gradient requires problem and objective.")
     shape_in = np.shape(u)
     plan = _resolve_plan(t_span, N, method, plan)
-    lay = _Layout(plan, problem.state_dim, problem.control_dim)
+    lay = _Layout(
+        plan,
+        problem.state_dim,
+        problem.control_dim,
+        n_q=getattr(problem, "n_q", None),
+    )
     u = lay.pack_stage_input(u, "control")
 
     sol = solution or reference_solve(y0, u, problem=problem, plan=plan)
@@ -751,14 +821,15 @@ def _lagrange_contraction(p: NDArray, lay: _Layout) -> NDArray:
     q = np.zeros((lay.total_stages, lay.nx))
     for n in range(lay.N):
         method = lay.method_at(n)
-        A, B = method.A, method.B
+        B = method.B
+        coup = lay.coupling_at(n)
         h = lay.h_at(n)
         s = lay.s_at(n)
         qn = lay.stage(q, n)
         for j in range(s):
             acc = np.zeros(lay.nx)
             for i in range(s):
-                acc += A[i, j] * p[lay.idx_Z(n, i)]
+                acc += coup[i, j] * p[lay.idx_Z(n, i)]
             for l in range(lay.r):
                 acc += B[l, j] * p[lay.idx_Y(n + 1, l)]
             qn[j] = -h * acc
@@ -782,7 +853,7 @@ def reference_hessian(
     t_span: tuple[float, float] | None = None,
     N: int | None = None,
     problem: Problem | None = None,
-    method: GLMethod | None = None,
+    method: StepMethod | None = None,
     objective: Objective | None = None,
     solution: ReferenceSolution | None = None,
     *,
@@ -815,7 +886,12 @@ def reference_hessian(
     if problem is None or objective is None:
         raise TypeError("reference_hessian requires problem and objective.")
     plan = _resolve_plan(t_span, N, method, plan)
-    lay = _Layout(plan, problem.state_dim, problem.control_dim)
+    lay = _Layout(
+        plan,
+        problem.state_dim,
+        problem.control_dim,
+        n_q=getattr(problem, "n_q", None),
+    )
     u = lay.pack_stage_input(u, "control")
     N = lay.N
 

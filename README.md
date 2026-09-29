@@ -37,6 +37,7 @@ Hessian-vector product against an independently assembled reference.
 | DIRK (`implicit_trapezoid` / Crank–Nicolson) | **certified** |
 | SDIRK (`implicit_midpoint`, `sdirk2`, `sdirk3`) | **certified** |
 | Fully implicit, dense `A` (`gauss2`) | **certified** — one coupled `(s·n)` Newton solve per step |
+| Partitioned (`symplectic_euler`, `verlet`) | **certified** — separable `H = T(p) + V(q, u, t)` only; the domain is checked on the values the step used |
 | BDF (`bdf2`, `bdf3`) | **refused** — `r > 1` has no starting procedure |
 | Adams (`adams_bashforth2`, `adams_moulton2`) | **refused** — tableau not representable |
 | IMEX / additive splitting | **refused** |
@@ -195,13 +196,15 @@ the optimizer's cache and checks nothing. See `NUMERICS.md` C-17.6.
   Jacobian). Reuse under a declared-constant Jacobian is implemented and is
   described above; what is missing is reuse where the matrix genuinely
   changes and a stale one would be used deliberately.
-- **Partitioned methods** (partitioned Runge–Kutta, Nyström), which apply a
-  different coefficient array to each of two state blocks. A GLM applies one
-  array to the whole state as `A ⊗ I`, so symplectic Euler and Störmer–Verlet
-  are not expressible — there is no partitioned method object to construct.
-  Conventions, the domain and the certification cases are `APPROVED`
-  in `NUMERICS.md` C-8.4 and C-14.5. Nothing is implemented; those clauses rule
-  how a partitioned family must be expressed and certified, not that one exists.
+- **Higher-order partitioned methods.** Symplectic Euler and Störmer–Verlet
+  are certified and described above. Compositions such as Blanes–Moan are not
+  built: their paired symplectic condition cancels arithmetically rather than
+  vanishing structurally, so it needs a stated rounding budget under
+  `NUMERICS.md` C-11.3 before it can be asserted.
+- **Non-separable Hamiltonians** under a partitioned method. `NUMERICS.md`
+  C-8.4 scopes the family to `H = T(p) + V(q, u, t)`; anything else is refused
+  during the solve rather than integrated, because the partitioned sweeps drop
+  the coupling blocks by construction.
 - Nonlinear control parametrisation, sparse operators, and checkpointing.
 - **Mesh adaptation.** Prescribed non-uniform steps and per-step methods are
   implemented and described above; what is missing is a policy that builds a

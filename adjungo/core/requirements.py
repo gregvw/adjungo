@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from adjungo.core.method import GLMethod, StageType
+from adjungo.core.plan import StepMethod
 from adjungo.core.problem import Linearity, ProblemStructure
 
 
@@ -92,7 +93,7 @@ class SolverRequirements:
 
 
 def deduce_requirements(
-    method: GLMethod,
+    method: StepMethod,
     problem: ProblemStructure,
     state_dim: int,
 ) -> SolverRequirements:
@@ -106,6 +107,34 @@ def deduce_requirements(
     """
 
     is_explicit = method.stage_type == StageType.EXPLICIT
+
+    if method.stage_type == StageType.PARTITIONED:
+        # A partitioned method that reaches here was accepted by
+        # PartitionedMethod's constructor, which refuses any pair whose
+        # dependency graph has a cycle (C-6.2). So the stage system resolves
+        # by substitution: no Newton iteration, no matrix, nothing to factor.
+        #
+        # This is *not* the same statement as StageType.EXPLICIT, which is a
+        # property of one triangular A. Symplectic Euler's A^p has a nonzero
+        # diagonal and Verlet's A^q is not triangular; neither is explicit as
+        # an array. Routing them through the branch below would be right by
+        # coincidence, and would stop being right for the first partitioned
+        # method that does need a solve.
+        return SolverRequirements(
+            needs_newton=False,
+            newton_system_size=0,
+            factorizations_per_step=0,
+            factorization_size=0,
+            can_reuse_across_stages=False,
+            can_reuse_across_steps=False,
+            store_jacobians=True,
+            store_stage_values=True,
+            trajectory_vectors_per_step=method.s + method.r,
+        )
+
+    # Every remaining branch reads the single `A` of an ordinary tableau,
+    # which is what the early return above leaves behind.
+    assert isinstance(method, GLMethod)
 
     # A stage equation is linear in its unknown exactly when f is affine in
     # the state. `state_affine` says that directly. The enum membership test

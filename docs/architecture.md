@@ -68,6 +68,13 @@ adjungo/
                        exact zeros and exact equality. An optional declared
                        stage type is checked against that structure at
                        construction (C-8.3).
+    partitioned.py     PartitionedMethod: a separate coefficient array for
+                       each half of the state, A^q and A^p, with the weights
+                       b, the abscissae c and the external stage shared
+                       (C-8.4). Derives the dependency order the stage system
+                       resolves in, and refuses a cyclic pair at construction
+                       (C-6.2). Also paired_symplectic_residual and the
+                       conjugate C(A), which exchanges the pair's members.
     requirements.py    deduce_requirements(method, structure, state_dim):
                        decides, from the declaration alone, what the solver
                        must be able to do.
@@ -89,12 +96,26 @@ adjungo/
                        not as a working seam.
 
   solvers/         one step's stage equations
-    base.py            StageSolver protocol and the per-step cache.
+    base.py            StageSolver, generic over the method kind it handles,
+                       and the per-step cache. GLMStageSolver holds the
+                       operations that read a single A; a partitioned method
+                       has none, so it is not a specialisation of it.
     explicit.py        A strictly lower triangular: forward substitution.
     dirk.py            A lower triangular: one n-by-n factorization per stage.
     sdirk.py           A lower triangular with constant diagonal: one n-by-n
                        factorization per step, shared by all stages.
     implicit.py        A dense: one (s*n)-by-(s*n) coupled Newton solve.
+    coupled.py         The coupled (s*n) system assembly and its transpose,
+                       used by implicit.py and by the second-order sweeps.
+                       Its own module only to break an import cycle.
+    partitioned.py     The two halves advanced in turn, in dependency order:
+                       no Newton iteration and nothing to factor, which is
+                       not the same statement as StageType.EXPLICIT. Carries
+                       the two domain checks C-8.4 is relied upon for, run on
+                       the values the step computed with rather than on a
+                       probe (precedent R-9): every f consumed mid-
+                       substitution must survive completion unchanged, and F
+                       must be block anti-diagonal with G^q = 0. Both exact.
     newton.py          Newton iteration with explicit convergence criteria,
                        and StageDispatchMixin, which chooses between it and
                        the affine route from requirements.needs_newton.
@@ -242,7 +263,7 @@ Stated here so that this document cannot be read as advertising.
 | Automatic differentiation of user callbacks | Not planned. The caller supplies derivatives. |
 | Additive / IMEX splitting | Tableaux retained in `methods/experimental/`; refused. |
 | `r > 1` multistep | Tableaux retained; refused. Needs a certified starting procedure. |
-| Partitioned methods (PRK, Nystrom) | Not built, and not certified. Conventions, domain, the paired symplectic condition and the conjugate exchange are `APPROVED` in `NUMERICS.md` C-8.4; certification cases in C-14.5, also `APPROVED`. Both rule how such a family must be expressed and certified; neither delivers one. No representation exists, so there is nothing to hand to `GLMOptimizer`; C-6.2 would refuse one if there were. Sequenced after the discretization plan, which is now delivered, so that stage storage was refactored once rather than twice — not because a partitioned step needs packed storage; both target methods fit the present rectangular arrays. |
+| Higher-order partitioned compositions | Not built. `symplectic_euler` and `verlet` are certified (`NUMERICS.md` C-6.1, evidence in C-14.5). Blanes–Moan is not: its paired symplectic residual cancels arithmetically rather than vanishing structurally, so asserting it needs a stated rounding budget under C-11.3, which no clause yet carries. Non-separable Hamiltonians are outside C-8.4's domain and are refused during the solve, not integrated approximately. |
 | Mesh adaptation | Not built. **Prescribed** non-uniform steps and per-step method selection *are* built, as `core/plan.py`; `NUMERICS.md` C-18's first increment covers `r = 1` families at fixed state dimension and is acceptance-tested in `tests/test_discretization_plan.py`. The C-10 stage-control layout is packed, so a plan whose stage count varies carries an ordinary control parametrization and optimizes through the SciPy adapters. What remains unbuilt is the outer **adaptation policy** that would construct a plan from a trajectory, and multistep startup, which still waits on C-Q4. One present limit, loud under C-7: `Objective.evaluate` is specified on the rectangular `(N, s, ν)` layout, which a varying-stage-count plan does not have, so such a plan needs an objective implementing `PackedObjective.evaluate_packed` to have a scalar value at all. Gradients and Hessian-vector products never needed it. |
 | Matrix-free linear algebra | Not built. `algebra/protocols.py` is the seam it would enter through; `algebra/operators.py` holds an unused `LinearOperator` sketch. |
 | Sparse linear algebra | Not built. Same seam. |

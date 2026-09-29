@@ -19,6 +19,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from adjungo.core.method import GLMethod
+from adjungo.core.partitioned import PartitionedMethod
+
+#: What a step's method may be. The two members carry different coefficients
+#: -- a partitioned tableau has no single ``A`` at all (C-8.4) -- but expose
+#: the same ``U``, ``B``, ``V``, ``c``, ``s``, ``r`` surface, which is the
+#: whole of what a plan reads. Anything that needs more than that surface
+#: belongs in the step implementation, not here (C-18.1).
+StepMethod = GLMethod | PartitionedMethod
 
 #: Tolerance basis for :func:`_check_step_sizes_match_nodes`. ``nodes[n]`` and
 #: ``nodes[n] + h_n`` are two floating-point values of the same real number,
@@ -59,7 +67,7 @@ def _check_step_sizes_match_nodes(nodes: NDArray, h: NDArray) -> None:
         )
 
 
-def _frozen_tableau(method: GLMethod) -> GLMethod:
+def _frozen_tableau(method: StepMethod) -> StepMethod:
     """A copy of ``method`` whose coefficient buffers cannot be written.
 
     A plan is the record of what was executed (C-18.2), and the trajectory it
@@ -80,7 +88,7 @@ def _frozen_tableau(method: GLMethod) -> GLMethod:
     recorded in C-15.7.
     """
     frozen = copy.copy(method)
-    for name in ("A", "U", "B", "V", "c"):
+    for name in method.coefficient_names:
         buffer = np.array(getattr(method, name), dtype=float)
         buffer.flags.writeable = False
         object.__setattr__(frozen, name, buffer)
@@ -105,7 +113,7 @@ class DiscretizationPlan:
     """
 
     nodes: NDArray
-    methods: tuple[GLMethod, ...]
+    methods: tuple[StepMethod, ...]
 
     #: Optional explicit step lengths, one per step. When omitted these are
     #: ``np.diff(nodes)``, which is the definition and what a caller-supplied
@@ -160,10 +168,10 @@ class DiscretizationPlan:
                 f"(NUMERICS.md C-18.1)."
             )
         for step, method in enumerate(methods):
-            if not isinstance(method, GLMethod):
+            if not isinstance(method, StepMethod):
                 raise TypeError(
-                    f"DiscretizationPlan.methods[{step}] must be a GLMethod, "
-                    f"got {type(method).__name__}."
+                    f"DiscretizationPlan.methods[{step}] must be a GLMethod "
+                    f"or a PartitionedMethod, got {type(method).__name__}."
                 )
             if method.r != 1:
                 raise NotImplementedError(
@@ -217,7 +225,7 @@ class DiscretizationPlan:
         # every step its own solver and silently refactorize once per step.
         # Two equal-valued but distinct objects already got separate solvers
         # before this snapshot existed, and still do.
-        snapshots: dict[int, GLMethod] = {}
+        snapshots: dict[int, StepMethod] = {}
         frozen_methods = tuple(
             snapshots.setdefault(id(m), _frozen_tableau(m)) for m in methods
         )
@@ -233,7 +241,7 @@ class DiscretizationPlan:
 
     @classmethod
     def uniform(
-        cls, t_span: tuple[float, float], N: int, method: GLMethod
+        cls, t_span: tuple[float, float], N: int, method: StepMethod
     ) -> DiscretizationPlan:
         """The degenerate plan: ``N`` equal steps of one method.
 
@@ -273,7 +281,7 @@ class DiscretizationPlan:
         """``Σ_n s_n`` -- the packed length of a stage-indexed array."""
         return int(self.stage_offsets[-1])
 
-    def method_at(self, step: int) -> GLMethod:
+    def method_at(self, step: int) -> StepMethod:
         """The method executing step ``step``."""
         return self.methods[step]
 

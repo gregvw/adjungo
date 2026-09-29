@@ -33,12 +33,12 @@ from adjungo.methods.runge_kutta import (
     rk4,
     sdirk3,
 )
-from adjungo.solvers.factory import create_stage_solver
-from adjungo.solvers.implicit import (
-    ImplicitStageSolver,
+from adjungo.solvers.coupled import (
     solve_coupled,
     solve_coupled_transposed,
 )
+from adjungo.solvers.factory import create_stage_solver
+from adjungo.solvers.implicit import ImplicitStageSolver
 from adjungo.solvers.newton import STAGE_NEWTON_TOL, StageSolveError
 from adjungo.stepping.forward import forward_solve
 from tests.problems import CoupledNonlinear

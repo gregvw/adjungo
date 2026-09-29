@@ -12,7 +12,7 @@ from adjungo.core.affine import (
 )
 from adjungo.core.method import GLMethod, StageType
 from adjungo.core.objective import Objective
-from adjungo.core.plan import DiscretizationPlan
+from adjungo.core.plan import DiscretizationPlan, StepMethod
 from adjungo.core.problem import Linearity, Problem, ProblemStructure
 from adjungo.core.requirements import (
     SolverRequirements,
@@ -25,6 +25,7 @@ from adjungo.optimization.parametrization import (
 )
 from adjungo.solvers.base import StageSolver
 from adjungo.solvers.factory import create_stage_solver
+from adjungo.solvers.partitioned import partition_of
 from adjungo.stepping.adjoint import AdjointTrajectory, adjoint_solve
 from adjungo.stepping.forward import forward_solve
 from adjungo.stepping.sensitivity import (
@@ -44,6 +45,7 @@ CERTIFIED_STAGE_TYPES = frozenset(
         StageType.DIRK,
         StageType.SDIRK,
         StageType.IMPLICIT,
+        StageType.PARTITIONED,
     }
 )
 
@@ -199,6 +201,11 @@ class GLMOptimizer:
                 requirements,
                 problem_structure,
                 y_scale=y_scale,
+                n_q=(
+                    partition_of(problem)
+                    if step_method.stage_type is StageType.PARTITIONED
+                    else None
+                ),
             )
         self.step_requirements = tuple(
             requirements_by_method[id(m)] for m in plan.methods
@@ -295,7 +302,7 @@ class GLMOptimizer:
         return next(iter(distinct.values()))
 
     @property
-    def method(self) -> GLMethod:
+    def method(self) -> StepMethod:
         """The method, when the plan executes exactly one."""
         return self._single(self.plan.methods, "method")
 

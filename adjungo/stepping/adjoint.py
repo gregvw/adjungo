@@ -75,11 +75,9 @@ def adjoint_solve(
         )
 
         # Weighted adjoint: Lambda_k = sum_j a_{jk} mu_j + sum_j b_{jk} lambda_j
-        for k in range(method.s):
-            W_step[k] = (
-                method.A[:, k] @ Mu_step +          # sum_j a_{jk} mu_j
-                method.B[:, k] @ Lambda[step + 1]   # sum_j b_{jk} lambda_j
-            )
+        W_step[...] = solvers[step].weighted_adjoint(
+            Mu_step, Lambda[step + 1], method
+        )
 
         # Update: lambda^n = U^T mu^n + V^T lambda^{n+1} + dJ/dy^[n]
         Lambda[step] = (

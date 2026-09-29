@@ -5,10 +5,10 @@ from numpy.typing import NDArray
 
 from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
-from adjungo.solvers.base import StageSolver, StepCache
+from adjungo.solvers.base import GLMStageSolver, StepCache
 
 
-class ExplicitStageSolver(StageSolver):
+class ExplicitStageSolver(GLMStageSolver):
     """Forward substitution for strictly lower triangular A."""
 
     def __init__(self) -> None:
