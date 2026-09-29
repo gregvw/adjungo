@@ -1,6 +1,7 @@
 """Base stage solver interface."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -109,3 +110,35 @@ class StageSolver(ABC):
             μ: Stage adjoints (s, n)
         """
         ...
+
+
+def step_solvers(
+    stage_solver: "StageSolver | Sequence[StageSolver]", n_steps: int
+) -> tuple["StageSolver", ...]:
+    """Normalize a solver argument to one solver per step (C-18.1).
+
+    A plan may execute a different method at each step, and the route that
+    solves a step's stage equations is a property of that step's method, so
+    the stepping code indexes solvers by step. A single solver is broadcast,
+    which is what every uniform plan supplies.
+
+    Broadcasting is *not* the same as accepting a length mismatch: a sequence
+    of the wrong length is refused rather than cycled or truncated, because
+    either would silently execute a step with the route belonging to a
+    different method.
+    """
+    if isinstance(stage_solver, StageSolver):
+        return (stage_solver,) * n_steps
+    solvers = tuple(stage_solver)
+    if len(solvers) != n_steps:
+        raise ValueError(
+            f"expected one stage solver per step ({n_steps}), got "
+            f"{len(solvers)} (NUMERICS.md C-18.1)."
+        )
+    for step, solver in enumerate(solvers):
+        if not isinstance(solver, StageSolver):
+            raise TypeError(
+                f"stage_solver[{step}] must be a StageSolver, got "
+                f"{type(solver).__name__}."
+            )
+    return solvers

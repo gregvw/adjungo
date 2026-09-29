@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 
 from adjungo.core.method import StageType
+from adjungo.core.plan import DiscretizationPlan
 from adjungo.methods.runge_kutta import (
     explicit_euler,
     gauss2,
@@ -193,7 +194,7 @@ def test_reference_forward_reproduces_package_forward(method_factory):
     solver = GLMOptimizer(
         problem, objective, method, t_span, N, y0
     ).stage_solver
-    traj = forward_solve(y0, u, t_span, N, problem, method, solver)
+    traj = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
     ref = reference_solve(y0, u, t_span, N, problem, method)
 
     tol = certified_rtol(method)
@@ -392,8 +393,7 @@ def test_tangent_adjoint_duality(method_factory):
     opt._ensure_forward(u)
     traj = opt._trajectory
     sens = forward_sensitivity(
-        traj, v, method, opt.stage_solver, problem, opt.h
-    )
+        traj, v, opt.stage_solver, problem)
 
     from_tangent = float(
         np.sum(objective.dJ_dy_terminal(traj.Y[N]) * sens.delta_Y[N])

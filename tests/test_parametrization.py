@@ -31,14 +31,26 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from adjungo.methods.runge_kutta import explicit_euler, heun, rk4
+from adjungo.core.plan import DiscretizationPlan
+from adjungo.methods.runge_kutta import (
+    explicit_euler,
+    heun,
+    implicit_midpoint,
+    rk4,
+)
 from adjungo.optimization.interface import GLMOptimizer
 from adjungo.optimization.parametrization import (
+    AffineControlParametrization,
     NodalControl,
     PiecewiseConstantControl,
 )
 from adjungo.validation import reference_gradient, reference_hessian
-from tests.problems import CoupledNonlinear, FullCostObjective
+from tests.problems import (
+    AnchorObjective,
+    CoupledNonlinear,
+    FullCostObjective,
+    ScalarAnchor,
+)
 
 T_SPAN = (0.0, 0.4)
 N_STEPS = 5
@@ -426,3 +438,150 @@ def test_no_parametrization_is_the_identity():
         hessp(u.ravel(), v),
         optimizer.hessian_vector_product(u, v.reshape(u.shape)).ravel(),
     )
+
+
+# ---------------------------------------------------------------------------
+# The affine offset
+# ---------------------------------------------------------------------------
+
+
+class ShiftedControl(AffineControlParametrization):
+    """``u[n, i, :] = θ[n, :] + 1``: the smallest map with ``q ≠ 0``.
+
+    Both shipped parametrizations have ``q = 0``, so every test above holds
+    equally well for a map that confuses ``P θ + q`` with ``P θ``. This one
+    does not. It is deliberately minimal — the offset is the only thing that
+    distinguishes it from :class:`PiecewiseConstantControl`.
+    """
+
+    def __init__(self, n_steps: int, stage_counts, control_dim: int) -> None:
+        super().__init__(n_steps, stage_counts, control_dim)
+
+    @property
+    def parameter_shape(self) -> tuple[int, ...]:
+        return (self.n_steps, self.control_dim)
+
+    def _expand_packed(self, theta):
+        arr = self._check_parameter_shape(theta)
+        return np.repeat(arr, self.stage_counts, axis=0) + 1.0
+
+    def _push_packed(self, v):
+        return np.repeat(self._check_parameter_shape(v), self.stage_counts, 0)
+
+    def _pullback_packed(self, g):
+        return np.add.reduceat(g, self.stage_offsets[:-1], axis=0)
+
+
+def test_the_offset_moves_the_point_and_not_the_direction():
+    """``push`` is ``P v``, never ``P v + q``.
+
+    ``expand`` and ``push`` differ by exactly ``q`` for this map, which is
+    the whole content of C-10.2's distinction between the two.
+    """
+    par = ShiftedControl(3, [2, 2, 2], 2)
+    v = np.arange(6, dtype=float).reshape(3, 2)
+
+    assert np.allclose(par.push(v), par.expand(v) - 1.0)
+    # P is the difference of expand at two points: the offset cancels.
+    assert np.allclose(par.push(v), par.expand(v) - par.expand(np.zeros((3, 2))))
+    assert np.allclose(par.matrix() @ v.ravel(), par.push(v).ravel())
+
+
+def test_an_offset_map_returns_the_exact_hessian_on_the_scalar_anchor():
+    """Closed form, so the failure is not a matter of tolerance.
+
+    On ``y' = u``, ``y(0) = 0``, one explicit Euler step of length one and
+    ``J = y(1)²/2``, the objective in ``θ`` is ``(θ + 1)²/2``. Its gradient
+    is ``θ + 1`` and its Hessian is the identity, whatever ``θ`` is.
+
+    A ``push`` that carried the offset would return ``v + 1`` where ``P v``
+    is wanted, giving ``H·0 = 1`` and ``H·2 = 3`` instead of ``0`` and
+    ``2``. The gradient is unaffected — only the curvature path pushes a
+    direction — so nothing else in this file could see it.
+    """
+    plan = DiscretizationPlan.uniform((0.0, 1.0), 1, explicit_euler())
+    optimizer = GLMOptimizer(
+        ScalarAnchor(), AnchorObjective(), y0=np.zeros((1, 1)), plan=plan
+    )
+    par = ShiftedControl(1, [1], 1)
+    fun, jac = optimizer.scipy_interface(parametrization=par)
+    hessp = optimizer.scipy_hessp(parametrization=par)
+
+    for theta in (0.0, -1.0, 0.75):
+        th = np.array([theta])
+        assert fun(th) == pytest.approx(0.5 * (theta + 1.0) ** 2, rel=1e-14)
+        assert jac(th)[0] == pytest.approx(theta + 1.0, rel=1e-14, abs=1e-15)
+        for v in (0.0, 2.0, -1.5):
+            assert hessp(th, np.array([v]))[0] == pytest.approx(
+                v, rel=1e-14, abs=1e-15
+            )
+
+
+def test_a_map_must_declare_its_linear_part():
+    """No default: the wrong one is silent, and only on offset maps.
+
+    A subclass that supplies ``_expand_packed`` and ``_pullback_packed`` but
+    not ``_push_packed`` must not be constructible, rather than inheriting
+    ``expand`` and being right only by accident of ``q = 0``.
+    """
+
+    class NoPush(AffineControlParametrization):
+        @property
+        def parameter_shape(self) -> tuple[int, ...]:
+            return (self.n_steps, self.control_dim)
+
+        def _expand_packed(self, theta):
+            arr = self._check_parameter_shape(theta)
+            return np.repeat(arr, self.stage_counts, axis=0) + 1.0
+
+        def _pullback_packed(self, g):
+            return np.add.reduceat(g, self.stage_offsets[:-1], axis=0)
+
+    with pytest.raises(TypeError, match="_push_packed"):
+        NoPush(1, [1], 1)
+
+
+# ---------------------------------------------------------------------------
+# Abscissa ownership
+# ---------------------------------------------------------------------------
+
+
+def test_the_callers_abscissa_array_is_copied_not_aliased():
+    """An ordinary write to the caller's own array must not reach the map.
+
+    ``np.asarray(c).ravel()`` may return a view; freezing a view leaves its
+    owner writable. The interpolation weights are built once by a copying
+    ``np.stack``, so an aliased declaration and the weights can drift apart
+    — and the optimizer's abscissa check reads the declaration, so it would
+    accept the result.
+    """
+    c = np.array([0.0])
+    par = NodalControl(n_steps=1, control_dim=1, c=c)
+
+    c[0] = 0.5
+    assert par.stage_abscissae[0][0] == 0.0
+    assert np.array_equal(par.expand(np.array([[0.0], [1.0]])).ravel(), [0.0])
+
+    # The declaration and the weights still agree, so the gate can do its job.
+    plan = DiscretizationPlan.uniform((0.0, 1.0), 1, implicit_midpoint())
+    optimizer = GLMOptimizer(
+        ScalarAnchor(), AnchorObjective(), y0=np.zeros((1, 1)), plan=plan
+    )
+    with pytest.raises(ValueError, match="abscissae"):
+        optimizer.scipy_interface(parametrization=par)
+
+    # And the map the plan does declare gives the closed-form value:
+    # u = ½·0 + ½·1, J = u²/2.
+    fun, _ = optimizer.scipy_interface(
+        parametrization=NodalControl.from_plan(plan, 1)
+    )
+    assert fun(np.array([0.0, 1.0])) == pytest.approx(0.125, rel=1e-14)
+
+
+def test_the_plans_own_abscissae_are_not_captured_by_reference_either():
+    """``from_plan`` must not give the map a window into the plan."""
+    plan = DiscretizationPlan.uniform((0.0, 1.0), 2, implicit_midpoint())
+    par = NodalControl.from_plan(plan, 1)
+    for row in par.stage_abscissae:
+        assert not row.flags.writeable
+        assert not np.shares_memory(row, plan.methods[0].c)

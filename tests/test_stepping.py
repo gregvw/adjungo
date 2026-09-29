@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from adjungo.core.plan import DiscretizationPlan
 from adjungo.methods.runge_kutta import explicit_euler, rk4
 from adjungo.solvers.explicit import ExplicitStageSolver
 from adjungo.stepping.adjoint import adjoint_solve
@@ -69,11 +70,14 @@ def test_forward_solve_explicit_euler():
     t_span = (0.0, 1.0)
     N = 10
 
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
 
     assert isinstance(trajectory, Trajectory)
     assert trajectory.Y.shape == (11, 1, 2)  # N+1, r, n
-    assert trajectory.Z.shape == (10, 1, 2)  # N, s, n
+    # Stage storage is packed as (sum_n s_n, n) per C-18.5; for a plan with
+    # one stage count throughout it is also viewable as (N, s, n).
+    assert trajectory.Z.shape == (10, 2)
+    assert trajectory.Z_rect.shape == (10, 1, 2)  # N, s, n
     assert len(trajectory.caches) == 10
     assert trajectory.N == 10
 
@@ -89,10 +93,11 @@ def test_forward_solve_rk4():
     t_span = (0.0, 1.0)
     N = 10
 
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
 
     assert trajectory.Y.shape == (11, 1, 2)
-    assert trajectory.Z.shape == (10, 4, 2)  # 4 stages per step
+    assert trajectory.Z.shape == (40, 2)  # 10 steps x 4 stages, packed
+    assert trajectory.Z_rect.shape == (10, 4, 2)  # 4 stages per step
     assert trajectory.N == 10
 
 
@@ -108,8 +113,8 @@ def test_forward_solve_with_nonzero_control():
     t_span = (0.0, 1.0)
     N = 10
 
-    traj_zero = forward_solve(y0, u_zero, t_span, N, problem, method, solver)
-    traj_nonzero = forward_solve(y0, u_nonzero, t_span, N, problem, method, solver)
+    traj_zero = forward_solve(y0, u_zero, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
+    traj_nonzero = forward_solve(y0, u_nonzero, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
 
     # Trajectories should be different
     assert not np.allclose(traj_zero.Y, traj_nonzero.Y)
@@ -126,15 +131,14 @@ def test_adjoint_solve_basic():
     t_span = (0.0, 1.0)
     N = 10
 
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
     objective = QuadraticObjective(y_target=np.array([0.0, 0.0]))
 
-    h = (t_span[1] - t_span[0]) / N
-    adjoint = adjoint_solve(trajectory, objective, method, solver, h)
+    adjoint = adjoint_solve(trajectory, objective, solver)
 
     assert adjoint.Lambda.shape == (11, 1, 2)  # N+1, r, n
-    assert adjoint.Mu.shape == (10, 4, 2)  # N, s, n
-    assert adjoint.WeightedAdj.shape == (10, 4, 2)  # N, s, n
+    assert adjoint.Mu.shape == (40, 2)  # packed (sum_n s_n, n)
+    assert adjoint.WeightedAdj.shape == (40, 2)  # packed
 
 
 def test_adjoint_zero_terminal_condition():
@@ -148,7 +152,7 @@ def test_adjoint_zero_terminal_condition():
     t_span = (0.0, 1.0)
     N = 5
 
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
 
     # Objective with zero terminal gradient
     class ZeroTerminalObjective:
@@ -159,8 +163,7 @@ def test_adjoint_zero_terminal_condition():
             return np.zeros_like(y)
 
     objective = ZeroTerminalObjective()
-    h = (t_span[1] - t_span[0]) / N
-    adjoint = adjoint_solve(trajectory, objective, method, solver, h)
+    adjoint = adjoint_solve(trajectory, objective, solver)
 
     # With zero terminal condition and no running cost, adjoints should be zero
     assert np.allclose(adjoint.Lambda, 0.0)
@@ -178,7 +181,7 @@ def test_trajectory_properties():
     t_span = (0.0, 1.0)
     N = 10
 
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
 
     assert trajectory.N == 10
     assert trajectory.n == 2
@@ -201,7 +204,7 @@ def test_forward_solve_callable_control():
     t_span = (0.0, 1.0)
     N = 10
 
-    trajectory = forward_solve(y0, u_func, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u_func, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
 
     assert trajectory.Y.shape == (11, 1, 2)
     # State should be affected by sinusoidal control
@@ -219,17 +222,19 @@ def test_weighted_adjoint_computation():
     t_span = (0.0, 1.0)
     N = 5
 
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
     objective = QuadraticObjective(y_target=np.array([0.0, 0.0]))
 
-    h = (t_span[1] - t_span[0]) / N
-    adjoint = adjoint_solve(trajectory, objective, method, solver, h)
+    adjoint = adjoint_solve(trajectory, objective, solver)
+    plan = trajectory.plan
 
     # Verify weighted adjoint formula: Λ_k = Σ_j a_{jk} μ_j + Σ_j b_{jk} λ_j
     for step in range(N):
+        Mu_step = plan.stages(adjoint.Mu, step)
+        W_step = plan.stages(adjoint.WeightedAdj, step)
         for k in range(method.s):
             expected = (
-                method.A[:, k] @ adjoint.Mu[step]
+                method.A[:, k] @ Mu_step
                 + method.B[:, k] @ adjoint.Lambda[step + 1]
             )
-            assert np.allclose(adjoint.WeightedAdj[step, k], expected)
+            assert np.allclose(W_step[k], expected)

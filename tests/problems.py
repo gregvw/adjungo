@@ -293,6 +293,27 @@ class FullCostObjective:
                 total += 0.5 * float(u[n, k] @ self.R @ u[n, k])
         return total
 
+    def evaluate_packed(self, trajectory, u: NDArray) -> float:
+        """The same sum with the stage controls packed (C-18.5).
+
+        The control term sums over every stage of every step with one weight
+        ``R``, so it does not care where a step's stages begin -- which is
+        exactly why the packed loop is written over ``trajectory.plan``
+        rather than over ``u`` alone. An objective whose stage weights differ
+        between steps would need the block structure, and would get it the
+        same way.
+        """
+        Y = trajectory.Y
+        N = Y.shape[0] - 1
+        d = Y[N, 0] - self.y_target
+        total = 0.5 * float(d @ self.Q_T @ d)
+        for n in range(N):
+            total += 0.5 * float(Y[n, 0] @ self.Q @ Y[n, 0])
+        for n in range(N):
+            for row in trajectory.plan.stages(u, n):
+                total += 0.5 * float(row @ self.R @ row)
+        return total
+
     def dJ_dy_terminal(self, y_final: NDArray) -> NDArray:
         out = np.zeros_like(np.asarray(y_final, dtype=float))
         out[0] = self.Q_T @ (np.asarray(y_final)[0] - self.y_target)

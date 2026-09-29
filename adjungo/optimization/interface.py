@@ -1,6 +1,7 @@
 """Optimization interface for external optimizers."""
 
 from collections.abc import Callable
+from typing import TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -11,13 +12,18 @@ from adjungo.core.affine import (
 )
 from adjungo.core.method import GLMethod, StageType
 from adjungo.core.objective import Objective
+from adjungo.core.plan import DiscretizationPlan
 from adjungo.core.problem import Linearity, Problem, ProblemStructure
-from adjungo.core.requirements import deduce_requirements
+from adjungo.core.requirements import (
+    SolverRequirements,
+    deduce_requirements,
+)
 from adjungo.optimization.gradient import assemble_gradient
 from adjungo.optimization.hessian import assemble_hessian_vector_product
 from adjungo.optimization.parametrization import (
     AffineControlParametrization,
 )
+from adjungo.solvers.base import StageSolver
 from adjungo.solvers.factory import create_stage_solver
 from adjungo.stepping.adjoint import AdjointTrajectory, adjoint_solve
 from adjungo.stepping.forward import forward_solve
@@ -26,6 +32,8 @@ from adjungo.stepping.sensitivity import (
     forward_sensitivity,
 )
 from adjungo.stepping.trajectory import Trajectory
+
+_T = TypeVar("_T")
 
 #: Method families certified by a completed milestone (NUMERICS.md C-6.1).
 #: Adding an entry here is a certification claim and requires the milestone's
@@ -40,37 +48,34 @@ CERTIFIED_STAGE_TYPES = frozenset(
 )
 
 
-def _enforce_envelope(
-    method: GLMethod, t_span: tuple[float, float], N: int
-) -> None:
+def _enforce_envelope(plan: DiscretizationPlan) -> None:
     """Refuse unsupported configurations at construction (C-6.2, C-12).
 
     These are hard guards with no override. Proceeding into an uncertified path
     and reporting a plausible-looking number is the failure mode this contract
     exists to prevent.
+
+    Every method in the plan is checked, not just the first. A plan is a
+    sequence of independent method choices (C-18.1), so a single uncertified
+    step anywhere in it puts the whole solve outside the envelope.
+
+    Mesh validity and ``r > 1`` are **not** checked here. A plan cannot be
+    built that violates them: :class:`DiscretizationPlan` refuses a
+    degenerate mesh and a multistep method in its own constructor, which is
+    the earlier and more complete boundary because it also covers callers
+    who reach ``forward_solve`` without an optimizer. Repeating those checks
+    here would add branches no test can reach.
     """
-    if N < 1:
-        raise ValueError(f"N must be at least 1, got {N} (NUMERICS.md C-12).")
-
-    if t_span[1] == t_span[0]:
-        raise ValueError(
-            f"t_span must have nonzero extent, got {t_span} (NUMERICS.md C-12)."
-        )
-
-    if method.r > 1:
-        raise NotImplementedError(
-            f"Methods with r > 1 external stages are not supported (got "
-            f"r={method.r}). Adjungo has no starting procedure for multistep "
-            f"methods; see NUMERICS.md C-6.2 and open question C-Q4."
-        )
-
-    if method.stage_type not in CERTIFIED_STAGE_TYPES:
-        raise NotImplementedError(
-            f"Method family {method.stage_type.name} is not certified "
-            f"(NUMERICS.md C-6.1). A dense stage matrix A requires a coupled "
-            f"Newton solve, scheduled for milestone M3. Certified families: "
-            f"{', '.join(sorted(t.name for t in CERTIFIED_STAGE_TYPES))}."
-        )
+    for step, method in enumerate(plan.methods):
+        where = "" if plan.N == 1 else f" at step {step}"
+        if method.stage_type not in CERTIFIED_STAGE_TYPES:
+            raise NotImplementedError(
+                f"Method family {method.stage_type.name} is not certified"
+                f"{where} (NUMERICS.md C-6.1). A dense stage matrix A requires "
+                f"a coupled Newton solve, scheduled for milestone M3. "
+                f"Certified families: "
+                f"{', '.join(sorted(t.name for t in CERTIFIED_STAGE_TYPES))}."
+            )
 
 
 
@@ -83,34 +88,73 @@ class GLMOptimizer:
         self,
         problem: Problem,
         objective: Objective,
-        method: GLMethod,
-        t_span: tuple[float, float],
-        N: int,
-        y0: NDArray,
+        method: GLMethod | None = None,
+        t_span: tuple[float, float] | None = None,
+        N: int | None = None,
+        y0: NDArray | None = None,
         problem_structure: ProblemStructure | None = None,
+        *,
+        plan: DiscretizationPlan | None = None,
     ):
         """
         Initialize GLM optimizer.
 
+        The discretization is either given directly as a
+        :class:`DiscretizationPlan`, or built from the uniform single-method
+        arguments, which remain the convenience form for the common case
+        (C-18.1). Supplying both is refused rather than resolved by
+        precedence: a caller who passes a plan *and* an ``N`` has two
+        different meshes in mind, and silently honouring one of them would
+        return the exact derivatives of a discrete objective the caller did
+        not ask for.
+
         Args:
             problem: Problem specification
             objective: Objective function
-            method: GLM tableau
-            t_span: Time interval (t0, tf)
-            N: Number of time steps
+            method: GLM tableau (uniform form)
+            t_span: Time interval (t0, tf) (uniform form)
+            N: Number of time steps (uniform form)
             y0: Initial state
             problem_structure: Optional problem structure (deduced if not provided)
+            plan: Explicit discretization plan, in place of (method, t_span, N)
         """
+        uniform_args = (method, t_span, N)
+        if plan is None:
+            missing = [
+                name
+                for name, value in zip(
+                    ("method", "t_span", "N"), uniform_args, strict=True
+                )
+                if value is None
+            ]
+            if missing:
+                raise TypeError(
+                    f"GLMOptimizer needs either plan= or all of method, "
+                    f"t_span, N; missing {', '.join(missing)}."
+                )
+            assert method is not None and t_span is not None and N is not None
+            plan = DiscretizationPlan.uniform(t_span, N, method)
+        elif any(value is not None for value in uniform_args):
+            supplied = [
+                name
+                for name, value in zip(
+                    ("method", "t_span", "N"), uniform_args, strict=True
+                )
+                if value is not None
+            ]
+            raise TypeError(
+                f"GLMOptimizer takes either plan= or (method, t_span, N), not "
+                f"both; got plan= together with {', '.join(supplied)}."
+            )
+        if y0 is None:
+            raise TypeError("GLMOptimizer requires y0.")
+
         self.problem = problem
         self.objective = objective
-        self.method = method
-        self.t_span = t_span
-        self.N = N
+        self._plan = plan
         self.y0 = y0
 
-        _enforce_envelope(method, t_span, N)
-
-        self.h = (t_span[1] - t_span[0]) / N
+        _enforce_envelope(plan)
 
         # Coefficient validity is a property of the problem, not of the route,
         # so it is answered here rather than inside the deduction below. A
@@ -133,21 +177,197 @@ class GLMOptimizer:
         #: skipped rather than computed as additions of zero.
         self.problem_structure = problem_structure
 
-        # Deduce requirements and create appropriate solver
-        self.requirements = deduce_requirements(
-            method, problem_structure, problem.state_dim
+        # One route per step. The route is decided by the step's method
+        # (C-18.1), so a plan that changes method mid-solve changes route with
+        # it. Distinct methods are keyed by identity rather than by value:
+        # GLMethod holds ndarrays, so ``==`` is not a usable key, and two
+        # equal-valued tableaux getting separate solvers costs only
+        # construction.
+        y_scale = max(float(np.max(np.abs(self.y0))), 1.0)
+        requirements_by_method: dict[int, SolverRequirements] = {}
+        solvers_by_method: dict[int, StageSolver] = {}
+        for step_method in plan.methods:
+            key = id(step_method)
+            if key in solvers_by_method:
+                continue
+            requirements = deduce_requirements(
+                step_method, problem_structure, problem.state_dim
+            )
+            requirements_by_method[key] = requirements
+            solvers_by_method[key] = create_stage_solver(
+                step_method,
+                requirements,
+                problem_structure,
+                y_scale=y_scale,
+            )
+        self.step_requirements = tuple(
+            requirements_by_method[id(m)] for m in plan.methods
         )
-        self.stage_solver = create_stage_solver(
-            method,
-            self.requirements,
-            problem_structure,
-            y_scale=max(float(np.max(np.abs(self.y0))), 1.0),
+        #: One stage solver per step; shared objects when a method repeats.
+        self.stage_solvers = tuple(
+            solvers_by_method[id(m)] for m in plan.methods
         )
 
         # Cached trajectory (invalidated when u changes)
         self._trajectory: Trajectory | None = None
         self._adjoint: AdjointTrajectory | None = None
         self._u_cached: NDArray | None = None
+
+    @property
+    def plan(self) -> DiscretizationPlan:
+        """The discretization this optimizer differentiates.
+
+        Read-only. C-18.2 requires the backward calculation to differentiate
+        the objective the forward sweep executed, and almost everything this
+        object holds is derived from the plan: the cached trajectory and
+        adjoint, the per-step stage solvers and their C-15.1 factorization
+        stores, and the per-step ``SolverRequirements``. Rebinding the
+        attribute changes none of them.
+
+        Measured before this was refused, on ``y' = u``, ``J = y(1)²/2`` with
+        two Euler steps and stage controls ``(1, 3)``: moving the interior
+        node from ``½`` to ``¼`` and re-evaluating at the *same* controls
+        returned the previous plan's ``J = 2.0`` instead of ``3.125``,
+        because the cache compares controls only. The gradient and
+        Hessian-vector product were stale with it.
+
+        Use :meth:`with_plan` to change discretization. Rebuilding is the
+        honest cost: a setter would have to rebuild the solvers and discard
+        every cache, which is the constructor.
+        """
+        return self._plan
+
+    @plan.setter
+    def plan(self, value: DiscretizationPlan) -> None:
+        raise AttributeError(
+            "GLMOptimizer.plan is read-only. Rebinding it would leave the "
+            "cached trajectory, adjoint, stage solvers and factorization "
+            "stores describing the previous discretization, and those are "
+            "keyed on the controls alone -- a re-evaluation at unchanged "
+            "controls would return the old plan's answer. Use "
+            "optimizer.with_plan(new_plan) (NUMERICS.md C-18.2)."
+        )
+
+    def with_plan(
+        self, plan: DiscretizationPlan, **overrides: object
+    ) -> "GLMOptimizer":
+        """A new optimizer for ``plan``, over the same problem and objective.
+
+        This is the supported way to re-discretize: an adaptation policy
+        producing ``𝒟_k`` from the current trajectory hands the new plan
+        here and gets an object with no state carried over from ``𝒟_{k-1}``.
+        Control *parameters* are the caller's to transfer; stage controls are
+        not transferable in general, since a new plan may have a different
+        number of them.
+        """
+        kwargs: dict[str, object] = {
+            "problem": self.problem,
+            "objective": self.objective,
+            "y0": self.y0,
+            "problem_structure": self.problem_structure,
+        }
+        kwargs.update(overrides)
+        return type(self)(plan=plan, **kwargs)  # type: ignore[arg-type]
+
+    @property
+    def N(self) -> int:
+        """Number of steps in the plan."""
+        return self.plan.N
+
+    @property
+    def t_span(self) -> tuple[float, float]:
+        """``(t_0, t_N)`` -- the plan's first and last nodes."""
+        return self.plan.t_span
+
+    def _single(self, values: tuple[_T, ...], what: str) -> _T:
+        """The one distinct entry of a per-step tuple, or a refusal.
+
+        Returning the first step's value for a plan that does not have one
+        value would name a property of step 0 after the whole solve (C-7).
+        """
+        distinct = {id(v): v for v in values}
+        if len(distinct) != 1:
+            raise ValueError(
+                f"this optimizer's plan does not have a single {what}: it "
+                f"varies across the {self.plan.N} steps. Index the per-step "
+                f"sequence instead (NUMERICS.md C-18.1)."
+            )
+        return next(iter(distinct.values()))
+
+    @property
+    def method(self) -> GLMethod:
+        """The method, when the plan executes exactly one."""
+        return self._single(self.plan.methods, "method")
+
+    @property
+    def h(self) -> float:
+        """The step size, when every step shares it.
+
+        Equality is exact, and ``DiscretizationPlan.uniform`` gives every
+        step the identical ``h`` so that this succeeds. A caller that wants
+        a representative size for a genuinely unequal mesh is asking a
+        different question and should read ``plan.h``.
+        """
+        h = self.plan.h
+        if h.size > 1 and not bool(np.all(h == h[0])):
+            raise ValueError(
+                f"this optimizer's plan does not have a single step size: "
+                f"h ranges over [{h.min()!r}, {h.max()!r}]. Read plan.h, or "
+                f"plan.step_size(n) (NUMERICS.md C-18.1)."
+            )
+        return float(h[0])
+
+    @property
+    def stage_solver(self) -> StageSolver:
+        """The stage solver, when the plan uses exactly one."""
+        return self._single(self.stage_solvers, "stage solver")
+
+    @property
+    def requirements(self) -> SolverRequirements:
+        """The solver requirements, when the plan uses exactly one method."""
+        return self._single(self.step_requirements, "set of requirements")
+
+    def _pack(self, u: NDArray, what: str = "control") -> NDArray:
+        """Accept a rectangular ``(N, s, nu)`` or packed ``(Σ s_n, nu)`` array.
+
+        Stage-indexed storage is packed (C-18.5). A plan with one stage count
+        throughout can also be *viewed* rectangularly, and that is the shape
+        every caller predating the plan uses, so it is accepted and reshaped
+        at the boundary rather than supported by a second code path inside.
+        """
+        arr = np.asarray(u, dtype=float)
+        nu = self.problem.control_dim
+        packed = (self.plan.total_stages, nu)
+        if arr.ndim == 3:
+            s = self.plan.uniform_stage_count
+            if s is None:
+                raise ValueError(
+                    f"{what} was given as {arr.shape}, but this plan's stage "
+                    f"count varies across steps, so no rectangular shape "
+                    f"describes it. Supply the packed shape {packed} "
+                    f"(NUMERICS.md C-18.5)."
+                )
+            expected = (self.plan.N, s, nu)
+            if arr.shape != expected:
+                raise ValueError(
+                    f"{what} has shape {arr.shape}, expected {expected}."
+                )
+            return arr.reshape(packed)
+        if arr.ndim == 2:
+            if arr.shape != packed:
+                raise ValueError(
+                    f"{what} has shape {arr.shape}, expected {packed}."
+                )
+            return arr
+        raise ValueError(
+            f"{what} must be a packed ({packed[0]}, {nu}) array or, for a "
+            f"plan with one stage count, an (N, s, {nu}) array; got "
+            f"{arr.ndim} dimensions."
+        )
+
+    def _unpack_like(self, packed: NDArray, like: NDArray) -> NDArray:
+        """Return ``packed`` in the shape the caller's ``like`` array used."""
+        return packed.reshape(np.shape(like)) if np.ndim(like) == 3 else packed
 
     def _deduce_problem_structure(self) -> ProblemStructure:
         """Deduce problem structure from the problem specification.
@@ -235,18 +455,59 @@ class GLMOptimizer:
         )
 
     def objective_value(self, u: NDArray) -> float:
-        """
-        J(u) - runs forward solve if needed.
+        """``J(u)`` -- runs the forward solve if needed.
+
+        ``Objective.evaluate`` is specified on the rectangular ``(N, s, ν)``
+        stage-control layout, and a plan whose stage count varies across
+        steps has no such layout (C-18.5). On such a plan the objective is
+        asked for :meth:`~adjungo.core.objective.PackedObjective.\
+evaluate_packed` instead, which takes the packed ``(Σ_n s_n, ν)`` array and
+        reads each step's block through ``trajectory.plan.stages``.
+
+        An objective that implements neither is **refused**, not handed the
+        packed array in place of the rectangular one. That substitution would
+        not fail: the objective would index stage ``(n, k)`` out of whatever
+        step happens to lie at packed row ``n`` and return a number (C-7).
+
+        Derivatives never needed this. ``dJ_du`` and ``d2J_du2`` are called
+        one stage at a time with ``(step, stage)`` alongside, so they carry
+        no layout assumption, and ``gradient`` and ``hessian_vector_product``
+        work on any plan C-18.1 admits.
 
         Args:
-            u: Control array (N, s, ν)
+            u: Stage controls, rectangular ``(N, s, ν)`` or packed
+                ``(Σ_n s_n, ν)``
 
         Returns:
             Objective value
         """
         self._ensure_forward(u)
         assert self._trajectory is not None
-        return self.objective.evaluate(self._trajectory, u)
+        packed = self._pack(u)
+
+        s = self.plan.uniform_stage_count
+        if s is not None:
+            return self.objective.evaluate(
+                self._trajectory,
+                packed.reshape(self.N, s, self.problem.control_dim),
+            )
+
+        evaluate_packed = getattr(self.objective, "evaluate_packed", None)
+        if evaluate_packed is None:
+            raise NotImplementedError(
+                f"{type(self.objective).__name__} does not implement "
+                f"evaluate_packed, so it has no value on a plan whose stage "
+                f"count varies across steps (stage counts "
+                f"{tuple(m.s for m in self.plan.methods)}). Objective."
+                f"evaluate takes the rectangular (N, s, nu) layout, which "
+                f"does not describe this plan, and the packed array is not "
+                f"substituted for it because an objective would index it as "
+                f"if it were rectangular and return a number. Gradients and "
+                f"Hessian-vector products need nothing added: their "
+                f"objective callbacks are per-stage (NUMERICS.md C-7, "
+                f"C-18.5, C-18.7)."
+            )
+        return float(evaluate_packed(self._trajectory, packed))
 
     def trajectory(self, u: NDArray) -> Trajectory:
         """Return the forward trajectory at ``u``.
@@ -279,6 +540,7 @@ class GLMOptimizer:
             Y=self._trajectory.Y.copy(),
             Z=self._trajectory.Z.copy(),
             caches=self._trajectory.caches,
+            plan=self.plan,
         )
 
     def gradient(self, u: NDArray) -> NDArray:
@@ -294,15 +556,14 @@ class GLMOptimizer:
         self._ensure_adjoint(u)
         assert self._trajectory is not None
         assert self._adjoint is not None
-        return assemble_gradient(
+        grad = assemble_gradient(
             self._trajectory,
             self._adjoint,
-            u,
+            self._pack(u),
             self.objective,
-            self.method,
             self.problem,
-            self.h,
         )
+        return self._unpack_like(grad, u)
 
     def hessian_vector_product(self, u: NDArray, v: NDArray) -> NDArray:
         """
@@ -319,9 +580,12 @@ class GLMOptimizer:
         assert self._trajectory is not None
         assert self._adjoint is not None
 
+        u_packed = self._pack(u)
+        v_packed = self._pack(v, "direction")
+
         # Forward sensitivity: δy, δZ from δu = v
         sensitivity = forward_sensitivity(
-            self._trajectory, v, self.method, self.stage_solver, self.problem, self.h
+            self._trajectory, v_packed, self.stage_solvers, self.problem
         )
 
         # Backward adjoint sensitivity: δλ, δμ
@@ -329,31 +593,26 @@ class GLMOptimizer:
             self._trajectory,
             self._adjoint,
             sensitivity,
-            u,
-            v,
-            self.method,
-            self.stage_solver,
+            u_packed,
+            v_packed,
+            self.stage_solvers,
             self.problem,
-            self.h,
-            self.t_span[0],
             self.objective,
             structure=self.problem_structure,
         )
 
-        return assemble_hessian_vector_product(
+        hvp = assemble_hessian_vector_product(
             self._trajectory,
             self._adjoint,
             sensitivity,
             adj_sensitivity,
-            u,
-            v,
+            u_packed,
+            v_packed,
             self.objective,
-            self.method,
             self.problem,
-            self.h,
-            self.t_span[0],
             structure=self.problem_structure,
         )
+        return self._unpack_like(hvp, u)
 
     def scipy_interface(
         self,
@@ -408,7 +667,7 @@ class GLMOptimizer:
         which is the same ownership rule the stage solvers follow for
         ``y_scale``.
         """
-        shape = (self.N, self.method.s, self.problem.control_dim)
+        shape = (self.plan.total_stages, self.problem.control_dim)
 
         if parametrization is None:
             def expand(x_flat: NDArray) -> NDArray:
@@ -428,20 +687,63 @@ class GLMOptimizer:
     ) -> None:
         """Refuse a parametrization built for a different discretisation.
 
-        A map whose stage-control shape disagrees with this optimizer's
-        would otherwise fail deep inside a reshape, or -- worse, when the
-        sizes happen to coincide -- succeed while silently permuting the
-        controls.
+        Three things must agree, and shape alone establishes none of them.
+        A map whose stage-control size disagrees would otherwise fail deep
+        inside a reshape, or -- worse, when the sizes happen to coincide --
+        succeed while silently permuting the controls.
+
+        The abscissae are the addition C-18 forces. Before it there was one
+        tableau for the whole solve, so a map holding "the" abscissae could
+        not disagree with the method being integrated. A plan may now change
+        method between steps at an unchanged stage count -- ``explicit_euler``
+        and ``implicit_midpoint`` both have ``s = 1`` -- so a map built
+        against one step's ``c`` produces a correctly shaped array sampled at
+        the wrong instants. That is C-10.4's coordinate convention silently
+        violated, not a representable alternative: measured on ``y' = u``,
+        ``J = y(1)²/2`` with nodes ``(0, ½, 1)``, Euler then midpoint, and
+        ``θ = (0, ½, 1)``, it returned ``J = 0.03125`` against the plan's own
+        ``0.0703125``, with a correspondingly displaced gradient.
+
+        A map reporting :attr:`~adjungo.optimization.parametrization.\
+AffineControlParametrization.stage_abscissae` of ``None`` declares that it
+        does not sample at abscissae at all, so there is nothing to compare;
+        that is the piecewise-constant case.
         """
-        expected = (self.N, self.method.s, self.problem.control_dim)
-        if parametrization.stage_shape != expected:
+        p = parametrization
+        nu = self.problem.control_dim
+        plan_counts = tuple(m.s for m in self.plan.methods)
+        if (
+            p.n_steps != self.plan.N
+            or p.stage_counts != plan_counts
+            or p.control_dim != nu
+        ):
             raise ValueError(
-                f"{type(parametrization).__name__} produces stage controls "
-                f"of shape {parametrization.stage_shape}, but this "
-                f"optimizer integrates shape {expected} "
-                f"(N={self.N}, s={self.method.s}, "
-                f"control_dim={self.problem.control_dim})."
+                f"{type(p).__name__} produces stage controls for "
+                f"{p.n_steps} steps with stage counts {p.stage_counts} and "
+                f"control_dim {p.control_dim}, but this optimizer integrates "
+                f"{self.plan.N} steps with stage counts {plan_counts} and "
+                f"control_dim {nu}."
             )
+
+        declared = p.stage_abscissae
+        if declared is None:
+            return
+        for step, (c_map, method) in enumerate(
+            zip(declared, self.plan.methods, strict=True)
+        ):
+            # Element for element, as in C-15.1's factorization comparison.
+            # A tolerance here would accept a map sampling at instants the
+            # solver never evaluates, which is a different discrete problem
+            # rather than a rounding difference.
+            if not np.array_equal(c_map, method.c):
+                raise ValueError(
+                    f"{type(p).__name__} samples step {step} at abscissae "
+                    f"{np.asarray(c_map)}, but that step's method evaluates "
+                    f"its stages at {np.asarray(method.c)}. The control "
+                    f"would be sampled at instants the solver never visits "
+                    f"(NUMERICS.md C-10.4, C-18.4). NodalControl.from_plan "
+                    f"takes the abscissae from the plan."
+                )
 
     def scipy_hessp(
         self,
@@ -508,12 +810,10 @@ class GLMOptimizer:
         if self._trajectory is None or not self._cache_matches(u):
             self._trajectory = forward_solve(
                 self.y0,
-                u,
-                self.t_span,
-                self.N,
+                self._pack(u),
+                self.plan,
                 self.problem,
-                self.method,
-                self.stage_solver,
+                self.stage_solvers,
             )
             self._u_cached = u.copy()
             self._adjoint = None  # Invalidate adjoint
@@ -533,5 +833,5 @@ class GLMOptimizer:
         if self._adjoint is None:
             assert self._trajectory is not None
             self._adjoint = adjoint_solve(
-                self._trajectory, self.objective, self.method, self.stage_solver, self.h
+                self._trajectory, self.objective, self.stage_solvers
             )

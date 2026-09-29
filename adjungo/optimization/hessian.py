@@ -4,7 +4,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 from adjungo.core.affine import affine_dynamics_verified
-from adjungo.core.method import GLMethod
 from adjungo.core.objective import Objective
 from adjungo.core.problem import Problem, ProblemStructure
 from adjungo.stepping.adjoint import AdjointTrajectory
@@ -23,10 +22,7 @@ def assemble_hessian_vector_product(
     u: NDArray,
     delta_u: NDArray,
     objective: Objective,
-    method: GLMethod,
     problem: Problem,
-    h: float,
-    t0: float = 0.0,
     structure: "ProblemStructure | None" = None,
 ) -> NDArray:
     """
@@ -66,16 +62,13 @@ def assemble_hessian_vector_product(
         adjoint: Adjoint trajectory
         sensitivity: State sensitivity trajectory
         adj_sensitivity: Adjoint sensitivity trajectory
-        u: Control array (N, s, ν)
-        delta_u: Control perturbation (N, s, ν)
+        u: Packed stage controls ``(sum_n s_n, nu)``
+        delta_u: Packed control perturbation ``(sum_n s_n, nu)``
         objective: Objective function
-        method: GLM tableau
         problem: Problem specification
-        h: Step size
-        t0: Initial time
 
     Returns:
-        Hessian-vector product (N, s, ν)
+        Packed Hessian-vector product ``(sum_n s_n, nu)``
 
     Raises:
         NotImplementedError: If the problem lacks ``F_yu_action`` or
@@ -113,42 +106,46 @@ def assemble_hessian_vector_product(
                     f"{type(problem).__name__} does not provide it"
                 )
 
-    N, s, _nu = u.shape
+    plan = trajectory.plan
+    u = plan.pack(u, "control")
+    delta_u = plan.pack(delta_u, "delta_u")
     hvp = np.zeros_like(u)
 
-    for step in range(N):
+    for step in range(plan.N):
         cache = trajectory.caches[step]
-        Lambda_k = adjoint.WeightedAdj[step]  # Weighted adjoints
-        t_n = t0 + step * h
+        h = plan.step_size(step)
+        t_stage = plan.stage_times(step)
+        Z_step = plan.stages(trajectory.Z, step)
+        u_step = plan.stages(u, step)
+        du_step = plan.stages(delta_u, step)
+        hvp_step = plan.stages(hvp, step)
+        W_step = plan.stages(adjoint.WeightedAdj, step)
+        dW_step = plan.stages(adj_sensitivity.delta_WeightedAdj, step)
+        dZ_step = plan.stages(sensitivity.delta_Z, step)
 
-        for k in range(s):
-            z_k, u_k = trajectory.Z[step, k], u[step, k]
-            t_k = t_n + method.c[k] * h
+        for k in range(plan.s(step)):
+            z_k, u_k = Z_step[k], u_step[k]
+            t_k = t_stage[k]
 
             # J_uu δu (from objective)
-            hvp[step, k] = (
-                objective.d2J_du2(u_k, step, k) @ delta_u[step, k]
-            )
+            hvp_step[k] = objective.d2J_du2(u_k, step, k) @ du_step[k]
 
-            # +h G_k^T δΛ_k (adjoint sensitivity contribution)
-            delta_Lambda_k = adj_sensitivity.delta_WeightedAdj[step, k]
-            hvp[step, k] += h * cache.G[k].T @ delta_Lambda_k
+            # +h_n G_k^T δΛ_k (adjoint sensitivity contribution)
+            hvp_step[k] += h * cache.G[k].T @ dW_step[k]
 
             if skip_dynamics_curvature:
                 continue
 
-            # +h (F_yu[Λ_k])^T δZ_k
+            # +h_n (F_yu[Λ_k])^T δZ_k
             F_yu_Lambda = np.asarray(
-                problem.F_yu_action(z_k, u_k, t_k, Lambda_k[k])
+                problem.F_yu_action(z_k, u_k, t_k, W_step[k])
             )
-            hvp[step, k] += (
-                h * F_yu_Lambda.T @ sensitivity.delta_Z[step, k]
-            )
+            hvp_step[k] += h * F_yu_Lambda.T @ dZ_step[k]
 
-            # +h F_uu[Λ_k] δu_k
+            # +h_n F_uu[Λ_k] δu_k
             F_uu_Lambda = np.asarray(
-                problem.F_uu_action(z_k, u_k, t_k, Lambda_k[k])
+                problem.F_uu_action(z_k, u_k, t_k, W_step[k])
             )
-            hvp[step, k] += h * F_uu_Lambda @ delta_u[step, k]
+            hvp_step[k] += h * F_uu_Lambda @ du_step[k]
 
     return hvp

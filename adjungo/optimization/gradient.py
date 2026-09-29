@@ -3,7 +3,6 @@
 import numpy as np
 from numpy.typing import NDArray
 
-from adjungo.core.method import GLMethod
 from adjungo.core.objective import Objective
 from adjungo.core.problem import Problem
 from adjungo.stepping.adjoint import AdjointTrajectory
@@ -15,43 +14,51 @@ def assemble_gradient(
     adjoint: AdjointTrajectory,
     u: NDArray,
     objective: Objective,
-    method: GLMethod,
     problem: Problem,
-    h: float,
 ) -> NDArray:
     """
-    From glm_opt.tex equation for ∇_{u_k^n} Ĵ:
+    From glm_opt.tex equation for grad_{u_k^n} J:
 
-    ∇_{u_k^n} Ĵ = ∂J/∂u_k^n - h (G_k^n)^T Λ_k^n
+    grad_{u_k^n} J = dJ/du_k^n - h_n (G_k^n)^T Lambda_k^n
 
-    where Λ_k^n = Σ_i a_{ik} μ_i^n + Σ_i b_{ik} λ_i^n is the weighted adjoint.
+    where Lambda_k^n = sum_i a_{ik} mu_i^n + sum_i b_{ik} lambda_i^n is the
+    weighted adjoint.
+
+    ``h_n`` is the step's own size, read from the trajectory's plan by step
+    index (C-18.4). The plan is never re-selected here; see C-18.2.
 
     Args:
-        trajectory: Forward solution trajectory
+        trajectory: Forward solution trajectory, carrying its plan
         adjoint: Adjoint trajectory
-        u: Control array (N, s, ν)
+        u: Stage controls, packed ``(sum_n s_n, nu)`` or, when the plan has
+            one stage count throughout, rectangular ``(N, s, nu)``
         objective: Objective function
-        method: GLM tableau
         problem: Problem specification
-        h: Step size
 
     Returns:
-        Gradient array (N, s, ν)
+        The gradient, in the same shape ``u`` was supplied in. A gradient is
+        a covector on the control space, so returning it in a different
+        layout than the point it was taken at would make ``u - alpha * g``
+        silently broadcast instead of step.
     """
-    N, s, _nu = u.shape
+    plan = trajectory.plan
+    caller_shape = np.shape(u)
+    u = plan.pack(u, "control")
     grad = np.zeros_like(u)
 
-    for step in range(N):
+    for step in range(plan.N):
         cache = trajectory.caches[step]
+        h = plan.step_size(step)
+        u_step = plan.stages(u, step)
+        grad_step = plan.stages(grad, step)
+        W_step = plan.stages(adjoint.WeightedAdj, step)
 
-        for k in range(s):
-            # ∂J/∂u contribution (if objective depends on u directly)
-            grad[step, k] = objective.dJ_du(u[step, k], step, k)
+        for k in range(plan.s(step)):
+            # dJ/du contribution (if objective depends on u directly)
+            grad_step[k] = objective.dJ_du(u_step[k], step, k)
 
-            # Constraint contribution: +h G_k^T Λ_k
-            G_k = cache.G[k]  # (n, ν)
-            Lambda_k = adjoint.WeightedAdj[step, k]  # (n,)
+            # Constraint contribution: +h_n G_k^T Lambda_k
+            G_k = cache.G[k]  # (n, nu)
+            grad_step[k] += h * G_k.T @ W_step[k]
 
-            grad[step, k] += h * G_k.T @ Lambda_k
-
-    return grad
+    return grad.reshape(caller_shape)
