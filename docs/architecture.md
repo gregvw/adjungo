@@ -234,7 +234,8 @@ Stated here so that this document cannot be read as advertising.
 | Automatic differentiation of user callbacks | Not planned. The caller supplies derivatives. |
 | Additive / IMEX splitting | Tableaux retained in `methods/experimental/`; refused. |
 | `r > 1` multistep | Tableaux retained; refused. Needs a certified starting procedure. |
-| Partitioned methods (PRK, Nystrom) | Not built, and not certified. Conventions, proposed domain, the paired symplectic condition and the conjugate exchange are drafted in `NUMERICS.md` C-8.4; certification cases in C-14.5. Both are `OPEN` and await a ruling. No representation exists, so there is nothing to hand to `GLMOptimizer`; C-6.2 would refuse one if there were. |
+| Partitioned methods (PRK, Nystrom) | Not built, and not certified. Conventions, proposed domain, the paired symplectic condition and the conjugate exchange are drafted in `NUMERICS.md` C-8.4; certification cases in C-14.5. Both are `OPEN` and await a ruling. No representation exists, so there is nothing to hand to `GLMOptimizer`; C-6.2 would refuse one if there were. Sequenced after the discretization plan so that stage storage is refactored once rather than twice — not because a partitioned step needs packed storage; both target methods fit the present rectangular arrays. |
+| Non-uniform steps, per-step method selection, mesh adaptation | Not built. `h = (t_span[1] - t_span[0]) / N` is a scalar at four sites, `Trajectory.Z` is a dense `(N, s, n)`, and the C-10 adapters bake one `method.s` and one `c`. `NUMERICS.md` C-18 drafts the plan abstraction, the `J_𝒟` promise, the packed-offset storage and the variable-step symplectic caveat; it is `OPEN`. Its first increment would cover `r = 1` families at fixed state dimension; multistep startup and adaptation policies are later work. |
 | Matrix-free linear algebra | Not built. `algebra/protocols.py` is the seam it would enter through; `algebra/operators.py` holds an unused `LinearOperator` sketch. |
 | Sparse linear algebra | Not built. Same seam. |
 | Reuse for a *varying* Jacobian (modified Newton, lagged Jacobian) | Not built. The refusal is narrower than it first appears and is stated precisely below. |
@@ -248,7 +249,7 @@ Stated here so that this document cannot be read as advertising.
 ## For a C++ reimplementation
 
 This Python package is a pilot study. `NUMERICS.md` C-13 is the normative list
-of what must carry forward; it currently has eleven items. The twelve below are
+of what must carry forward; it currently has twelve items. The thirteen below are
 that list restated for an implementer, together with the implementation
 lessons that produced it — a longer list, not a competing one. Where the two
 differ, C-13 governs.
@@ -674,6 +675,29 @@ differ, C-13 governs.
     machinery rather than reproduce it: `const` coefficients cannot be
     unfrozen, and affineness becomes a compile-time property of the type that
     selects the solve path by static polymorphism instead of by inspection.
+
+13. **Differentiate the discretization you executed.** The C-18 plan clause is
+    `OPEN` and nothing is implemented, but the port obligation is already clear
+    and belongs beside the others. Once a step's size and coefficients can
+    differ from its neighbours', both sweeps must read one immutable plan by
+    step index. Deterministic lookup is fine — duplicating coefficients per
+    step is not required. What is forbidden is asking a selection or adaptation
+    policy a second time. C++ sharpens the temptation: recomputing a small
+    lookup is cheaper than storing one per step, and it looks like an
+    optimization.
+
+    A mismatched backward plan need not differentiate the executed objective,
+    and need not return the gradient of anything: two Euler steps of `y' = u`
+    at length 1 with `J = y(2)²/2`, differentiated backward at lengths
+    `(1, 2)`, give `(u₁+u₂, 2(u₁+u₂))`, whose Jacobian `[[1,1],[2,2]]` is
+    asymmetric. Symmetry and duality corroborate; shared errors can pass them,
+    so neither establishes this property — see NUMERICS.md C-14.1.
+
+    The same paragraph governs a second temptation: sharing the packed stage
+    offsets between the stepping code and the independent reference. They
+    compute the same thing, which is exactly why they may not compute it
+    once. NUMERICS.md C-18.5 states this; the tier-1 oracle's whole value is
+    that it shares no code with what it checks.
 
 ### Modified Newton: the refusal is narrower than it looks
 
