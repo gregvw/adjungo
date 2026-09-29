@@ -151,8 +151,9 @@ the optimizer's cache and checks nothing. See `NUMERICS.md` C-17.6.
   different coefficient array to each of two state blocks. A GLM applies one
   array to the whole state as `A ⊗ I`, so symplectic Euler and Störmer–Verlet
   are not expressible — there is no partitioned method object to construct.
-  Conventions, the proposed domain and the certification cases are drafted in
-  `NUMERICS.md` C-8.4 and C-14.5, both `OPEN`. Nothing is implemented.
+  Conventions, the domain and the certification cases are `APPROVED`
+  in `NUMERICS.md` C-8.4 and C-14.5. Nothing is implemented; those clauses rule
+  how a partitioned family must be expressed and certified, not that one exists.
 - Nonlinear control parametrisation, sparse operators, and checkpointing.
 
 ## Installation

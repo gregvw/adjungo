@@ -298,7 +298,7 @@ forward solve, gradient, **and** Hessian-vector product for it, against the
 | Fully implicit (dense `A`) | **certified** — M3 (`gauss2`) |
 | Linear multistep, `r > 1` | **not supported** |
 | IMEX / additive splitting | **not supported** |
-| Partitioned (PRK, Nyström) | **not supported** — conventions drafted in [C-8.4](#c-8), certification cases in [C-14.5](#c-14); both `OPEN` |
+| Partitioned (PRK, Nyström) | **not supported** — conventions [C-8.4](#c-8) and certification cases [C-14.5](#c-14) are `APPROVED`; neither is implemented, and approval of a convention is not certification of a family |
 
 `OBSERVED` — each certified method above is exercised, on the
 [C-14](#c-14-the-certification-test-population) population, by:
@@ -549,7 +549,7 @@ because the first version of the population checked it only through accuracy.
 The SDIRK solver's zero test was made exact for uniformity but is not injected,
 because it is unreachable: the SDIRK class requires a nonzero diagonal.
 
-### C-8.4 Partitioned methods — `OPEN`, draft, unimplemented
+### C-8.4 Partitioned methods — `APPROVED`, unimplemented
 
 C-8.1 applies one coefficient array `A` to the whole state, as `A ⊗ I`. A
 **partitioned** method applies a *different* array to each of two complementary
@@ -563,14 +563,14 @@ nothing can reach `GLMOptimizer` to be refused; C-6.2's last bullet would refuse
 one if there were. This clause fixes the conventions a milestone would have to
 implement, so that the mathematics is settled before any code claims it.
 
-**Proposed domain.** The equations below are written for a general two-block
-partition, but the milestone they are drafted for is deliberately narrower: two
+**Domain.** The equations below are written for a general two-block
+partition, but the milestone they govern is deliberately narrower: two
 canonical partitions `(q, p)` and **separable** Hamiltonians
 `H(q, p, u, t) = T(p) + V(q, u, t)`, so that `f^q` depends only on `p` and `f^p`
 only on `q`, `u` and `t`. Symplectic
 Euler and Störmer–Verlet first; one Blanes–Moan composition afterward. A
 non-separable Hamiltonian, more than two partitions, or a general additive
-splitting lies outside the proposed domain and requires amending this clause,
+splitting lies outside this domain and requires amending this clause,
 not merely supplying another tableau.
 
 **Step form.** The state splits as `y = (y^q, y^p)` with `f = (f^q, f^p)`. A
@@ -1346,7 +1346,7 @@ in the suite for the explicit, SDIRK and DIRK routes. Transposing the driver's
 own weight `Σ_j a_jk μ_j`, which `Mᵀ` does not filter, fails 15 tests in that
 module.
 
-### C-14.5 Certification cases for a partitioned family — `OPEN`, draft
+### C-14.5 Certification cases for a partitioned family — `APPROVED`, unimplemented
 
 Should the [C-8.4](#c-8) family be built, it must be certified on **three
 separate properties**. They fail for different reasons and a single witness
