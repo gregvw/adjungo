@@ -789,7 +789,30 @@ that is not a point. Both shipped maps have `q = 0`, so this error would be
 dormant until the first map with a nonzero offset; the operations are therefore
 kept distinct rather than merged into one that happens to be correct today.
 
-**Evidence.** `tests/test_parametrization.py` (48 tests). Checked against four
+That is enforced structurally, not by convention: `_push_packed` is abstract on
+`AffineControlParametrization`, so a subclass cannot acquire the wrong one by
+inheriting. [C-18](#c-18)'s first draft supplied a base-class default returning
+`expand(v)`, which is what the two shipped maps had each written for
+themselves; hoisting it turned a per-subclass identity into a general promise
+that is false. The anchor that now holds it is `y' = u` with one explicit Euler
+step and `u = θ + 1`, whose objective is `(θ+1)²/2` and whose Hessian is the
+identity at every `θ`: the merged version returned `1` and `3` for directions
+`0` and `2`. The gradient is unaffected, since only the curvature path pushes a
+direction, so no gradient test could have caught it.
+
+**Abscissa ownership.** `NodalControl` copies each abscissa array before
+freezing it, because `np.asarray(c).ravel()` may return a *view* and freezing a
+view leaves its owner writable. The interpolation weights are built once by a
+copying `np.stack`, so an aliased declaration and the weights drift apart under
+an ordinary write through the caller's own array — no writeability override is
+involved, which distinguishes this from [C-15.7](#c-15)'s exporter cases. The
+consequence is the [C-18.4](#c-18) abscissa gate reading a declaration the
+weights do not honour and passing it: one `implicit_midpoint` step with nodes
+`(0, 1)`, declaring `c = ½` while weighting `c = 0`, returned `J = 0` where the
+closed form is `0.125`. `from_plan` shared memory with the plan's own frozen
+tableau by the same route.
+
+**Evidence.** `tests/test_parametrization.py` (53 tests). Checked against seven
 injected defects, each measured under the R-11 procedure:
 
 | Injected defect | Tests failed |
@@ -799,6 +822,9 @@ injected defects, each measured under the R-11 procedure:
 | `NodalControl.pullback` swaps the interpolation weights | 12 |
 | `NodalControl` ignores `c` and uses the left endpoint | 2 |
 | `pullback` keeps the first stage instead of contracting | 9 |
+| base-class `push` returns `expand(v)` | 2 |
+| `_push_packed` is a concrete default rather than abstract | 1 |
+| `NodalControl` keeps a view of the caller's `c` instead of a copy | 2 |
 
 The swapped-weights row is the important one: it is the transposition error this
 layer is designed against, and it is caught by the dedicated transpose test, by

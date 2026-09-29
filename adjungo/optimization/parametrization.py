@@ -218,6 +218,22 @@ class AffineControlParametrization(ABC):
         """Map parameters to packed stage controls, shape ``(Σ s_n, ν)``."""
 
     @abstractmethod
+    def _push_packed(self, v: NDArray) -> NDArray:
+        """Apply the **linear part alone** to a direction, packed.
+
+        Separate from :meth:`_expand_packed` because the map is ``u = Pθ +
+        q``: the offset belongs to the point, not to the direction. For a
+        map with ``q = 0`` this is the same arithmetic, and both shipped
+        maps say so explicitly. It is declared rather than defaulted because
+        the wrong default is silent — an offset map would return ``Pv + q``
+        for a direction, and a Hessian-vector product would be displaced by
+        exactly ``P`` applied to nothing at all. Measured on ``y' = u``,
+        ``J = y(1)²/2``, one Euler step and ``u = θ + 1``, whose Hessian is
+        the identity: the offset default returns ``1`` and ``3`` for
+        directions ``0`` and ``2``.
+        """
+
+    @abstractmethod
     def _pullback_packed(self, g: NDArray) -> NDArray:
         """Apply the transpose to a packed stage-control covector."""
 
@@ -232,8 +248,12 @@ class AffineControlParametrization(ABC):
         return self._to_natural_layout(self._expand_packed(theta))
 
     def push(self, v: NDArray) -> NDArray:
-        """Apply the linear part to a parameter-space direction: ``P v``."""
-        return self.expand(v)
+        """Apply the linear part to a parameter-space direction: ``P v``.
+
+        Not ``expand(v)`` in general: ``expand`` adds the affine offset,
+        which a direction does not carry.
+        """
+        return self._to_natural_layout(self._push_packed(v))
 
     def pullback(self, g: NDArray) -> NDArray:
         """Apply the transpose to a stage-control covector: ``Pᵀ g``."""
@@ -312,6 +332,10 @@ class PiecewiseConstantControl(AffineControlParametrization):
         arr = self._check_parameter_shape(theta)
         return np.repeat(arr, self.stage_counts, axis=0)
 
+    def _push_packed(self, v: NDArray) -> NDArray:
+        # q = 0: this map is linear, so the direction uses the same formula.
+        return self._expand_packed(v)
+
     def _pullback_packed(self, g: NDArray) -> NDArray:
         return np.add.reduceat(g, self.stage_offsets[:-1], axis=0)
 
@@ -330,10 +354,19 @@ class NodalControl(AffineControlParametrization):
     piecewise-constant parametrization cannot represent, at the cost of
     ``ν`` extra unknowns.
 
-    The abscissae are captured at construction and are **not** re-read from
-    the methods later: the interpolation weights and the stage times the
-    solver evaluates must come from the same tableau, or the control seen by
-    ``f`` is sampled at different instants than the parametrization believes.
+    The abscissae are **copied** at construction and are not re-read from the
+    methods later: the interpolation weights and the stage times the solver
+    evaluates must come from the same tableau, or the control seen by ``f``
+    is sampled at different instants than the parametrization believes. The
+    copy is what makes that true. ``np.asarray(c).ravel()`` can return a
+    *view*, and freezing a view leaves its owner writable, so a later write
+    through the caller's own array would move the declared abscissae while
+    the weights — built once, by a copying ``np.stack`` — stayed behind. The
+    optimizer's element-for-element abscissa check reads the declaration, so
+    it would accept the map. Measured on ``y' = u``, ``J = y(1)²/2``, one
+    ``implicit_midpoint`` step and nodes ``(0, 1)``: declaring ``c = ½``
+    while weighting ``c = 0`` gives ``J = 0`` where the true value is
+    ``0.125``.
 
     Since C-18 a plan may carry a different method at each step, so ``c`` is
     per step. Passing a single abscissa vector still means "these abscissae
@@ -362,9 +395,10 @@ class NodalControl(AffineControlParametrization):
         control_dim: int,
         c: NDArray | Sequence[NDArray],
     ) -> None:
-        arrays = [np.asarray(row, dtype=float).ravel() for row in _as_per_step(
-            c, n_steps
-        )]
+        arrays = [
+            np.asarray(row, dtype=float).ravel().copy()
+            for row in _as_per_step(c, n_steps)
+        ]
         super().__init__(n_steps, [row.size for row in arrays], control_dim)
 
         for step, row in enumerate(arrays):
@@ -428,6 +462,11 @@ class NodalControl(AffineControlParametrization):
                 + w[:, 1, None] * arr[n + 1][None, :]
             )
         return out
+
+    def _push_packed(self, v: NDArray) -> NDArray:
+        # q = 0: interpolation of node *values* is linear in them, so a
+        # direction in node space maps by the same interpolation.
+        return self._expand_packed(v)
 
     def _pullback_packed(self, g: NDArray) -> NDArray:
         out = np.zeros(self.parameter_shape)
