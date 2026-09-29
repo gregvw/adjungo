@@ -21,9 +21,9 @@ partitioned method is built on and an ordinary-looking Hamiltonian can fail it.
 Finally, the problem is put through the certified ``r = 1`` families and its
 gradients and HVPs compared with the C-14.1 tier-1 reference. That is not a
 test of the partitioned family, which does not exist; it establishes that the
-problem is admissible and well conditioned on the routes that do exist, so a
-future disagreement can be attributed to the new method rather than to the
-fixture.
+problem is admissible, and not obviously stiff, on the routes that do exist,
+so a future disagreement can be attributed to the new method rather than to
+the fixture.
 
 **Nothing here certifies a partitioned method.** C-6.1 is unchanged and
 continues to list the family as not supported.
@@ -320,13 +320,16 @@ def test_the_hvp_matches_the_tier_one_reference(factory, rtol):
 
 
 def test_the_problem_is_not_stiff_at_the_meshes_the_study_will_use():
-    """A conditioning check, so a later disagreement is not the fixture's.
+    """A necessary screen, not a conditioning certificate.
 
-    If the stage matrices were near-singular at the step sizes C-14.5's
-    refinement study uses, a partitioned method's first reported error would
-    be dominated by conditioning rather than by the method. The spectral
-    radius of ``h F`` is reported against the step, and the C-14.5 study's
-    coarsest mesh is the demanding end.
+    The spectral radius of ``h F`` along one trajectory bounds nothing about
+    how well conditioned a stage matrix is: ``F`` is non-normal here, the
+    radius is sampled at one control, and ``N = 60`` over ``[0.2, 1.4]`` is a
+    single mesh rather than C-14.5's detuned-horizon refinement study. What it
+    does establish is that the problem is not *obviously* stiff at a mesh of
+    that order -- enough that a later partitioned disagreement is worth
+    investigating rather than dismissed as a step outside the method's
+    stability region.
     """
     problem = ShakenLatticeTrap()
     objective = _objective()

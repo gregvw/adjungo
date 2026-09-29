@@ -1386,7 +1386,10 @@ than inferred from the model. Gradients and HVPs agree with the
 `gauss2`. Eleven single-token injections into the fixture — sign of the
 restoring force, swapped axes, an unsymmetrised quartic Hessian block, a
 contraction over the wrong half of `v`, a transposed Jacobian block — were all
-detected.
+detected. A spectral-radius screen at `N = 60` over `[0.2, 1.4]` records that
+the problem is not obviously stiff at a mesh of that order; it is a necessary
+screen on one trajectory at one control, not a conditioning certificate and not
+the refinement study below.
 
 That establishes the fixture, not the family. **C-6.1 is unchanged and still
 lists partitioned methods as not supported.**

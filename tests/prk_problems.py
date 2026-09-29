@@ -49,8 +49,10 @@ suite, because each had either ``s = 1`` or a constant Jacobian.
 * **The stiffness is ``u_2^2``**, not ``u_2``. A control entering linearly
   gives ``F_uu = 0``, and a trap whose centre alone is controlled gives
   ``F_yu = 0`` too. Here ``d2f^p/du_2^2 = -2(q - d)`` and
-  ``d2f^p/dq du_2 = -2 u_2 I`` are both nonzero, and both depend on the
-  state.
+  ``d2f^p/dq du_2 = -2 u_2 I`` are both nonzero. The first varies with the
+  state; the second varies with the control and is constant in the state,
+  which is all the term needs to be to catch a contraction over the wrong
+  index.
 * **``u_1`` enters linearly** and ``u_2`` does not, so a routine that
   contracted over the wrong control component could not stay hidden.
 * **``n_q = n_p = 2``, ``n = 4``, ``nu = 2``.** ``n != nu``, and neither is
