@@ -1,5 +1,6 @@
 """State and adjoint sensitivity equations."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -7,7 +8,6 @@ import scipy.linalg
 from numpy.typing import NDArray
 
 from adjungo.core.affine import affine_dynamics_verified
-from adjungo.core.method import GLMethod
 from adjungo.core.objective import Objective
 from adjungo.core.problem import Problem, ProblemStructure
 from adjungo.solvers.base import StageSolver
@@ -16,7 +16,7 @@ from adjungo.solvers.implicit import (
     solve_coupled_transposed,
 )
 from adjungo.stepping.adjoint import AdjointTrajectory
-from adjungo.stepping.trajectory import Trajectory
+from adjungo.stepping.trajectory import Trajectory, packed_like
 
 
 @dataclass
@@ -24,7 +24,7 @@ class SensitivityTrajectory:
     """State sensitivity trajectory."""
 
     delta_Y: NDArray  # (N+1, r, n) external stage sensitivities
-    delta_Z: NDArray  # (N, s, n) internal stage sensitivities
+    delta_Z: NDArray  # (sum_n s_n, n) packed internal stage sensitivities
 
 
 @dataclass
@@ -32,17 +32,15 @@ class AdjointSensitivityTrajectory:
     """Adjoint sensitivity trajectory."""
 
     delta_Lambda: NDArray      # (N+1, r, n) external adjoint sensitivities
-    delta_Mu: NDArray          # (N, s, n) internal adjoint sensitivities
-    delta_WeightedAdj: NDArray # (N, s, n) weighted adjoint sensitivities
+    delta_Mu: NDArray          # (sum_n s_n, n) packed adjoint sensitivities
+    delta_WeightedAdj: NDArray # (sum_n s_n, n) packed weighted adjoint sens.
 
 
 def forward_sensitivity(
     trajectory: Trajectory,
     delta_u: NDArray,
-    method: GLMethod,
-    stage_solver: StageSolver,
+    stage_solver: StageSolver | Sequence[StageSolver],
     problem: Problem,
-    h: float,
 ) -> SensitivityTrajectory:
     """
     Algorithm 3: Forward state sensitivity from glm_opt.tex Section 7.
@@ -67,25 +65,32 @@ def forward_sensitivity(
         trajectory: Forward solution trajectory
         delta_u: Control perturbation (N, s, ν)
         method: GLM tableau
-        stage_solver: Stage equation solver
+        stage_solver: Stage equation solver, or one per step
         problem: Problem specification
         h: Step size
 
     Returns:
         State sensitivity trajectory
     """
+    plan = trajectory.plan
     N = trajectory.N
-    s, r, n = method.s, method.r, trajectory.n
-    A = method.A
+    n, r = trajectory.n, trajectory.r
 
     delta_Y = np.zeros((N + 1, r, n))
-    delta_Z = np.zeros((N, s, n))
+    delta_u = plan.pack(delta_u, "delta_u")
+    delta_Z = packed_like(plan, n)
 
     # Zero initial condition for sensitivity
     delta_Y[0] = 0
 
     for step in range(N):
         cache = trajectory.caches[step]
+        method = plan.method_at(step)
+        h = plan.step_size(step)
+        s = method.s
+        A = method.A
+        du_step = plan.stages(delta_u, step)
+        dZ_step = plan.stages(delta_Z, step)
 
         # The tangent system is the forward stage system linearised:
         #   δZ_i = U[i] δy + h Σ_j A[i,j] ( F_j δZ_j + G_j δu_j )
@@ -102,10 +107,10 @@ def forward_sensitivity(
                 for j in range(s):
                     if A[i, j] != 0.0:
                         acc = acc + h * A[i, j] * (
-                            cache.G[j] @ delta_u[step, j]
+                            cache.G[j] @ du_step[j]
                         )
                 rhs_coupled[i] = acc
-            delta_Z[step] = solve_coupled(
+            dZ_step[...] = solve_coupled(
                 cache.coupled_factorization, rhs_coupled
             )
         else:
@@ -115,12 +120,12 @@ def forward_sensitivity(
 
                 # Add coupling from previous stages
                 for j in range(i):
-                    rhs += h * A[i, j] * (cache.F[j] @ delta_Z[step, j] +
-                                          cache.G[j] @ delta_u[step, j])
+                    rhs += h * A[i, j] * (cache.F[j] @ dZ_step[j] +
+                                          cache.G[j] @ du_step[j])
 
                 # For explicit stages (a_{ii} = 0): δZ_i = rhs
                 if A[i, i] == 0.0:  # exact, as in the forward solve (C-8.3)
-                    delta_Z[step, i] = rhs
+                    dZ_step[i] = rhs
                 else:
                     # Implicit stage. Differentiating
                     #   Z_i - h a_ii f(Z_i, u_i, t_i)
@@ -132,7 +137,7 @@ def forward_sensitivity(
                     # reused rather than rebuilt.
                     gamma = A[i, i]
                     rhs_implicit = rhs + h * gamma * (
-                        cache.G[i] @ delta_u[step, i]
+                        cache.G[i] @ du_step[i]
                     )
                     lu = (
                         cache.stage_factorizations[i]
@@ -159,14 +164,14 @@ def forward_sensitivity(
                             "because the tangent solves with that same matrix "
                             "(NUMERICS.md C-5.4)."
                         )
-                    delta_Z[step, i] = scipy.linalg.lu_solve(lu, rhs_implicit)
+                    dZ_step[i] = scipy.linalg.lu_solve(lu, rhs_implicit)
 
         # Propagate sensitivity: δy^n = V δy^{n-1} + h B Σ_i [F_i δZ_i + G_i δu_i]
         delta_Y[step + 1] = method.V @ delta_Y[step]
 
         for i in range(s):
             # Add contribution from each stage
-            f_sens = cache.F[i] @ delta_Z[step, i] + cache.G[i] @ delta_u[step, i]
+            f_sens = cache.F[i] @ dZ_step[i] + cache.G[i] @ du_step[i]
             delta_Y[step + 1] += h * method.B[:, i:i+1] @ f_sens[np.newaxis, :]
 
     return SensitivityTrajectory(delta_Y=delta_Y, delta_Z=delta_Z)
@@ -178,11 +183,8 @@ def adjoint_sensitivity(
     sensitivity: SensitivityTrajectory,
     u: NDArray,
     delta_u: NDArray,
-    method: GLMethod,
-    stage_solver: StageSolver,
+    stage_solver: StageSolver | Sequence[StageSolver],
     problem: Problem,
-    h: float,
-    t0: float = 0.0,
     objective: Objective | None = None,
     structure: "ProblemStructure | None" = None,
 ) -> AdjointSensitivityTrajectory:
@@ -228,11 +230,8 @@ def adjoint_sensitivity(
         sensitivity: State sensitivity trajectory
         u: Control array (N, s, ν)
         delta_u: Control perturbation (N, s, ν)
-        method: GLMethod tableau
-        stage_solver: Stage equation solver
+        stage_solver: Stage equation solver, or one per step
         problem: Problem specification
-        h: Step size
-        t0: Initial time (default 0.0)
         objective: Objective function, supplying the terminal and running
             state Hessians. Required.
 
@@ -294,14 +293,15 @@ def adjoint_sensitivity(
                 f"{type(objective).__name__} does not provide it"
             )
 
+    plan = trajectory.plan
     N = trajectory.N
-    s, r, n = method.s, method.r, trajectory.n
-    A = method.A
-    B = method.B
+    n, r = trajectory.n, trajectory.r
 
     delta_Lambda = np.zeros((N + 1, r, n))
-    delta_Mu = np.zeros((N, s, n))
-    delta_WeightedAdj = np.zeros((N, s, n))
+    u = plan.pack(u, "control")
+    delta_u = plan.pack(delta_u, "delta_u")
+    delta_Mu = packed_like(plan, n)
+    delta_WeightedAdj = packed_like(plan, n)
 
     # Terminal condition: δλ^[N] = J_yy^terminal(y^[N]) δy^[N].
     # Zero is correct only for an affine terminal cost.
@@ -312,18 +312,29 @@ def adjoint_sensitivity(
     # Backward sweep (same direction as adjoint solve)
     for step in range(N - 1, -1, -1):
         cache = trajectory.caches[step]
-        Lambda_k = adjoint.WeightedAdj[step]  # Weighted adjoints Λ_k
+        method = plan.method_at(step)
+        h = plan.step_size(step)
+        s = method.s
+        A = method.A
+        B = method.B
+        Lambda_k = plan.stages(adjoint.WeightedAdj, step)  # Weighted adj. Λ_k
+        dMu_step = plan.stages(delta_Mu, step)
+        dW_step = plan.stages(delta_WeightedAdj, step)
+        dZ_step = plan.stages(sensitivity.delta_Z, step)
+        Z_step = plan.stages(trajectory.Z, step)
+        u_step = plan.stages(u, step)
+        du_step = plan.stages(delta_u, step)
 
         # Second-derivative forcing:
         #   Γ_k = h [ F_yy[Λ_k] δZ_k + F_yu[Λ_k] δu_k ]
         # The callbacks contract their ``v`` argument over the equation index
         # ℓ, so ``v`` must be the weighted adjoint Λ_k.
         Gamma = np.zeros((s, n))
-        t_n = t0 + step * h
+        t_stage = plan.stage_times(step)
         if not skip_dynamics_curvature:
             for k in range(s):
-                t_k = t_n + method.c[k] * h
-                z_k, u_k = trajectory.Z[step, k], u[step, k]
+                t_k = t_stage[k]
+                z_k, u_k = Z_step[k], u_step[k]
 
                 F_yy_Lam = np.asarray(
                     problem.F_yy_action(z_k, u_k, t_k, Lambda_k[k])
@@ -332,8 +343,7 @@ def adjoint_sensitivity(
                     problem.F_yu_action(z_k, u_k, t_k, Lambda_k[k])
                 )
                 Gamma[k] = h * (
-                    F_yy_Lam @ sensitivity.delta_Z[step, k]
-                    + F_yu_Lam @ delta_u[step, k]
+                    F_yy_Lam @ dZ_step[k] + F_yu_Lam @ du_step[k]
                 )
 
         delta_lambda_ext = delta_Lambda[step + 1]
@@ -354,13 +364,13 @@ def adjoint_sensitivity(
             # only the external-adjoint term and Γ; adding an A term here as
             # well -- the natural slip when adapting the triangular branch
             # below -- would count the coupling twice.
-            rhs_coupled = np.empty((s, cache.Z.shape[1]))
+            rhs_coupled = np.empty((s, n))
             for i in range(s):
                 rhs_coupled[i] = (
                     h * cache.F[i].T @ (B[:, i] @ delta_lambda_ext)
                     + Gamma[i]
                 )
-            delta_Mu[step] = solve_coupled_transposed(
+            dMu_step[...] = solve_coupled_transposed(
                 cache.coupled_factorization, rhs_coupled
             )
         else:
@@ -370,7 +380,7 @@ def adjoint_sensitivity(
             for i in range(s - 1, -1, -1):
                 weighted = B[:, i] @ delta_lambda_ext
                 for j in range(i + 1, s):
-                    weighted = weighted + A[j, i] * delta_Mu[step, j]
+                    weighted = weighted + A[j, i] * dMu_step[j]
                 rhs = h * cache.F[i].T @ weighted + Gamma[i]
 
                 # Implicit stages carry the same transposed stage solve as
@@ -381,17 +391,15 @@ def adjoint_sensitivity(
                     else None
                 )
                 if lu is None:
-                    delta_Mu[step, i] = rhs
+                    dMu_step[i] = rhs
                 else:
-                    delta_Mu[step, i] = scipy.linalg.lu_solve(
-                        lu, rhs, trans=1
-                    )
+                    dMu_step[i] = scipy.linalg.lu_solve(lu, rhs, trans=1)
 
         # Compute weighted adjoint sensitivities for Hessian assembly
         # δΛ_k = Σ_j a_{jk} δμ_j + Σ_j b_{jk} δλ_j
         for k in range(s):
-            delta_WeightedAdj[step, k] = (
-                A[:, k] @ delta_Mu[step] +  # Σ_j a_{jk} δμ_j
+            dW_step[k] = (
+                A[:, k] @ dMu_step +  # Σ_j a_{jk} δμ_j
                 B[:, k] @ delta_Lambda[step + 1]  # Σ_j b_{jk} δλ_j
             )
 
@@ -399,7 +407,7 @@ def adjoint_sensitivity(
         #   δλ^[n] = U^T δμ^n + V^T δλ^[n+1] + J_yy(y^[n], n) δy^[n]
         # The running term mirrors the ∂J/∂y^[n] term in adjoint_solve; it is
         # present for n = 0 .. N-1, while node N is the terminal condition.
-        delta_Lambda[step] = method.U.T @ delta_Mu[step]
+        delta_Lambda[step] = method.U.T @ dMu_step
         delta_Lambda[step] += method.V.T @ delta_lambda_ext
 
         J_yy = np.asarray(objective.d2J_dy2(trajectory.Y[step], step))

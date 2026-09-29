@@ -47,6 +47,47 @@ Tableaux for the refused families are kept under
 representable; the Adams tableaux need per-history stage coefficients and are
 rejected earlier, by `GLMethod` validation itself.
 
+### Discretisation plans
+
+A solve does not have to use one mesh and one method. A `DiscretizationPlan`
+carries the time nodes and a method for **each** step, so step sizes may vary
+and the method may change from step to step — an explicit method where the
+problem is mild, an implicit one where it stiffens.
+
+```python
+from adjungo.core.plan import DiscretizationPlan
+
+# The uniform case, unchanged, and still the convenience form.
+plan = DiscretizationPlan.uniform((0.0, 1.0), 100, rk4())
+
+# Or nodes and methods given explicitly.
+plan = DiscretizationPlan(
+    nodes=np.array([0.0, 0.1, 0.3, 0.7, 1.0]),
+    methods=(rk4(), rk4(), sdirk2(), sdirk2()),
+)
+optimizer = GLMOptimizer(problem, objective, y0=y0, plan=plan)
+```
+
+The plan is **prescribed**, not adapted: it is an input, frozen for the
+duration of a solve, and the backward sweep reads the same plan the forward
+sweep executed. Adjungo returns exact derivatives of the discrete objective
+*that plan* defines. Choosing a plan from an evolving trajectory is a policy
+the caller writes; Adjungo does not yet supply one.
+
+Stage-indexed arrays are stored packed, as `(Σₙ sₙ, ·)`. When every step has
+the same stage count this is the familiar `(N, s, ν)` array reshaped, and
+controls may be supplied in either layout. When the stage count **varies**,
+two things are refused rather than guessed:
+
+- the control parametrisations below, which are built against a single
+  `method.s`; and
+- the scalar objective value, because `Objective.evaluate` is specified on the
+  rectangular layout. Gradients and Hessian-vector products are still exact —
+  their objective callbacks receive one stage and its `(step, stage)` index —
+  but without an objective value there is no line search.
+
+Non-uniform steps at a *fixed* stage count have neither limitation.
+
 ### Problem types
 
 Linear, bilinear, quasilinear and nonlinear dynamics; control-dependent and
@@ -155,6 +196,13 @@ the optimizer's cache and checks nothing. See `NUMERICS.md` C-17.6.
   in `NUMERICS.md` C-8.4 and C-14.5. Nothing is implemented; those clauses rule
   how a partitioned family must be expressed and certified, not that one exists.
 - Nonlinear control parametrisation, sparse operators, and checkpointing.
+- **Mesh adaptation.** Prescribed non-uniform steps and per-step methods are
+  implemented and described above; what is missing is a policy that builds a
+  new plan from a trajectory's error or stiffness indicators, and the
+  warm-start transfer between plans that would go with it.
+- **Multistep startup.** `r > 1` is refused at construction, as the table
+  above records: it needs a defined history representation and a certified
+  starting procedure. `NUMERICS.md` C-Q4 holds the open question.
 
 ## Installation
 

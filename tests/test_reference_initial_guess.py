@@ -36,6 +36,7 @@ from scipy.special import ellipk
 
 import adjungo.validation.reference as ref
 from adjungo.core.method import GLMethod
+from adjungo.core.plan import DiscretizationPlan
 from adjungo.methods.runge_kutta import gauss2, rk4, sdirk3
 from adjungo.validation.reference import (
     _constant_guess,
@@ -122,8 +123,7 @@ def libration_period(amplitude: float) -> float:
 
 
 def _constant_start(
-    u: NDArray, y0: NDArray, problem: object, method: object,
-    t0: float, h: float, lay: _Layout,
+    u: NDArray, y0: NDArray, problem: object, lay: _Layout,
 ) -> NDArray:
     """The guess the reference used before: everything at ``y0``."""
     return _constant_guess(y0, lay)
@@ -199,12 +199,14 @@ def test_the_constant_start_is_kept_where_sweeping_is_worse() -> None:
     """
     problem, y0, u, t_final, n_steps = _vdp_fixture()
     method = gauss2()
-    h = t_final / n_steps
     lay = _Layout(
-        n_steps, method.s, method.r, problem.state_dim, problem.control_dim
+        DiscretizationPlan.uniform((0.0, t_final), n_steps, method),
+        problem.state_dim,
+        problem.control_dim,
     )
+    u = lay.pack_stage_input(u, "control")
 
-    chosen = ref._initial_guess(u, y0, problem, method, 0.0, h, lay)
+    chosen = ref._initial_guess(u, y0, problem, lay)
     assert np.array_equal(chosen, _constant_guess(y0, lay)), (
         "the swept guess was adopted on a fixture where sweeping is unstable"
     )
@@ -212,10 +214,10 @@ def test_the_constant_start_is_kept_where_sweeping_is_worse() -> None:
     def defect(w: NDArray) -> float:
         with np.errstate(over="ignore", invalid="ignore"):
             return float(
-                np.max(np.abs(_residual(w, u, y0, problem, method, 0.0, h, lay)))
+                np.max(np.abs(_residual(w, u, y0, problem, lay)))
             )
 
-    swept = defect(_swept_guess(u, y0, problem, method, 0.0, h, lay))
+    swept = defect(_swept_guess(u, y0, problem, lay))
     constant = defect(_constant_guess(y0, lay))
     assert swept > constant, (
         "this fixture is only meaningful while sweeping is the worse start "
@@ -243,41 +245,46 @@ def test_the_contraction_check_keeps_a_diverging_sweep_finite() -> None:
     """
     problem, y0, u, t_final, n_steps = _vdp_fixture()
     method = gauss2()
-    h = t_final / n_steps
     lay = _Layout(
-        n_steps, method.s, method.r, problem.state_dim, problem.control_dim
+        DiscretizationPlan.uniform((0.0, t_final), n_steps, method),
+        problem.state_dim,
+        problem.control_dim,
     )
+    u = lay.pack_stage_input(u, "control")
 
     # The same forward sweep with the contraction check removed, for contrast.
     def unguarded_sweep(sweeps: int) -> float:
+        h = lay.plan.step_size(0)
         Y = np.zeros((lay.N + 1, lay.r, lay.nx))
-        Z = np.zeros((lay.N, lay.s, lay.nx))
+        Z = np.zeros((lay.total_stages, lay.nx))
         Y[0] = y0
         for n in range(lay.N):
-            t_stage = np.array([h * (n + method.c[j]) for j in range(lay.s)])
+            s = lay.s_at(n)
+            un = lay.stage(u, n)
+            t_stage = np.array([h * (n + method.c[j]) for j in range(s)])
             explicit = np.array(
                 [
                     sum(method.U[i, k] * Y[n, k] for k in range(lay.r))
-                    for i in range(lay.s)
+                    for i in range(s)
                 ]
             )
             Zn = explicit
             for _ in range(sweeps):
                 f_st = np.array(
                     [
-                        problem.f(Zn[j], u[n, j], t_stage[j])
-                        for j in range(lay.s)
+                        problem.f(Zn[j], un[j], t_stage[j])
+                        for j in range(s)
                     ]
                 )
                 Zn = explicit + h * (method.A @ f_st)
-            Z[n] = Zn
+            lay.stage(Z, n)[...] = Zn
             f_st = np.array(
-                [problem.f(Zn[j], u[n, j], t_stage[j]) for j in range(lay.s)]
+                [problem.f(Zn[j], un[j], t_stage[j]) for j in range(s)]
             )
             for lvl in range(lay.r):
                 Y[n + 1, lvl] = sum(
                     method.V[lvl, k] * Y[n, k] for k in range(lay.r)
-                ) + h * sum(method.B[lvl, j] * f_st[j] for j in range(lay.s))
+                ) + h * sum(method.B[lvl, j] * f_st[j] for j in range(s))
         return float(max(np.max(np.abs(Y)), np.max(np.abs(Z))))
 
     with np.errstate(over="ignore", invalid="ignore"):
@@ -289,7 +296,7 @@ def test_the_contraction_check_keeps_a_diverging_sweep_finite() -> None:
     )
 
     with np.errstate(over="ignore", invalid="ignore"):
-        guarded = _swept_guess(u, y0, problem, method, 0.0, h, lay)
+        guarded = _swept_guess(u, y0, problem, lay)
     assert np.all(np.isfinite(guarded))
     # The guarded sweep stays within a few orders of the state scale rather
     # than running to 1e+72; the bound separates "stopped" from "diverged".
@@ -364,21 +371,23 @@ def test_an_overflowed_sweep_is_rejected_without_a_finiteness_test() -> None:
     method = gauss2()
     y0 = np.array([1.0])
     n_steps, t_final = 400, 40.0
-    h = t_final / n_steps
     u = np.zeros((n_steps, method.s, 1))
-    lay = _Layout(n_steps, method.s, method.r, 1, 1)
+    lay = _Layout(
+        DiscretizationPlan.uniform((0.0, t_final), n_steps, method), 1, 1
+    )
+    u = lay.pack_stage_input(u, "control")
 
     with np.errstate(over="ignore", invalid="ignore"):
-        swept = _swept_guess(u, y0, problem, method, 0.0, h, lay)
+        swept = _swept_guess(u, y0, problem, lay)
         swept_defect = np.max(
-            np.abs(_residual(swept, u, y0, problem, method, 0.0, h, lay))
+            np.abs(_residual(swept, u, y0, problem, lay))
         )
     assert not np.isfinite(swept_defect), (
         "this fixture no longer overflows the sweep, so it no longer tests "
         f"the path it was built for; measured {swept_defect:.3e}"
     )
 
-    chosen = ref._initial_guess(u, y0, problem, method, 0.0, h, lay)
+    chosen = ref._initial_guess(u, y0, problem, lay)
     assert np.array_equal(chosen, _constant_guess(y0, lay)), (
         "a runaway sweep was adopted as the starting point"
     )
@@ -445,12 +454,13 @@ def test_a_predictor_that_raises_is_a_rejected_candidate() -> None:
     method = backward_euler()
     y0 = np.array([1.0])
     u = np.zeros((1, 1, 1))
-    lay = _Layout(1, 1, 1, 1, 1)
+    lay = _Layout(DiscretizationPlan.uniform((0.0, 1.5), 1, method), 1, 1)
+    u = lay.pack_stage_input(u, "control")
 
     with pytest.raises(ValueError):
-        _swept_guess(u, y0, problem, method, 0.0, 1.5, lay)
+        _swept_guess(u, y0, problem, lay)
 
-    chosen = ref._initial_guess(u, y0, problem, method, 0.0, 1.5, lay)
+    chosen = ref._initial_guess(u, y0, problem, lay)
     assert np.array_equal(chosen, _constant_guess(y0, lay))
 
     solution = reference_solve(y0, u, (0.0, 1.5), 1, problem, method)

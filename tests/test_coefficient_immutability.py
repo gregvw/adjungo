@@ -84,6 +84,7 @@ from adjungo.core.affine import (
     affine_dynamics_verified,
     require_immutable_coefficients,
 )
+from adjungo.core.plan import DiscretizationPlan
 from adjungo.core.problem import Linearity
 from adjungo.core.requirements import deduce_requirements
 from adjungo.methods.runge_kutta import explicit_euler
@@ -984,7 +985,7 @@ def test_inheriting_a_reader_obliges_the_buffer_it_reads() -> None:
             Y0,
         )
     with pytest.raises(MutableCoefficients, match="_M"):
-        forward_solve(Y0, U, T_SPAN, N_STEPS, problem, explicit_euler(), None)
+        forward_solve(Y0, U, DiscretizationPlan.uniform(T_SPAN, N_STEPS, explicit_euler()), problem, None)
 
 
 class ForgesItsMRO(type):
@@ -2021,10 +2022,16 @@ class SerialisesOnlyItsCoefficients(AffineDynamics):
     route, but this instance still holds the root's buffers and still inherits
     ``F``, so the tape aliases ``self._M`` whichever route runs. Its
     restoration obligation is therefore unchanged by its ineligibility.
+
+    ``_nu`` travels with the coefficients because ``control_dim`` is part of
+    the ``Problem`` protocol: an instance without it is not a problem at all,
+    and the refusal under test would never be reached. What this fixture
+    withholds is the root-initialised flag, nothing else.
+
     """
 
-    def __getstate__(self) -> dict[str, NDArray]:
-        return {"_M": self._M, "_C": self._C, "_b": self._b}
+    def __getstate__(self) -> dict[str, object]:
+        return {"_M": self._M, "_C": self._C, "_b": self._b, "_nu": self._nu}
 
 
 class SerialisesTwoOfThree(AffineDynamics):
@@ -2036,8 +2043,8 @@ class SerialisesTwoOfThree(AffineDynamics):
     skipped this and restored ``_M`` writeable.
     """
 
-    def __getstate__(self) -> dict[str, NDArray]:
-        return {"_M": self._M, "_C": self._C}
+    def __getstate__(self) -> dict[str, object]:
+        return {"_M": self._M, "_C": self._C, "_nu": self._nu}
 
     def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
         return np.asarray(self._M @ y + self._C @ u)
@@ -2053,8 +2060,8 @@ class SerialisesOneOfThree(AffineDynamics):
     stops counting and freezes the name either way.
     """
 
-    def __getstate__(self) -> dict[str, NDArray]:
-        return {"_M": self._M}
+    def __getstate__(self) -> dict[str, object]:
+        return {"_M": self._M, "_nu": self._nu}
 
     def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
         return np.asarray(self._M @ y + C_DOUBLED @ u)
@@ -5548,13 +5555,12 @@ def test_the_exported_stepping_composition_refuses_the_same_problem() -> None:
             y_scale=1.0,
         )
         trajectory = forward_solve(
-            Y0, U, T_SPAN, N_STEPS, problem, method, solver
+            Y0, U, DiscretizationPlan.uniform(T_SPAN, N_STEPS, method), problem, solver
         )
-        adjoint = adjoint_solve(trajectory, objective, method, solver, H)
+        adjoint = adjoint_solve(trajectory, objective, solver)
         return np.asarray(
             assemble_gradient(
-                trajectory, adjoint, U, objective, method, problem, H
-            )
+                trajectory, adjoint, U, objective, problem)
         )
 
     exact, _ = _closed_form(2.0)

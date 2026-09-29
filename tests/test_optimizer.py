@@ -57,20 +57,20 @@ def test_optimizer_caches_forward_and_adjoint(monkeypatch):
     adjoint_calls = []
     gradient_calls = []
 
-    def fake_forward(y0, u, t_span, N, problem, method, stage_solver):
-        forward_calls.append(u.copy())
-        Y = np.zeros((N + 1, 1, 1))
-        Z = np.zeros((N, 1, 1))
-        return Trajectory(Y=Y, Z=Z, caches=[None] * N)
+    def fake_forward(y0, u, plan, problem, stage_solver):
+        forward_calls.append(np.asarray(u).copy())
+        Y = np.zeros((plan.N + 1, 1, 1))
+        Z = np.zeros((plan.total_stages, 1))
+        return Trajectory(Y=Y, Z=Z, caches=[None] * plan.N, plan=plan)
 
-    def fake_adjoint(trajectory, objective, method, stage_solver, h):
+    def fake_adjoint(trajectory, objective, stage_solver):
         adjoint_calls.append(True)
         Lambda = np.zeros_like(trajectory.Y)
         Mu = np.zeros_like(trajectory.Z)
         WeightedAdj = np.zeros_like(trajectory.Z)
         return AdjointTrajectory(Lambda=Lambda, Mu=Mu, WeightedAdj=WeightedAdj)
 
-    def fake_gradient(trajectory, adjoint, u, objective, method, problem, h):
+    def fake_gradient(trajectory, adjoint, u, objective, problem):
         gradient_calls.append(True)
         return np.ones_like(u)
 

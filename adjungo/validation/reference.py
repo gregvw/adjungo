@@ -64,6 +64,7 @@ from numpy.typing import NDArray
 if TYPE_CHECKING:
     from adjungo.core.method import GLMethod
     from adjungo.core.objective import Objective
+    from adjungo.core.plan import DiscretizationPlan
     from adjungo.core.problem import Problem
 
 __all__ = [
@@ -100,18 +101,66 @@ class _Layout:
     * rows ``[0, r*n_x)``            -- ``R_init``
     * rows at ``idx_Y(n+1, l)``      -- ``R_Y[n]`` component ``l``
     * rows at ``idx_Z(n, i)``        -- ``R_Z[n, i]``
+
+    Stage-indexed storage is packed, because a plan's steps need not carry
+    the same stage count (C-18.1). The offsets are **accumulated here**, from
+    the plan's method sequence, rather than read from
+    ``DiscretizationPlan.stage_offsets``. That is not duplication for its own
+    sake: C-14.1 puts this reference at tier 1 precisely because it shares no
+    assembly with ``adjungo/stepping``, and an indexing mistake copied into
+    both sides is exactly the class of error a tier-1 oracle exists to catch.
+    What it *does* read from the plan is the plan itself -- nodes, step
+    lengths and methods -- because that is the specification of the discrete
+    problem both sides must solve, not an implementation of it.
     """
 
-    def __init__(self, N: int, s: int, r: int, nx: int, nu: int) -> None:
-        self.N = N
-        self.s = s
-        self.r = r
+    def __init__(
+        self, plan: DiscretizationPlan, nx: int, nu: int
+    ) -> None:
+        self.plan = plan
+        self.N = plan.N
         self.nx = nx
         self.nu = nu
-        self.n_ext = (N + 1) * r * nx
-        self.n_int = N * s * nx
+
+        r_values = {m.r for m in plan.methods}
+        if len(r_values) != 1:
+            raise NotImplementedError(
+                f"the reference requires one external-stage count for the "
+                f"whole plan, got {sorted(r_values)} (NUMERICS.md C-18.3)."
+            )
+        self.r = r_values.pop()
+
+        offsets = [0]
+        for method in plan.methods:
+            offsets.append(offsets[-1] + method.s)
+        self.z_off = tuple(offsets)
+        self.total_stages = offsets[-1]
+
+        self.n_ext = (self.N + 1) * self.r * nx
+        self.n_int = self.total_stages * nx
         self.nw = self.n_ext + self.n_int
-        self.nctrl = N * s * nu
+        self.nctrl = self.total_stages * nu
+
+    def s_at(self, n: int) -> int:
+        """Stage count of step ``n``."""
+        return self.plan.methods[n].s
+
+    def method_at(self, n: int) -> GLMethod:
+        """Tableau executing step ``n``."""
+        return self.plan.methods[n]
+
+    def h_at(self, n: int) -> float:
+        """Step length ``h_n``."""
+        return float(self.plan.h[n])
+
+    def t_at(self, n: int) -> float:
+        """Time at the start of step ``n``."""
+        return float(self.plan.nodes[n])
+
+    def stage(self, packed: NDArray, n: int) -> NDArray:
+        """The ``(s_n, ...)`` block of a packed stage array."""
+        start = self.z_off[n]
+        return packed[start:start + self.s_at(n)]
 
     def idx_Y(self, n: int, l: int) -> slice:
         """Slice of ``w`` holding external stage ``l`` at step ``n``."""
@@ -120,12 +169,12 @@ class _Layout:
 
     def idx_Z(self, n: int, i: int) -> slice:
         """Slice of ``w`` holding internal stage ``i`` of step ``n``."""
-        start = self.n_ext + (n * self.s + i) * self.nx
+        start = self.n_ext + (self.z_off[n] + i) * self.nx
         return slice(start, start + self.nx)
 
     def idx_u(self, n: int, k: int) -> slice:
         """Slice of the flattened control holding ``u^n_k``."""
-        start = (n * self.s + k) * self.nu
+        start = (self.z_off[n] + k) * self.nu
         return slice(start, start + self.nu)
 
     def pack(self, Y: NDArray, Z: NDArray) -> NDArray:
@@ -133,16 +182,41 @@ class _Layout:
 
     def unpack(self, w: NDArray) -> tuple[NDArray, NDArray]:
         Y = w[: self.n_ext].reshape(self.N + 1, self.r, self.nx)
-        Z = w[self.n_ext :].reshape(self.N, self.s, self.nx)
+        Z = w[self.n_ext :].reshape(self.total_stages, self.nx)
         return Y, Z
 
+    def pack_stage_input(self, arr: NDArray, name: str) -> NDArray:
+        """Accept a rectangular ``(N, s, ...)`` stage array, or a packed one.
 
-def _stage_times(t0: float, h: float, c: NDArray, step: int) -> NDArray:
-    """Stage times ``t0 + step*h + c_j*h``.
+        Callers predating C-18 pass ``(N, s, nu)`` controls, and a plan with
+        one stage count throughout can be viewed that way. The check is
+        written against this layout's own ``total_stages``.
+        """
+        a = np.asarray(arr, dtype=float)
+        if a.ndim >= 3:
+            counts = {m.s for m in self.plan.methods}
+            if len(counts) != 1 or a.shape[:2] != (self.N, self.s_at(0)):
+                raise ValueError(
+                    f"{name} has shape {a.shape}, which does not describe "
+                    f"this plan's stages (NUMERICS.md C-18.5)."
+                )
+            return a.reshape(self.total_stages, *a.shape[2:])
+        if a.ndim < 1 or a.shape[0] != self.total_stages:
+            raise ValueError(
+                f"{name} has shape {a.shape}, expected leading length "
+                f"{self.total_stages}."
+            )
+        return a
 
-    Matches ``adjungo.stepping.forward.forward_solve`` exactly.
+
+def _stage_times(lay: _Layout, step: int) -> NDArray:
+    """Stage times ``t_n + c_j h_n`` for step ``step``.
+
+    Matches ``adjungo.stepping.forward.forward_solve``'s convention (C-8.1)
+    while being computed here from the plan's nodes and step lengths.
     """
-    return t0 + step * h + c * h
+    method = lay.method_at(step)
+    return lay.t_at(step) + method.c * lay.h_at(step)
 
 
 def _embed_initial(y0: NDArray, r: int, nx: int) -> NDArray:
@@ -160,9 +234,6 @@ def _residual(
     u: NDArray,
     y0: NDArray,
     problem: Problem,
-    method: GLMethod,
-    t0: float,
-    h: float,
     lay: _Layout,
 ) -> NDArray:
     """Assemble ``R(w, u)``."""
@@ -173,19 +244,22 @@ def _residual(
     for l in range(lay.r):
         R[lay.idx_Y(0, l)] = Y[0, l] - Y0_target[l]
 
-    A, U, B, V, c = method.A, method.U, method.B, method.V, method.c
-
     for n in range(lay.N):
-        t_stage = _stage_times(t0, h, c, n)
+        method = lay.method_at(n)
+        A, U, B, V = method.A, method.U, method.B, method.V
+        h = lay.h_at(n)
+        s = lay.s_at(n)
+        t_stage = _stage_times(lay, n)
+        Zn, un = lay.stage(Z, n), lay.stage(u, n)
         f_st = np.array(
-            [problem.f(Z[n, j], u[n, j], t_stage[j]) for j in range(lay.s)]
+            [problem.f(Zn[j], un[j], t_stage[j]) for j in range(s)]
         )
 
-        for i in range(lay.s):
-            res = Z[n, i].copy()
+        for i in range(s):
+            res = Zn[i].copy()
             for k in range(lay.r):
                 res -= U[i, k] * Y[n, k]
-            for j in range(lay.s):
+            for j in range(s):
                 res -= h * A[i, j] * f_st[j]
             R[lay.idx_Z(n, i)] = res
 
@@ -193,7 +267,7 @@ def _residual(
             res = Y[n + 1, l].copy()
             for k in range(lay.r):
                 res -= V[l, k] * Y[n, k]
-            for j in range(lay.s):
+            for j in range(s):
                 res -= h * B[l, j] * f_st[j]
             R[lay.idx_Y(n + 1, l)] = res
 
@@ -204,27 +278,23 @@ def _jacobians(
     Z: NDArray,
     u: NDArray,
     problem: Problem,
-    method: GLMethod,
-    t0: float,
-    h: float,
     lay: _Layout,
 ) -> tuple[NDArray, NDArray]:
-    """Stage Jacobians ``F[n, j] = df/dy`` and ``G[n, j] = df/du``."""
-    F = np.zeros((lay.N, lay.s, lay.nx, lay.nx))
-    G = np.zeros((lay.N, lay.s, lay.nx, lay.nu))
+    """Packed stage Jacobians ``df/dy`` and ``df/du``, one block per stage."""
+    F = np.zeros((lay.total_stages, lay.nx, lay.nx))
+    G = np.zeros((lay.total_stages, lay.nx, lay.nu))
     for n in range(lay.N):
-        t_stage = _stage_times(t0, h, method.c, n)
-        for j in range(lay.s):
-            F[n, j] = problem.F(Z[n, j], u[n, j], t_stage[j])
-            G[n, j] = problem.G(Z[n, j], u[n, j], t_stage[j])
+        t_stage = _stage_times(lay, n)
+        Zn, un = lay.stage(Z, n), lay.stage(u, n)
+        Fn, Gn = lay.stage(F, n), lay.stage(G, n)
+        for j in range(lay.s_at(n)):
+            Fn[j] = problem.F(Zn[j], un[j], t_stage[j])
+            Gn[j] = problem.G(Zn[j], un[j], t_stage[j])
     return F, G
 
 
-def _dR_dw(
-    F: NDArray, method: GLMethod, h: float, lay: _Layout
-) -> NDArray:
+def _dR_dw(F: NDArray, lay: _Layout) -> NDArray:
     """Dense ``dR/dw``."""
-    A, U, B, V = method.A, method.U, method.B, method.V
     Jw = np.zeros((lay.nw, lay.nw))
     I_nx = np.eye(lay.nx)
 
@@ -232,38 +302,46 @@ def _dR_dw(
         Jw[lay.idx_Y(0, l), lay.idx_Y(0, l)] = I_nx
 
     for n in range(lay.N):
-        for i in range(lay.s):
+        method = lay.method_at(n)
+        A, U, B, V = method.A, method.U, method.B, method.V
+        h = lay.h_at(n)
+        s = lay.s_at(n)
+        Fn = lay.stage(F, n)
+
+        for i in range(s):
             row = lay.idx_Z(n, i)
             Jw[row, lay.idx_Z(n, i)] += I_nx
             for k in range(lay.r):
                 Jw[row, lay.idx_Y(n, k)] += -U[i, k] * I_nx
-            for j in range(lay.s):
-                Jw[row, lay.idx_Z(n, j)] += -h * A[i, j] * F[n, j]
+            for j in range(s):
+                Jw[row, lay.idx_Z(n, j)] += -h * A[i, j] * Fn[j]
 
         for l in range(lay.r):
             row = lay.idx_Y(n + 1, l)
             Jw[row, lay.idx_Y(n + 1, l)] += I_nx
             for k in range(lay.r):
                 Jw[row, lay.idx_Y(n, k)] += -V[l, k] * I_nx
-            for j in range(lay.s):
-                Jw[row, lay.idx_Z(n, j)] += -h * B[l, j] * F[n, j]
+            for j in range(s):
+                Jw[row, lay.idx_Z(n, j)] += -h * B[l, j] * Fn[j]
 
     return Jw
 
 
-def _dR_du(
-    G: NDArray, method: GLMethod, h: float, lay: _Layout
-) -> NDArray:
+def _dR_du(G: NDArray, lay: _Layout) -> NDArray:
     """Dense ``dR/du``."""
-    A, B = method.A, method.B
     Ju = np.zeros((lay.nw, lay.nctrl))
     for n in range(lay.N):
-        for j in range(lay.s):
+        method = lay.method_at(n)
+        A, B = method.A, method.B
+        h = lay.h_at(n)
+        s = lay.s_at(n)
+        Gn = lay.stage(G, n)
+        for j in range(s):
             col = lay.idx_u(n, j)
-            for i in range(lay.s):
-                Ju[lay.idx_Z(n, i), col] += -h * A[i, j] * G[n, j]
+            for i in range(s):
+                Ju[lay.idx_Z(n, i), col] += -h * A[i, j] * Gn[j]
             for l in range(lay.r):
-                Ju[lay.idx_Y(n + 1, l), col] += -h * B[l, j] * G[n, j]
+                Ju[lay.idx_Y(n + 1, l), col] += -h * B[l, j] * Gn[j]
     return Ju
 
 
@@ -286,7 +364,7 @@ def _constant_guess(y0: NDArray, lay: _Layout) -> NDArray:
     """Every step node and every stage at the initial state."""
     Y = np.zeros((lay.N + 1, lay.r, lay.nx))
     Y[:] = _embed_initial(y0, lay.r, lay.nx)
-    Z = np.zeros((lay.N, lay.s, lay.nx))
+    Z = np.zeros((lay.total_stages, lay.nx))
     Z[:] = y0
     return lay.pack(Y, Z)
 
@@ -295,9 +373,6 @@ def _swept_guess(
     u: NDArray,
     y0: NDArray,
     problem: Problem,
-    method: GLMethod,
-    t0: float,
-    h: float,
     lay: _Layout,
     max_sweeps: int = 4,
 ) -> NDArray:
@@ -344,42 +419,43 @@ def _swept_guess(
     when no sweep is accepted within a step, and this function has no basis
     for judging the trajectory as a whole.
     """
-    A, U, B, V, c = method.A, method.U, method.B, method.V, method.c
-
     Y = np.zeros((lay.N + 1, lay.r, lay.nx))
-    Z = np.zeros((lay.N, lay.s, lay.nx))
+    Z = np.zeros((lay.total_stages, lay.nx))
     Y[0] = _embed_initial(y0, lay.r, lay.nx)
 
     for n in range(lay.N):
-        t_stage = _stage_times(t0, h, c, n)
+        method = lay.method_at(n)
+        A, U, B, V = method.A, method.U, method.B, method.V
+        h = lay.h_at(n)
+        s = lay.s_at(n)
+        t_stage = _stage_times(lay, n)
+        un = lay.stage(u, n)
         explicit = np.array(
-            [sum(U[i, k] * Y[n, k] for k in range(lay.r)) for i in range(lay.s)]
+            [sum(U[i, k] * Y[n, k] for k in range(lay.r)) for i in range(s)]
         )
 
         Zn = explicit
-        defect = _stage_defect(
-            Zn, explicit, problem, u[n], t_stage, A, h, lay.s
-        )
+        defect = _stage_defect(Zn, explicit, problem, un, t_stage, A, h, s)
         for _ in range(max_sweeps):
             f_st = np.array(
-                [problem.f(Zn[j], u[n, j], t_stage[j]) for j in range(lay.s)]
+                [problem.f(Zn[j], un[j], t_stage[j]) for j in range(s)]
             )
             candidate = explicit + h * (A @ f_st)
             candidate_defect = _stage_defect(
-                candidate, explicit, problem, u[n], t_stage, A, h, lay.s
+                candidate, explicit, problem, un, t_stage, A, h, s
             )
             if not candidate_defect < defect:
                 break
             Zn, defect = candidate, candidate_defect
 
-        Z[n] = Zn
+        lay.stage(Z, n)[...] = Zn
         f_st = np.array(
-            [problem.f(Zn[j], u[n, j], t_stage[j]) for j in range(lay.s)]
+            [problem.f(Zn[j], un[j], t_stage[j]) for j in range(s)]
         )
         for l in range(lay.r):
             Y[n + 1, l] = sum(
                 V[l, k] * Y[n, k] for k in range(lay.r)
-            ) + h * sum(B[l, j] * f_st[j] for j in range(lay.s))
+            ) + h * sum(B[l, j] * f_st[j] for j in range(s))
 
     return lay.pack(Y, Z)
 
@@ -388,9 +464,6 @@ def _initial_guess(
     u: NDArray,
     y0: NDArray,
     problem: Problem,
-    method: GLMethod,
-    t0: float,
-    h: float,
     lay: _Layout,
 ) -> NDArray:
     """Choose where Newton starts, by measured residual.
@@ -446,30 +519,71 @@ def _initial_guess(
     # raised.
     try:
         with np.errstate(over="ignore", invalid="ignore"):
-            swept = _swept_guess(u, y0, problem, method, t0, h, lay)
+            swept = _swept_guess(u, y0, problem, lay)
             swept_defect = np.max(
-                np.abs(_residual(swept, u, y0, problem, method, t0, h, lay))
+                np.abs(_residual(swept, u, y0, problem, lay))
             )
     except Exception:  # noqa: BLE001 - see above; any predictor failure falls back
         return constant
 
     constant_defect = np.max(
-        np.abs(_residual(constant, u, y0, problem, method, t0, h, lay))
+        np.abs(_residual(constant, u, y0, problem, lay))
     )
     if swept_defect < constant_defect:
         return swept
     return constant
 
 
+def _resolve_plan(
+    t_span: tuple[float, float] | None,
+    N: int | None,
+    method: GLMethod | None,
+    plan: DiscretizationPlan | None,
+) -> DiscretizationPlan:
+    """Accept either an explicit plan or the uniform ``(t_span, N, method)``.
+
+    The uniform arguments are a plan like any other (C-18.1). Supplying both
+    forms is refused rather than resolved by precedence: the reference would
+    otherwise validate the package against a discretization the caller did
+    not name.
+    """
+    from adjungo.core.plan import DiscretizationPlan as _Plan
+
+    uniform = (t_span, N, method)
+    if plan is None:
+        missing = [
+            name
+            for name, value in zip(
+                ("t_span", "N", "method"), uniform, strict=True
+            )
+            if value is None
+        ]
+        if missing:
+            raise TypeError(
+                f"the reference needs either plan= or all of t_span, N, "
+                f"method; missing {', '.join(missing)}."
+            )
+        assert t_span is not None and N is not None and method is not None
+        return _Plan.uniform(t_span, N, method)
+    if any(value is not None for value in uniform):
+        raise TypeError(
+            "the reference takes either plan= or (t_span, N, method), not "
+            "both."
+        )
+    return plan
+
+
 def reference_solve(
     y0: NDArray,
     u: NDArray,
-    t_span: tuple[float, float],
-    N: int,
-    problem: Problem,
-    method: GLMethod,
+    t_span: tuple[float, float] | None = None,
+    N: int | None = None,
+    problem: Problem | None = None,
+    method: GLMethod | None = None,
     tol: float = 1e-13,
     max_iter: int = 50,
+    *,
+    plan: DiscretizationPlan | None = None,
 ) -> ReferenceSolution:
     """Solve the monolithic discrete system ``R(w, u) = 0`` by Newton's method.
 
@@ -507,14 +621,16 @@ def reference_solve(
             silently unconverged reference is worse than no reference
             (clause C-6, no silent sentinels).
     """
-    t0, t1 = t_span
-    h = (t1 - t0) / N
-    lay = _Layout(N, method.s, method.r, problem.state_dim, problem.control_dim)
-    w = _initial_guess(u, y0, problem, method, t0, h, lay)
+    if problem is None:
+        raise TypeError("reference_solve requires problem.")
+    plan = _resolve_plan(t_span, N, method, plan)
+    lay = _Layout(plan, problem.state_dim, problem.control_dim)
+    u = lay.pack_stage_input(u, "control")
+    w = _initial_guess(u, y0, problem, lay)
 
     res_norm = np.inf
     for it in range(1, max_iter + 1):
-        R = _residual(w, u, y0, problem, method, t0, h, lay)
+        R = _residual(w, u, y0, problem, lay)
         res_norm = float(np.max(np.abs(R)))
         if res_norm <= tol:
             Yc, Zc = lay.unpack(w)
@@ -522,8 +638,8 @@ def reference_solve(
                 Y=Yc.copy(), Z=Zc.copy(), residual_norm=res_norm, iterations=it - 1
             )
         _, Zc = lay.unpack(w)
-        F, _ = _jacobians(Zc, u, problem, method, t0, h, lay)
-        Jw = _dR_dw(F, method, h, lay)
+        F, _ = _jacobians(Zc, u, problem, lay)
+        Jw = _dR_dw(F, lay)
         w = w - np.linalg.solve(Jw, R)
 
     raise RuntimeError(
@@ -565,20 +681,23 @@ def _objective_control_gradient(
     """``dJ/du`` holding the state fixed (the explicit control dependence)."""
     g = np.zeros(lay.nctrl)
     for n in range(lay.N):
-        for k in range(lay.s):
-            g[lay.idx_u(n, k)] = np.asarray(objective.dJ_du(u[n, k], n, k))
+        un = lay.stage(u, n)
+        for k in range(lay.s_at(n)):
+            g[lay.idx_u(n, k)] = np.asarray(objective.dJ_du(un[k], n, k))
     return g
 
 
 def reference_gradient(
     y0: NDArray,
     u: NDArray,
-    t_span: tuple[float, float],
-    N: int,
-    problem: Problem,
-    method: GLMethod,
-    objective: Objective,
+    t_span: tuple[float, float] | None = None,
+    N: int | None = None,
+    problem: Problem | None = None,
+    method: GLMethod | None = None,
+    objective: Objective | None = None,
     solution: ReferenceSolution | None = None,
+    *,
+    plan: DiscretizationPlan | None = None,
 ) -> NDArray:
     """Exact discrete reduced gradient ``dJ/du`` of the monolithic system.
 
@@ -595,27 +714,29 @@ def reference_gradient(
     Returns:
         Gradient with shape ``(N, s, nu)``, matching the layout of ``u``.
     """
-    t0, t1 = t_span
-    h = (t1 - t0) / N
-    lay = _Layout(N, method.s, method.r, problem.state_dim, problem.control_dim)
+    if problem is None or objective is None:
+        raise TypeError("reference_gradient requires problem and objective.")
+    shape_in = np.shape(u)
+    plan = _resolve_plan(t_span, N, method, plan)
+    lay = _Layout(plan, problem.state_dim, problem.control_dim)
+    u = lay.pack_stage_input(u, "control")
 
-    sol = solution or reference_solve(y0, u, t_span, N, problem, method)
-    F, G = _jacobians(sol.Z, u, problem, method, t0, h, lay)
+    sol = solution or reference_solve(y0, u, problem=problem, plan=plan)
+    F, G = _jacobians(sol.Z, u, problem, lay)
 
-    Rw = _dR_dw(F, method, h, lay)
-    Ru = _dR_du(G, method, h, lay)
+    Rw = _dR_dw(F, lay)
+    Ru = _dR_du(G, lay)
     Jw = _objective_state_gradient(sol.Y, objective, lay)
     Ju = _objective_control_gradient(u, objective, lay)
 
     # p solves Rw^T p = Jw  ->  dJ/du = Ju - p^T Ru
     p = np.linalg.solve(Rw.T, Jw)
     grad = Ju - Ru.T @ p
-    return np.asarray(grad, dtype=float).reshape(N, lay.s, lay.nu)
+    out_shape = shape_in if len(shape_in) == 3 else (lay.total_stages, lay.nu)
+    return np.asarray(grad, dtype=float).reshape(out_shape)
 
 
-def _lagrange_contraction(
-    p: NDArray, method: GLMethod, h: float, lay: _Layout
-) -> NDArray:
+def _lagrange_contraction(p: NDArray, lay: _Layout) -> NDArray:
     """Per-stage adjoint weight ``q[n, j]`` contracting the residual Hessian.
 
     Only the ``f`` terms of ``R`` are nonlinear, and ``f(Z^n_j, u^n_j, .)``
@@ -627,16 +748,20 @@ def _lagrange_contraction(
     and ``sum_m p_m grad^2 R_m`` restricted to stage ``(n, j)`` equals the
     contraction of ``grad^2 f`` against ``q[n, j]``.
     """
-    A, B = method.A, method.B
-    q = np.zeros((lay.N, lay.s, lay.nx))
+    q = np.zeros((lay.total_stages, lay.nx))
     for n in range(lay.N):
-        for j in range(lay.s):
+        method = lay.method_at(n)
+        A, B = method.A, method.B
+        h = lay.h_at(n)
+        s = lay.s_at(n)
+        qn = lay.stage(q, n)
+        for j in range(s):
             acc = np.zeros(lay.nx)
-            for i in range(lay.s):
+            for i in range(s):
                 acc += A[i, j] * p[lay.idx_Z(n, i)]
             for l in range(lay.r):
                 acc += B[l, j] * p[lay.idx_Y(n + 1, l)]
-            q[n, j] = -h * acc
+            qn[j] = -h * acc
     return q
 
 
@@ -654,12 +779,14 @@ def _require(objective: Objective, name: str) -> Any:
 def reference_hessian(
     y0: NDArray,
     u: NDArray,
-    t_span: tuple[float, float],
-    N: int,
-    problem: Problem,
-    method: GLMethod,
-    objective: Objective,
+    t_span: tuple[float, float] | None = None,
+    N: int | None = None,
+    problem: Problem | None = None,
+    method: GLMethod | None = None,
+    objective: Objective | None = None,
     solution: ReferenceSolution | None = None,
+    *,
+    plan: DiscretizationPlan | None = None,
 ) -> NDArray:
     """Exact dense discrete reduced Hessian ``d2J/du2``.
 
@@ -685,9 +812,12 @@ def reference_hessian(
         NotImplementedError: If a required second-derivative callback is
             missing.
     """
-    t0, t1 = t_span
-    h = (t1 - t0) / N
-    lay = _Layout(N, method.s, method.r, problem.state_dim, problem.control_dim)
+    if problem is None or objective is None:
+        raise TypeError("reference_hessian requires problem and objective.")
+    plan = _resolve_plan(t_span, N, method, plan)
+    lay = _Layout(plan, problem.state_dim, problem.control_dim)
+    u = lay.pack_stage_input(u, "control")
+    N = lay.N
 
     d2J_dy2_terminal = _require(objective, "d2J_dy2_terminal")
     d2J_dy2 = _require(objective, "d2J_dy2")
@@ -698,17 +828,17 @@ def reference_hessian(
                 f"{type(problem).__name__} does not provide it."
             )
 
-    sol = solution or reference_solve(y0, u, t_span, N, problem, method)
-    F, G = _jacobians(sol.Z, u, problem, method, t0, h, lay)
+    sol = solution or reference_solve(y0, u, problem=problem, plan=plan)
+    F, G = _jacobians(sol.Z, u, problem, lay)
 
-    Rw = _dR_dw(F, method, h, lay)
-    Ru = _dR_du(G, method, h, lay)
+    Rw = _dR_dw(F, lay)
+    Ru = _dR_du(G, lay)
     gw = _objective_state_gradient(sol.Y, objective, lay)
 
     p = np.linalg.solve(Rw.T, gw)
     S = -np.linalg.solve(Rw, Ru)
 
-    q = _lagrange_contraction(p, method, h, lay)
+    q = _lagrange_contraction(p, lay)
 
     # Lagrangian second derivatives: L = J - p^T R.
     L_ww = np.zeros((lay.nw, lay.nw))
@@ -721,17 +851,19 @@ def reference_hessian(
         L_ww[lay.idx_Y(n, 0), lay.idx_Y(n, 0)] += np.asarray(
             d2J_dy2(sol.Y[n], n)
         )
-        for k in range(lay.s):
+        un = lay.stage(u, n)
+        for k in range(lay.s_at(n)):
             L_uu[lay.idx_u(n, k), lay.idx_u(n, k)] += np.asarray(
-                objective.d2J_du2(u[n, k], n, k)
+                objective.d2J_du2(un[k], n, k)
             )
 
     # -sum_m p_m grad^2 R_m contributions, stage-local.
     for n in range(N):
-        t_stage = _stage_times(t0, h, method.c, n)
-        for j in range(lay.s):
-            zj, uj, tj = sol.Z[n, j], u[n, j], t_stage[j]
-            qj = q[n, j]
+        t_stage = _stage_times(lay, n)
+        Zn, un, qn = lay.stage(sol.Z, n), lay.stage(u, n), lay.stage(q, n)
+        for j in range(lay.s_at(n)):
+            zj, uj, tj = Zn[j], un[j], t_stage[j]
+            qj = qn[j]
             L_ww[lay.idx_Z(n, j), lay.idx_Z(n, j)] += -np.asarray(
                 problem.F_yy_action(zj, uj, tj, qj)
             )

@@ -71,6 +71,14 @@ adjungo/
     requirements.py    deduce_requirements(method, structure, state_dim):
                        decides, from the declaration alone, what the solver
                        must be able to do.
+    plan.py            DiscretizationPlan: the time nodes and the method used
+                       on each step (C-18.1). It is the discrete problem's
+                       identity, so it is frozen, it is carried on the
+                       trajectory, and the backward sweep reads it by step
+                       index rather than re-deriving it. DiscretizationPlan
+                       .uniform reproduces the single-method, equal-step case
+                       and gives every step exactly the same h, which C-15
+                       reuse depends on.
 
   algebra/         how linear systems are represented and solved
     protocols.py       LinearAlgebraBackend protocol.
@@ -234,8 +242,8 @@ Stated here so that this document cannot be read as advertising.
 | Automatic differentiation of user callbacks | Not planned. The caller supplies derivatives. |
 | Additive / IMEX splitting | Tableaux retained in `methods/experimental/`; refused. |
 | `r > 1` multistep | Tableaux retained; refused. Needs a certified starting procedure. |
-| Partitioned methods (PRK, Nystrom) | Not built, and not certified. Conventions, domain, the paired symplectic condition and the conjugate exchange are `APPROVED` in `NUMERICS.md` C-8.4; certification cases in C-14.5, also `APPROVED`. Both rule how such a family must be expressed and certified; neither delivers one. No representation exists, so there is nothing to hand to `GLMOptimizer`; C-6.2 would refuse one if there were. Sequenced after the discretization plan so that stage storage is refactored once rather than twice — not because a partitioned step needs packed storage; both target methods fit the present rectangular arrays. |
-| Non-uniform steps, per-step method selection, mesh adaptation | Not built. `h = (t_span[1] - t_span[0]) / N` is a scalar at four sites, `Trajectory.Z` is a dense `(N, s, n)`, and the C-10 adapters bake one `method.s` and one `c`. `NUMERICS.md` C-18 drafts the plan abstraction, the `J_𝒟` promise, the packed-offset storage and the variable-step symplectic caveat; it is `OPEN`. Its first increment would cover `r = 1` families at fixed state dimension; multistep startup and adaptation policies are later work. |
+| Partitioned methods (PRK, Nystrom) | Not built, and not certified. Conventions, domain, the paired symplectic condition and the conjugate exchange are `APPROVED` in `NUMERICS.md` C-8.4; certification cases in C-14.5, also `APPROVED`. Both rule how such a family must be expressed and certified; neither delivers one. No representation exists, so there is nothing to hand to `GLMOptimizer`; C-6.2 would refuse one if there were. Sequenced after the discretization plan, which is now delivered, so that stage storage was refactored once rather than twice — not because a partitioned step needs packed storage; both target methods fit the present rectangular arrays. |
+| Mesh adaptation, and control parametrization on a varying stage count | Not built. **Prescribed** non-uniform steps and per-step method selection *are* built, as `core/plan.py`; `NUMERICS.md` C-18's first increment covers `r = 1` families at fixed state dimension and is acceptance-tested in `tests/test_discretization_plan.py`. What remains unbuilt is the outer **adaptation policy** that would construct a plan from a trajectory, and multistep startup, which still waits on C-Q4. Two present limits, both loud under C-7: the C-10 adapters bake one `method.s`, so a plan whose stage count varies is refused a control parametrization; and `Objective.evaluate` is specified on the rectangular `(N, s, ν)` layout, which such a plan does not have, so it has gradients and Hessian-vector products but no scalar objective value and therefore no line search. |
 | Matrix-free linear algebra | Not built. `algebra/protocols.py` is the seam it would enter through; `algebra/operators.py` holds an unused `LinearOperator` sketch. |
 | Sparse linear algebra | Not built. Same seam. |
 | Reuse for a *varying* Jacobian (modified Newton, lagged Jacobian) | Not built. The refusal is narrower than it first appears and is stated precisely below. |

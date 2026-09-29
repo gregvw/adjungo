@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from scipy.integrate import solve_ivp
 
+from adjungo.core.plan import DiscretizationPlan
 from adjungo.methods.runge_kutta import explicit_euler, heun, rk4
 from adjungo.solvers.explicit import ExplicitStageSolver
 from adjungo.stepping.forward import forward_solve
@@ -74,7 +75,7 @@ def test_explicit_euler_vs_scipy_exponential():
 
     # Our implementation
     u = np.zeros((N, 1, 0))  # No control
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
     y_final_ours = trajectory.Y[-1, 0]
 
     # Scipy solution
@@ -107,7 +108,7 @@ def test_rk4_vs_scipy_harmonic_oscillator():
 
     # Our implementation
     u = np.zeros((N, 4, 0))  # No control, 4 stages for RK4
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
     y_final_ours = trajectory.Y[-1, 0]
 
     # Scipy solution
@@ -148,7 +149,7 @@ def test_heun_vs_scipy_linear_system():
 
     # Our implementation
     u = np.zeros((N, 2, 0))  # No control, 2 stages for Heun
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
     y_final_ours = trajectory.Y[-1, 0]
 
     # Scipy solution
@@ -182,7 +183,7 @@ def test_trajectory_at_intermediate_points():
 
     # Our implementation
     u = np.zeros((N, 4, 0))
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
 
     # Scipy solution
     def scipy_rhs(t, y):
@@ -225,7 +226,7 @@ def test_with_control_input():
         return np.array([np.sin(t)])
 
     # Our implementation with control
-    trajectory = forward_solve(y0, u_func, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u_func, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
     y_final_ours = trajectory.Y[-1, 0, 0]
 
     # Scipy solution with same control
@@ -256,7 +257,7 @@ def test_stiff_problem_comparison():
 
     # Our implementation
     u = np.zeros((N, 4, 0))
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
     y_final_ours = trajectory.Y[-1, 0, 0]
 
     # Scipy solution
@@ -290,7 +291,7 @@ def test_conservation_of_energy():
 
     # Our implementation
     u = np.zeros((N, 4, 0))
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
 
     # Compute energy at each time step: E = 0.5*(v^2 + x^2)
     energies = []
@@ -329,7 +330,7 @@ def test_convergence_with_refinement():
 
     for N in [10, 20, 40, 80]:
         u = np.zeros((N, 4, 0))
-        trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+        trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
         y_final = trajectory.Y[-1, 0, 0]
 
         error = np.abs(y_final - y_exact)
@@ -361,7 +362,7 @@ def test_euler_accuracy_vs_scipy_parametrized(N):
 
     # Our implementation
     u = np.zeros((N, 1, 0))
-    trajectory = forward_solve(y0, u, t_span, N, problem, method, solver)
+    trajectory = forward_solve(y0, u, DiscretizationPlan.uniform(t_span, N, method), problem, solver)
     y_final_ours = trajectory.Y[-1, 0, 0]
 
     # Analytical

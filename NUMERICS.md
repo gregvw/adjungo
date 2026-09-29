@@ -2571,19 +2571,24 @@ Evidence: `tests/test_time_varying_affine.py`, section "Reuse across calls".
 
 <a id="c-18"></a>
 
-## C-18 The discretization plan — `OPEN`, draft, unimplemented
+## C-18 The discretization plan — `APPROVED`, delivered
 
-Everything certified today assumes **one mesh and one method for a whole
-solve**: `h = (t₁ − t₀)/N` is a scalar, `Trajectory.Z` is a dense `(N, s, n)`
-array, and the C-10 adapters are built against a single `method.s` and a single
-`c`. That assumption is not a numerical requirement; it is an early convenience
-that three prospective capabilities all need removed — variable step sizes,
-prescribed method changes across regimes, and eventually a multistep starting
-procedure.
+Everything certified before this clause assumed **one mesh and one method for a
+whole solve**: `h = (t₁ − t₀)/N` was a scalar, `Trajectory.Z` was a dense
+`(N, s, n)` array, and the C-10 adapters were built against a single `method.s`
+and a single `c`. That assumption was not a numerical requirement; it was an
+early convenience that three prospective capabilities all need removed —
+variable step sizes, prescribed method changes across regimes, and eventually a
+multistep starting procedure.
 
-This clause fixes what replaces it. Nothing here is implemented.
+This clause fixes what replaces it. Its first increment — prescribed
+non-uniform steps and per-step methods over the certified `r = 1` families, at
+fixed state dimension — is implemented as `adjungo/core/plan.py` and meets
+every item of [C-18.7](#c-18); the delivery record there states what was
+measured and what remains refused. Mesh **adaptation** and multistep startup
+are later work and are not delivered.
 
-### C-18.1 The plan is explicit data — `OPEN`
+### C-18.1 The plan is explicit data — `APPROVED`
 
 A **discretization plan** `𝒟` is the time nodes `t₀ < t₁ < … < t_N`, giving
 `h_n = t_{n+1} − t_n`, together with a method specification for each step. The
@@ -2598,7 +2603,7 @@ coefficients cannot express a change of method between steps. A plan carrying
 partitioned step implementations uses both axes at once; neither subsumes the
 other, and neither is evidence for the other's design.
 
-### C-18.2 What the derivative is a derivative of — `OPEN`
+### C-18.2 What the derivative is a derivative of — `APPROVED`
 
 [C-2](#c-2) promises the exact derivative of the objective as discretised, at
 the mesh supplied. Under a plan that reads: adjungo returns the exact
@@ -2640,7 +2645,7 @@ what re-running one policy in both sweeps arranges. See [C-14.1](#c-14).
 Changing a plan invalidates the trajectory and every factorization cache keyed
 to it.
 
-### C-18.3 Scope of the first implementation — `OPEN`
+### C-18.3 Scope of the first implementation — `APPROVED`
 
 The plan is built against the **existing certified `r = 1` families** and a
 **fixed state dimension `n`**, varying the nodes, the stage count and the
@@ -2653,7 +2658,7 @@ design choice the starting procedure makes, not a prerequisite.) Nor is an
 adaptation policy implemented; C-18 defines what a policy may hand in, not the
 policy.
 
-### C-18.4 Where `h_n` and the step's weights enter — `OPEN`
+### C-18.4 Where `h_n` and the step's weights enter — `APPROVED`
 
 [C-8.1](#c-8)'s placement rule is unchanged in substance and restated per step:
 `h_n` is applied by the stepping code and is never absorbed into `A` or `B`.
@@ -2676,7 +2681,7 @@ package or the reference, and this clause does not add it. The uniform
 single-method case is the degenerate plan and must reproduce the present
 formulas exactly.
 
-### C-18.5 Storage — `OPEN`
+### C-18.5 Storage — `APPROVED`
 
 A plan whose steps have **different stage counts** cannot use the present dense
 `(N, s, n)` arrays. Stage storage becomes **packed with per-step offsets**, in
@@ -2697,9 +2702,9 @@ Sharing them is the obvious economy and it would destroy the property that makes
 cannot share a mistake with it. Two independent offset calculations that agree
 is evidence; one calculation used twice is not.
 
-### C-18.6 A variable-step plan does not inherit constant-step conservation — `OPEN`
+### C-18.6 A variable-step plan does not inherit constant-step conservation — `DERIVED`
 
-`DERIVED`. A prescribed sequence of symplectic steps is symplectic at unequal
+A prescribed sequence of symplectic steps is symplectic at unequal
 step sizes: each step is a symplectic map and their composition is symplectic.
 
 **The near-conservation of `H` that motivates these methods does not follow.**
@@ -2735,7 +2740,7 @@ Consequently a variable-step plan **may not cite the constant-step energy
 behaviour recorded for [C-8.4](#c-8) methods**, and any energy claim under a
 plan requires its own evidence at that plan.
 
-### C-18.7 Acceptance — `OPEN`
+### C-18.7 Acceptance — `APPROVED`
 
 Before any new capability rides on it:
 
@@ -2760,6 +2765,84 @@ Before any new capability rides on it:
    the plan it was keyed to.
 5. A [C-14.2](#c-14) injection campaign. None has been run; nothing here is
    certified.
+
+#### C-18.7 delivery record
+
+All five items are met. `adjungo/core/plan.py` carries `DiscretizationPlan`;
+`tests/test_discretization_plan.py` carries items 2, 3 and 4.
+
+**Item 1.** The full suite passes unchanged at 1047 tests, the pre-existing
+1019 of them reaching the solver through `DiscretizationPlan.uniform`.
+
+**Item 2.** Gradients and Hessian-vector products on four graded, mixed-method
+plans — stage counts `(1,2,4,1,2)`, `(1,2,3,2)`, `(2,3,2)` and `(2,2,4,1)` over
+`t ∈ [0.3, 1.1]` with `h_max/h_min = 4`, on `CoupledNonlinear`/`FullCostObjective`
+(`n_x = 3`, `ν = 2`) — agree with the [C-14.1](#c-14) tier-1 reference inside
+the [C-3](#c-3) tolerance carried by the *loosest* method in each plan. A plan
+is a sequence of independent method choices, so one implicit step anywhere puts
+the whole solve on the C-3.4 Newton-radius budget. A fixed-mesh ε-sweep
+([C-14.1](#c-14) level 3) runs beside that comparison, not in place of it, on
+the plans that mix methods at a constant stage count.
+
+**Item 3.** A four-to-one graded mesh, refined as a plan at `N = 8, 16, 32, 64`
+with its grading held fixed, on `y' = −1.3y + u` at `y₀ = 0.7`, `u ≡ 0.45`,
+`t ∈ [0, 1]`, error in `|y(1) − y_N|` against the closed form, `h` taken as the
+largest step: observed rates at or above `p − 0.25` for `explicit_euler` (1),
+`heun` (2), `implicit_midpoint` (2) and `rk4` (4).
+
+**Item 4.** A uniform and a three-to-one graded plan over the same `t_span` and
+`N`, with identical control parameters: the second plan evaluated on a fresh
+optimizer agrees with itself to `1e-13` relative in objective, gradient and
+HVP, while differing from the first plan's gradient by more than `1e-6` — so
+the agreement is not satisfied by ignoring the plan. A second case changes `N`
+under `jacobian_constant` reuse and checks the result against the tier-1
+reference, which is what a factorization cache outliving its plan would fail.
+
+**Item 5.** Twelve single-token injections, run under the [R-11](#r-11)
+protocol with the exit status cross-checked against the parsed count. Every one
+was detected, and every one was detected by `tests/test_discretization_plan.py`
+*alone*:
+
+| Injection | Failing tests |
+|---|---|
+| `stage_offsets[step]` → `+ 1` | 557 of 1047 |
+| `stage_times` uses `h[0]` | 8 |
+| forward sweep uses `step_size(0)` | 14 |
+| adjoint sweep uses `step_size(0)` | 10 |
+| gradient assembly uses `step_size(0)` | 6 |
+| `uniform` derives `step_sizes` by `np.diff(nodes)` | 60 |
+| forward sweep uses `method_at(0)` | 11 |
+| adjoint sweep uses `method_at(0)` | 11 |
+| both sensitivity sweeps use `step_size(0)` | 4 |
+| HVP assembly uses `step_size(0)` | 4 |
+| both sensitivity sweeps use `method_at(0)` | 4 |
+| `_enforce_envelope` loops over `plan.methods[:1]` | 1 |
+
+The sixth of those is the one worth reading twice. `np.diff` of equally spaced
+nodes returns step sizes that differ in the last ulp — harmless for accuracy,
+and fatal for [C-15.1](#c-15) reuse, because `I − h a_ii F` built from a step
+size differing in its last bit is a *different matrix* at that step, so the
+stored factorization fails the element-for-element comparison and the solve
+silently refactorizes once per step. Measured before `step_sizes` was made
+explicit: 5 factorizations over 12 steps of `implicit_midpoint` where
+`SolverRequirements` predicts 1. `DiscretizationPlan.uniform` therefore builds
+`nodes = t₀ + arange(N+1)·h` with `nodes[-1]` forced exact and
+`step_sizes = full(N, h)`; `t_n` and `h_n` are both part of the executed
+discretization and on a uniform mesh cannot both be exact, and this is the same
+pair the scalar-`h` code carried.
+
+**Two scope limits, both refused loudly under [C-7](#c-7).** A plan whose stage
+count *varies across steps* has no rectangular `(N, s, ν)` layout, so it is
+refused a [C-10](#c-10) control parametrization, and `Objective.evaluate`,
+which is specified on that layout, is refused it too — such a plan has exact
+gradients and Hessian-vector products, whose objective callbacks are per-stage
+and carry no layout assumption, but no scalar objective value and therefore no
+line search. Non-uniform steps at a *fixed* stage count, which is what
+[C-8.4](#c-8) needs and what an adaptation policy would reach for first, are
+unaffected.
+
+Certification of a *new method family* is unchanged by this: [C-6.1](#c-6)
+still governs, and nothing was added to it.
 
 ---
 

@@ -24,6 +24,7 @@ import pytest
 import scipy.linalg
 
 from adjungo.core.method import GLMethod, StageType
+from adjungo.core.plan import DiscretizationPlan
 from adjungo.core.problem import Linearity, ProblemStructure
 from adjungo.core.requirements import deduce_requirements
 from adjungo.methods.runge_kutta import (
@@ -492,7 +493,7 @@ def _terminal_error(method: GLMethod, N: int) -> float:
     exact = scipy.linalg.expm(problem.Amat * T) @ y0
     solver = _solver_for(method, problem, linear=True)
     trajectory = forward_solve(
-        y0, np.zeros((N, method.s, 1)), (0.0, T), N, problem, method, solver
+        y0, np.zeros((N, method.s, 1)), DiscretizationPlan.uniform((0.0, T), N, method), problem, solver
     )
     return float(np.max(np.abs(trajectory.Y[-1][0] - exact)))
 

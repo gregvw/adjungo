@@ -95,6 +95,7 @@ from adjungo import GLMOptimizer
 from adjungo.core.method import GLMethod
 from adjungo.methods import runge_kutta
 from adjungo.stepping import adjoint_solve
+from adjungo.stepping.trajectory import stage_view
 
 EPS = float(np.finfo(float).eps)
 
@@ -278,10 +279,7 @@ def _adjoint(optimizer, u):
     return adjoint_solve(
         optimizer.trajectory(u),
         optimizer.objective,
-        optimizer.method,
-        optimizer.stage_solver,
-        optimizer.h,
-    )
+        optimizer.stage_solver)
 
 
 def test_the_discovered_tableaux_cover_both_sides_of_d1():
@@ -426,12 +424,13 @@ def test_stage_adjoint_is_the_costate_at_the_transformed_abscissa(name):
             for seed in SEEDS:
                 optimizer, u = _setup(kappa, w, method, N, seed)
                 adjoint = _adjoint(optimizer, u)
+                W_rect = stage_view(adjoint.WeightedAdj, optimizer.plan)
                 h = optimizer.h
                 for n in range(N):
                     lam_next = costate((N - n - 1) * h, kappa, w)
                     MT_lam = MT @ lam_next
                     for k in range(method.s):
-                        got = adjoint.WeightedAdj[n, k]
+                        got = W_rect[n, k]
                         direct = b[k] * lam_next + h * bA[k] * MT_lam
                         sampled = b[k] * costate(
                             (N - n - cbar[k]) * h, kappa, w
@@ -474,6 +473,7 @@ def test_the_stage_time_is_c_bar_and_not_c(name):
             for seed in SEEDS:
                 optimizer, u = _setup(kappa, w, method, N, seed)
                 adjoint = _adjoint(optimizer, u)
+                W_rect = stage_view(adjoint.WeightedAdj, optimizer.plan)
                 h = optimizer.h
                 for n in range(N):
                     lam_next = costate((N - n - 1) * h, kappa, w)
@@ -487,7 +487,7 @@ def test_the_stage_time_is_c_bar_and_not_c(name):
                             + h * abs_bA[k] * np.abs(MT_lam)
                         ).max()
                         deviation = (
-                            np.abs(adjoint.WeightedAdj[n, k] - at_c).max()
+                            np.abs(W_rect[n, k] - at_c).max()
                             / scale
                         )
                         if satisfies_d1:

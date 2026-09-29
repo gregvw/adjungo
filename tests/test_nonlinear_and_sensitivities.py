@@ -267,9 +267,8 @@ def test_forward_sensitivity_finite_difference():
 
     # Forward sensitivity: δy from δu
     sens = forward_sensitivity(
-        trajectory, delta_u, method, optimizer.stage_solver,
-        optimizer.problem, optimizer.h
-    )
+        trajectory, delta_u, optimizer.stage_solver,
+        optimizer.problem)
 
     # Finite difference validation
     eps = 1e-6
@@ -323,16 +322,13 @@ def test_adjoint_sensitivity_finite_difference():
     # Forward sensitivity to get δy
 
     sens = forward_sensitivity(
-        trajectory, delta_u, method, optimizer.stage_solver,
-        optimizer.problem, optimizer.h
-    )
+        trajectory, delta_u, optimizer.stage_solver,
+        optimizer.problem)
 
     # Adjoint sensitivity: δλ from δy
     adj_sens = adjoint_sensitivity(
-        trajectory, adjoint, sens, u, delta_u, method,
-        optimizer.stage_solver, optimizer.problem, optimizer.h,
-        optimizer.t_span[0], optimizer.objective,
-    )
+        trajectory, adjoint, sens, u, delta_u,
+        optimizer.stage_solver, optimizer.problem, optimizer.objective)
 
     # Central difference on the adjoint, at a FIXED mesh (NUMERICS.md C-2).
     # Fresh optimizers are built per perturbation rather than poking the private
