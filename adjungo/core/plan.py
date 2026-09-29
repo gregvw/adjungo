@@ -12,6 +12,7 @@ second code path for it; see C-18.5.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -56,6 +57,34 @@ def _check_step_sizes_match_nodes(nodes: NDArray, h: NDArray) -> None:
             f"{nodes[n + 1]!r}; the discrepancy {drift[n]!r} exceeds the "
             f"rounding budget {budget[n]!r} (NUMERICS.md C-18.1)."
         )
+
+
+def _frozen_tableau(method: GLMethod) -> GLMethod:
+    """A copy of ``method`` whose coefficient buffers cannot be written.
+
+    A plan is the record of what was executed (C-18.2), and the trajectory it
+    produced is interpreted against it. Retaining the caller's ``GLMethod``
+    does not give that: ``GLMethod`` is a frozen dataclass, so ``m.B = ...``
+    is refused, but its fields are ordinary writable arrays and ``m.B[0, 0] =
+    2.0`` is not. That write reaches the plan through the alias and changes
+    the discretization out from under a trajectory already recorded against
+    it -- the same shape of failure as C-15.7's coefficient aliasing, reached
+    through the tableau rather than through the problem. Measured on
+    ``y' = u``, ``J = y(1)²/2`` with two Euler steps and controls ``(1, 3)``:
+    writing ``B[0,0] = 2`` after the solve moved a recorded ``J = 2.0`` to
+    ``6.125`` with no refusal anywhere.
+
+    Copying at construction closes the ordinary aliasing path, which is the
+    one an ordinary caller reaches. It is not a claim of immunity to a caller
+    who sets ``writeable`` back to ``True``; that is outside the trust model
+    recorded in C-15.7.
+    """
+    frozen = copy.copy(method)
+    for name in ("A", "U", "B", "V", "c"):
+        buffer = np.array(getattr(method, name), dtype=float)
+        buffer.flags.writeable = False
+        object.__setattr__(frozen, name, buffer)
+    return frozen
 
 
 @dataclass(frozen=True)
@@ -181,12 +210,24 @@ class DiscretizationPlan:
         offsets = np.zeros(len(methods) + 1, dtype=np.intp)
         np.cumsum(counts, out=offsets[1:])
 
+        # Keyed by identity, not by value. Two steps given the *same* method
+        # object must keep sharing one snapshot: GLMOptimizer keys its stage
+        # solvers -- and therefore its C-15.1 factorization store -- on
+        # ``id(method)``, so handing out a separate copy per step would give
+        # every step its own solver and silently refactorize once per step.
+        # Two equal-valued but distinct objects already got separate solvers
+        # before this snapshot existed, and still do.
+        snapshots: dict[int, GLMethod] = {}
+        frozen_methods = tuple(
+            snapshots.setdefault(id(m), _frozen_tableau(m)) for m in methods
+        )
+
         for array in (nodes, h, offsets):
             array.flags.writeable = False
 
         object.__setattr__(self, "step_sizes", None)
         object.__setattr__(self, "nodes", nodes)
-        object.__setattr__(self, "methods", methods)
+        object.__setattr__(self, "methods", frozen_methods)
         object.__setattr__(self, "h", h)
         object.__setattr__(self, "stage_offsets", offsets)
 

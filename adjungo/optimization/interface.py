@@ -151,7 +151,7 @@ class GLMOptimizer:
 
         self.problem = problem
         self.objective = objective
-        self.plan = plan
+        self._plan = plan
         self.y0 = y0
 
         _enforce_envelope(plan)
@@ -212,6 +212,62 @@ class GLMOptimizer:
         self._trajectory: Trajectory | None = None
         self._adjoint: AdjointTrajectory | None = None
         self._u_cached: NDArray | None = None
+
+    @property
+    def plan(self) -> DiscretizationPlan:
+        """The discretization this optimizer differentiates.
+
+        Read-only. C-18.2 requires the backward calculation to differentiate
+        the objective the forward sweep executed, and almost everything this
+        object holds is derived from the plan: the cached trajectory and
+        adjoint, the per-step stage solvers and their C-15.1 factorization
+        stores, and the per-step ``SolverRequirements``. Rebinding the
+        attribute changes none of them.
+
+        Measured before this was refused, on ``y' = u``, ``J = y(1)²/2`` with
+        two Euler steps and stage controls ``(1, 3)``: moving the interior
+        node from ``½`` to ``¼`` and re-evaluating at the *same* controls
+        returned the previous plan's ``J = 2.0`` instead of ``3.125``,
+        because the cache compares controls only. The gradient and
+        Hessian-vector product were stale with it.
+
+        Use :meth:`with_plan` to change discretization. Rebuilding is the
+        honest cost: a setter would have to rebuild the solvers and discard
+        every cache, which is the constructor.
+        """
+        return self._plan
+
+    @plan.setter
+    def plan(self, value: DiscretizationPlan) -> None:
+        raise AttributeError(
+            "GLMOptimizer.plan is read-only. Rebinding it would leave the "
+            "cached trajectory, adjoint, stage solvers and factorization "
+            "stores describing the previous discretization, and those are "
+            "keyed on the controls alone -- a re-evaluation at unchanged "
+            "controls would return the old plan's answer. Use "
+            "optimizer.with_plan(new_plan) (NUMERICS.md C-18.2)."
+        )
+
+    def with_plan(
+        self, plan: DiscretizationPlan, **overrides: object
+    ) -> "GLMOptimizer":
+        """A new optimizer for ``plan``, over the same problem and objective.
+
+        This is the supported way to re-discretize: an adaptation policy
+        producing ``𝒟_k`` from the current trajectory hands the new plan
+        here and gets an object with no state carried over from ``𝒟_{k-1}``.
+        Control *parameters* are the caller's to transfer; stage controls are
+        not transferable in general, since a new plan may have a different
+        number of them.
+        """
+        kwargs: dict[str, object] = {
+            "problem": self.problem,
+            "objective": self.objective,
+            "y0": self.y0,
+            "problem_structure": self.problem_structure,
+        }
+        kwargs.update(overrides)
+        return type(self)(plan=plan, **kwargs)  # type: ignore[arg-type]
 
     @property
     def N(self) -> int:
@@ -401,44 +457,57 @@ class GLMOptimizer:
     def objective_value(self, u: NDArray) -> float:
         """``J(u)`` -- runs the forward solve if needed.
 
-        ``Objective.evaluate`` is specified on the rectangular ``(N, s, nu)``
+        ``Objective.evaluate`` is specified on the rectangular ``(N, s, ν)``
         stage-control layout, and a plan whose stage count varies across
-        steps has no such layout. The control is therefore handed over in
-        rectangular form, and a plan with varying stage counts is **refused
-        here** rather than served a packed array the objective would index as
-        if it were rectangular. That would not fail: it would read stage
-        ``(n, k)`` out of whatever step happens to lie at packed row ``n``,
-        and return a number.
+        steps has no such layout (C-18.5). On such a plan the objective is
+        asked for :meth:`~adjungo.core.objective.PackedObjective.\
+evaluate_packed` instead, which takes the packed ``(Σ_n s_n, ν)`` array and
+        reads each step's block through ``trajectory.plan.stages``.
 
-        Derivatives are unaffected. ``dJ_du`` and ``d2J_du2`` are called one
-        stage at a time with ``(step, stage)`` alongside, so they carry no
-        layout assumption, and ``gradient`` and
-        ``hessian_vector_product`` work on any plan C-18.1 admits. What a
-        varying-stage-count plan lacks is the scalar objective value, and
-        therefore a line search. See NUMERICS.md C-7 and C-18.7.
+        An objective that implements neither is **refused**, not handed the
+        packed array in place of the rectangular one. That substitution would
+        not fail: the objective would index stage ``(n, k)`` out of whatever
+        step happens to lie at packed row ``n`` and return a number (C-7).
+
+        Derivatives never needed this. ``dJ_du`` and ``d2J_du2`` are called
+        one stage at a time with ``(step, stage)`` alongside, so they carry
+        no layout assumption, and ``gradient`` and ``hessian_vector_product``
+        work on any plan C-18.1 admits.
 
         Args:
-            u: Control array ``(N, s, nu)``
+            u: Stage controls, rectangular ``(N, s, ν)`` or packed
+                ``(Σ_n s_n, ν)``
 
         Returns:
             Objective value
         """
-        if self.plan.uniform_stage_count is None:
-            raise NotImplementedError(
-                f"the objective value is not available for a plan whose "
-                f"stage count varies across steps (stage counts "
-                f"{tuple(m.s for m in self.plan.methods)}). Objective."
-                f"evaluate takes the rectangular (N, s, nu) layout, which "
-                f"does not describe this plan. Gradients and "
-                f"Hessian-vector products are available, because their "
-                f"objective callbacks are per-stage (NUMERICS.md C-7, "
-                f"C-18.7)."
-            )
         self._ensure_forward(u)
         assert self._trajectory is not None
-        return self.objective.evaluate(
-            self._trajectory, self._pack(u).reshape(self._rectangular_stage_shape())
-        )
+        packed = self._pack(u)
+
+        s = self.plan.uniform_stage_count
+        if s is not None:
+            return self.objective.evaluate(
+                self._trajectory,
+                packed.reshape(self.N, s, self.problem.control_dim),
+            )
+
+        evaluate_packed = getattr(self.objective, "evaluate_packed", None)
+        if evaluate_packed is None:
+            raise NotImplementedError(
+                f"{type(self.objective).__name__} does not implement "
+                f"evaluate_packed, so it has no value on a plan whose stage "
+                f"count varies across steps (stage counts "
+                f"{tuple(m.s for m in self.plan.methods)}). Objective."
+                f"evaluate takes the rectangular (N, s, nu) layout, which "
+                f"does not describe this plan, and the packed array is not "
+                f"substituted for it because an objective would index it as "
+                f"if it were rectangular and return a number. Gradients and "
+                f"Hessian-vector products need nothing added: their "
+                f"objective callbacks are per-stage (NUMERICS.md C-7, "
+                f"C-18.5, C-18.7)."
+            )
+        return float(evaluate_packed(self._trajectory, packed))
 
     def trajectory(self, u: NDArray) -> Trajectory:
         """Return the forward trajectory at ``u``.
@@ -598,7 +667,7 @@ class GLMOptimizer:
         which is the same ownership rule the stage solvers follow for
         ``y_scale``.
         """
-        shape = self._rectangular_stage_shape()
+        shape = (self.plan.total_stages, self.problem.control_dim)
 
         if parametrization is None:
             def expand(x_flat: NDArray) -> NDArray:
@@ -618,42 +687,63 @@ class GLMOptimizer:
     ) -> None:
         """Refuse a parametrization built for a different discretisation.
 
-        A map whose stage-control shape disagrees with this optimizer's
-        would otherwise fail deep inside a reshape, or -- worse, when the
-        sizes happen to coincide -- succeed while silently permuting the
-        controls.
+        Three things must agree, and shape alone establishes none of them.
+        A map whose stage-control size disagrees would otherwise fail deep
+        inside a reshape, or -- worse, when the sizes happen to coincide --
+        succeed while silently permuting the controls.
+
+        The abscissae are the addition C-18 forces. Before it there was one
+        tableau for the whole solve, so a map holding "the" abscissae could
+        not disagree with the method being integrated. A plan may now change
+        method between steps at an unchanged stage count -- ``explicit_euler``
+        and ``implicit_midpoint`` both have ``s = 1`` -- so a map built
+        against one step's ``c`` produces a correctly shaped array sampled at
+        the wrong instants. That is C-10.4's coordinate convention silently
+        violated, not a representable alternative: measured on ``y' = u``,
+        ``J = y(1)²/2`` with nodes ``(0, ½, 1)``, Euler then midpoint, and
+        ``θ = (0, ½, 1)``, it returned ``J = 0.03125`` against the plan's own
+        ``0.0703125``, with a correspondingly displaced gradient.
+
+        A map reporting :attr:`~adjungo.optimization.parametrization.\
+AffineControlParametrization.stage_abscissae` of ``None`` declares that it
+        does not sample at abscissae at all, so there is nothing to compare;
+        that is the piecewise-constant case.
         """
-        expected = self._rectangular_stage_shape()
-        if parametrization.stage_shape != expected:
+        p = parametrization
+        nu = self.problem.control_dim
+        plan_counts = tuple(m.s for m in self.plan.methods)
+        if (
+            p.n_steps != self.plan.N
+            or p.stage_counts != plan_counts
+            or p.control_dim != nu
+        ):
             raise ValueError(
-                f"{type(parametrization).__name__} produces stage controls "
-                f"of shape {parametrization.stage_shape}, but this "
-                f"optimizer integrates shape {expected} "
-                f"(N={self.N}, s={expected[1]}, "
-                f"control_dim={self.problem.control_dim})."
+                f"{type(p).__name__} produces stage controls for "
+                f"{p.n_steps} steps with stage counts {p.stage_counts} and "
+                f"control_dim {p.control_dim}, but this optimizer integrates "
+                f"{self.plan.N} steps with stage counts {plan_counts} and "
+                f"control_dim {nu}."
             )
 
-    def _rectangular_stage_shape(self) -> tuple[int, int, int]:
-        """``(N, s, nu)``, or a refusal when the stage count varies.
-
-        The C-10.1 parametrization layer maps parameters onto a rectangular
-        stage-control array. A plan whose steps carry different stage counts
-        has no such array, and no amount of reshaping produces one, so the
-        adapter is refused rather than given a shape that silently misplaces
-        controls. The packed route -- passing stage controls directly -- is
-        unaffected.
-        """
-        s = self.plan.uniform_stage_count
-        if s is None:
-            raise NotImplementedError(
-                "the control parametrization layer requires one stage count "
-                "for the whole plan; this plan's steps carry "
-                f"{sorted({m.s for m in self.plan.methods})}. Pass packed "
-                f"stage controls of shape "
-                f"({self.plan.total_stages}, {self.problem.control_dim}) "
-                "directly (NUMERICS.md C-10.1, C-18.7)."
-            )
-        return (self.N, s, self.problem.control_dim)
+        declared = p.stage_abscissae
+        if declared is None:
+            return
+        for step, (c_map, method) in enumerate(
+            zip(declared, self.plan.methods, strict=True)
+        ):
+            # Element for element, as in C-15.1's factorization comparison.
+            # A tolerance here would accept a map sampling at instants the
+            # solver never evaluates, which is a different discrete problem
+            # rather than a rounding difference.
+            if not np.array_equal(c_map, method.c):
+                raise ValueError(
+                    f"{type(p).__name__} samples step {step} at abscissae "
+                    f"{np.asarray(c_map)}, but that step's method evaluates "
+                    f"its stages at {np.asarray(method.c)}. The control "
+                    f"would be sampled at instants the solver never visits "
+                    f"(NUMERICS.md C-10.4, C-18.4). NodalControl.from_plan "
+                    f"takes the abscissae from the plan."
+                )
 
     def scipy_hessp(
         self,

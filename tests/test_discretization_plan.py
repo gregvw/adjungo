@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import scipy.optimize
 
 from adjungo.core.method import StageType
 from adjungo.core.plan import DiscretizationPlan
@@ -43,13 +44,19 @@ from adjungo.methods.runge_kutta import (
 )
 from adjungo.optimization import interface
 from adjungo.optimization.interface import GLMOptimizer
+from adjungo.optimization.parametrization import (
+    NodalControl,
+    PiecewiseConstantControl,
+)
 from adjungo.validation import reference_gradient, reference_hessian
 from tests.problems import (
     AnchorObjective,
+    ConstantJacobianQuadraticControl,
     CoupledNonlinear,
     FullCostObjective,
     ScalarAnchor,
 )
+from tests.test_factorization_reuse import CONSTANT_JACOBIAN
 from tests.test_oracle_gradient import certified_rtol
 
 # ---------------------------------------------------------------------------
@@ -164,6 +171,24 @@ def _case(factories, ratio: float = 4.0, seed: int = 0):
     y0 = np.array([0.4, -0.25, 0.15])
     u = packed_controls(plan, problem.control_dim, seed=seed)
     return plan, problem, objective, y0, u
+
+
+class _WithoutPackedEvaluation:
+    """An objective that forwards everything except ``evaluate_packed``.
+
+    Every objective in this repository now offers the packed route, so the
+    refusal has nothing to fire on without one that does not. Deleting the
+    method from a copy is closer to a third-party objective than editing the
+    shipped one would be.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str):
+        if name == "evaluate_packed":
+            raise AttributeError(name)
+        return getattr(self._inner, name)
 
 
 # ---------------------------------------------------------------------------
@@ -356,15 +381,17 @@ def _fresh(plan, problem, objective, y0, u):
     )
 
 
-def test_a_new_plan_at_the_same_control_agrees_with_a_fresh_evaluation():
+def test_with_plan_at_the_same_control_agrees_with_a_fresh_evaluation():
     """C-18.7 item 4.
 
     Two plans with the *same* stage counts, so the identical control array is
-    admissible under both and nothing but the mesh changes. Evaluating the
-    second plan on an optimizer that has already solved the first must agree
-    with evaluating it from scratch. A trajectory, a control sampling or a
+    admissible under both and nothing but the mesh changes. Re-discretizing an
+    optimizer that has already solved the first plan must agree with
+    evaluating the second from scratch. A trajectory, a control sampling or a
     factorization cache that outlived the plan it was keyed to shows up here
     and nowhere else in this module.
+
+    Two *fresh* optimizers would not show it: the point is a warm object.
     """
     problem = CoupledNonlinear()
     objective = FullCostObjective(nx=3, nu=2)
@@ -382,12 +409,10 @@ def test_a_new_plan_at_the_same_control_agrees_with_a_fresh_evaluation():
     assert second.total_stages == first.total_stages
 
     warm = GLMOptimizer(problem, objective, y0=y0, plan=first)
-    warm.objective_value(u)
-    warm.gradient(u)
+    J_first = warm.objective_value(u)
+    g_first = warm.gradient(u)
 
-    # Same control parameters, new plan: a second optimizer is how a caller
-    # changes a plan today, the plan being frozen by construction (C-18.2).
-    moved = GLMOptimizer(problem, objective, y0=y0, plan=second)
+    moved = warm.with_plan(second)
     J_ref, g_ref, hv_ref, v = _fresh(second, problem, objective, y0, u)
 
     assert moved.objective_value(u) == pytest.approx(J_ref, rel=1e-14, abs=1e-15)
@@ -396,22 +421,55 @@ def test_a_new_plan_at_the_same_control_agrees_with_a_fresh_evaluation():
         hv_ref, rel=1e-13, abs=1e-14
     )
 
-    # And the two plans must genuinely disagree, or the comparison above is
+    # The two plans must genuinely disagree, or the comparison above is
     # satisfied by any implementation that ignores the plan entirely.
-    assert not np.allclose(g_ref, warm.gradient(u), rtol=1e-6, atol=1e-8)
+    assert not np.allclose(g_ref, g_first, rtol=1e-6, atol=1e-8)
+
+    # And the original is left describing its own plan: with_plan builds a
+    # new optimizer rather than mutating this one.
+    assert warm.plan is first
+    assert warm.objective_value(u) == J_first
+
+
+def test_rebinding_the_plan_is_refused():
+    """C-18.2: the plan a trajectory was recorded against cannot move.
+
+    ``optimizer.plan = other`` would leave the cached trajectory, adjoint,
+    stage solvers and factorization stores describing the previous
+    discretization, and the cache is keyed on the controls alone. Measured
+    before this was refused, on ``y' = u``, ``J = y(1)²/2`` with two Euler
+    steps and stage controls ``(1, 3)``: moving the interior node from ``½``
+    to ``¼`` and re-evaluating at the same controls returned the first plan's
+    ``J = 2.0`` instead of ``3.125``.
+    """
+    problem = CoupledNonlinear()
+    objective = FullCostObjective(nx=3, nu=2)
+    y0 = np.array([0.4, -0.25, 0.15])
+    first = DiscretizationPlan.uniform((0.3, 1.1), 4, sdirk2())
+    second = DiscretizationPlan.uniform((0.3, 1.1), 8, sdirk2())
+
+    optimizer = GLMOptimizer(problem, objective, y0=y0, plan=first)
+    with pytest.raises(AttributeError, match="read-only"):
+        optimizer.plan = second
+    assert optimizer.plan is first
 
 
 def test_changing_the_plan_invalidates_a_cached_factorization():
     """C-18.7 item 4, the C-15 cache specifically.
 
     ``jacobian_constant`` licenses reuse of one LU factorization across every
-    step (C-15.1). A cache keyed to nothing but the problem would survive a
-    change of ``h``, and ``I - h a_ii F`` is a different matrix at a different
-    ``h``, so the second plan would be solved with the first plan's
-    factorization. The two gradients would then differ by an amount no
-    structural identity detects.
+    step (C-15.1), so this needs a problem and a declaration that actually
+    enable reuse -- otherwise there is no cache to invalidate and the test
+    passes for the wrong reason.
+
+    A store keyed to nothing but the problem would survive a change of ``h``,
+    and ``I - h a_ii F`` is a different matrix at a different ``h``, so the
+    second plan would be solved with the first plan's factors. Counting is
+    the only way to see this: refactorizing the same matrix gives the same
+    answer, and reusing the wrong one gives a wrong answer that no structural
+    identity detects.
     """
-    problem = CoupledNonlinear()
+    problem = ConstantJacobianQuadraticControl()
     objective = FullCostObjective(nx=3, nu=2)
     y0 = np.array([0.4, -0.25, 0.15])
     t_span = (0.3, 1.1)
@@ -423,14 +481,32 @@ def test_changing_the_plan_invalidates_a_cached_factorization():
     u_coarse = packed_controls(coarse, problem.control_dim, seed=21)
     u_fine = packed_controls(fine, problem.control_dim, seed=21)
 
-    warm = GLMOptimizer(problem, objective, y0=y0, plan=coarse)
+    warm = GLMOptimizer(
+        problem, objective, y0=y0, plan=coarse,
+        problem_structure=CONSTANT_JACOBIAN,
+    )
     warm.gradient(u_coarse)
+    store = warm.stage_solver.factorizations
+    # Reuse really is on, or the invalidation below tests nothing.
+    assert store.factorizations == 1, (
+        f"the coarse solve made {store.factorizations} factorizations where "
+        f"C-15.1 predicts 1; this fixture is not exercising reuse"
+    )
 
-    after = GLMOptimizer(problem, objective, y0=y0, plan=fine).gradient(u_fine)
+    moved = warm.with_plan(fine)
+    after = moved.gradient(u_fine)
+
+    # A new plan means a new solver and a new store; the count starts again.
+    assert moved.stage_solver.factorizations.factorizations == 1
+    assert moved.stage_solver is not warm.stage_solver
+
     expected = reference_gradient(
         y0, u_fine, problem=problem, objective=objective, plan=fine
     )
     assert _rel_err(after, expected) < certified_rtol(method)
+
+    # The first store is untouched: nothing was silently re-keyed under it.
+    assert store.factorizations == 1
 
 
 # ---------------------------------------------------------------------------
@@ -573,20 +649,295 @@ def test_the_envelope_is_enforced_at_every_step_not_only_the_first(monkeypatch):
         )
 
 
-def test_the_objective_value_is_refused_for_a_varying_stage_count():
-    """C-7: a packed control must not be read as if it were rectangular.
+def test_the_objective_value_needs_a_packed_evaluation_on_a_mixed_plan():
+    """C-7, C-18.5: opt in to the packed layout or be refused.
 
-    ``Objective.evaluate`` takes ``(N, s, nu)``. On a plan whose stage count
+    ``Objective.evaluate`` takes ``(N, s, ν)``. On a plan whose stage count
     varies there is no such array, and handing the objective the packed one
     would not raise: it would read stage ``(n, k)`` from whatever step lies at
-    packed row ``n`` and return a plausible number. The derivatives stay
-    available, because their objective callbacks are given one stage and its
-    ``(step, stage)`` index.
+    packed row ``n`` and return a plausible number. So an objective that has
+    not said it can read the packed layout is refused, and one that has is
+    used.
+
+    The derivatives were never affected: their objective callbacks are given
+    one stage and its ``(step, stage)`` index.
     """
     plan, problem, objective, y0, u = _case(MIXED_PLANS[0].values[0])
-    optimizer = GLMOptimizer(problem, objective, y0=y0, plan=plan)
 
-    with pytest.raises(NotImplementedError, match="stage count varies"):
-        optimizer.objective_value(u)
+    rectangular_only = _WithoutPackedEvaluation(objective)
+    with pytest.raises(NotImplementedError, match="evaluate_packed"):
+        GLMOptimizer(
+            problem, rectangular_only, y0=y0, plan=plan
+        ).objective_value(u)
+
+    optimizer = GLMOptimizer(problem, objective, y0=y0, plan=plan)
+    value = optimizer.objective_value(u)
+
+    # Independent sum: the control term accumulated over the packed rows
+    # directly, with the state terms taken from the trajectory.
+    trajectory = optimizer.trajectory(u)
+    Y = trajectory.Y
+    d = Y[-1, 0] - objective.y_target
+    expected = 0.5 * float(d @ objective.Q_T @ d)
+    for n in range(plan.N):
+        expected += 0.5 * float(Y[n, 0] @ objective.Q @ Y[n, 0])
+    for row in u:
+        expected += 0.5 * float(row @ objective.R @ row)
+    # Exact: both routes add the same products in the same order.
+    assert value == expected
 
     assert optimizer.gradient(u).shape == u.shape
+
+
+def test_packed_and_rectangular_evaluation_agree_on_a_uniform_plan():
+    """The degenerate plan is where the two routes can be compared at all.
+
+    ``evaluate`` and ``evaluate_packed`` describe one function. A uniform
+    plan has both layouts, so an objective offering both must return the same
+    number; that is what makes the mixed-plan value above trustworthy, since
+    on a mixed plan only one of them can be called.
+    """
+    plan = DiscretizationPlan.uniform((0.3, 1.1), 5, sdirk3())
+    problem = CoupledNonlinear()
+    objective = FullCostObjective(nx=3, nu=2)
+    u = packed_controls(plan, problem.control_dim, seed=3)
+    optimizer = GLMOptimizer(
+        problem, objective, y0=np.array([0.4, -0.25, 0.15]), plan=plan
+    )
+    trajectory = optimizer.trajectory(u)
+
+    rectangular = objective.evaluate(
+        trajectory, u.reshape(plan.N, plan.methods[0].s, problem.control_dim)
+    )
+    packed = objective.evaluate_packed(trajectory, u)
+    # Exact: the same products, accumulated in the same order.
+    assert packed == rectangular
+
+
+# ---------------------------------------------------------------------------
+# C-10 control coordinates on a plan (C-18.5)
+# ---------------------------------------------------------------------------
+
+
+def test_nodal_control_samples_each_step_at_its_own_abscissae():
+    """C-10.4, C-18.4: the interpolant and the solver must agree on *when*.
+
+    Closed form. ``y' = u``, ``y(0) = 0``, ``J = y(1)²/2``, nodes ``(0, ½, 1)``,
+    explicit Euler then implicit midpoint, both ``s = 1``, and nodal values
+    ``θ = (0, ½, 1)``. Step 0 samples at ``c = 0``, giving ``u = θ₀ = 0``; step
+    1 samples at ``c = ½``, giving ``u = ½θ₁ + ½θ₂ = ¾``. Both methods have
+    ``b = [1]``, so ``y(1) = ½·0 + ½·¾ = ⅜`` and ``J = 9/128 = 0.0703125``.
+
+    Sampling both steps at Euler's ``c = 0`` -- which is what one abscissa
+    vector for the whole plan gives, at exactly the right shape -- yields
+    ``(0, ½)``, ``y(1) = ¼`` and ``J = 0.03125``. Nothing about the shape
+    distinguishes the two.
+    """
+    plan = DiscretizationPlan(
+        nodes=np.array([0.0, 0.5, 1.0]),
+        methods=(explicit_euler(), implicit_midpoint()),
+    )
+    optimizer = GLMOptimizer(
+        ScalarAnchor(), AnchorObjective(), y0=np.zeros((1, 1)), plan=plan
+    )
+    theta = np.array([[0.0], [0.5], [1.0]])
+
+    good = NodalControl.from_plan(plan, control_dim=1)
+    assert good.expand(theta).ravel() == pytest.approx([0.0, 0.75], abs=0.0)
+
+    fun, jac = optimizer.scipy_interface(parametrization=good)
+    assert fun(theta.ravel()) == pytest.approx(9.0 / 128.0, rel=1e-15)
+    # dJ/dθ = y(1) · (½, ¼, ¼) by the chain rule through the two steps.
+    assert jac(theta.ravel()) == pytest.approx(
+        0.375 * np.array([0.5, 0.25, 0.25]), rel=1e-14
+    )
+
+
+def test_a_parametrization_sampling_the_wrong_abscissae_is_refused():
+    """C-7: the mismatch above must not be reachable in silence.
+
+    ``explicit_euler`` and ``implicit_midpoint`` both have ``s = 1``, so the
+    map built against either produces an array of exactly the right shape.
+    Only the abscissae distinguish them, so only comparing the abscissae
+    refuses it.
+    """
+    plan = DiscretizationPlan(
+        nodes=np.array([0.0, 0.5, 1.0]),
+        methods=(explicit_euler(), implicit_midpoint()),
+    )
+    optimizer = GLMOptimizer(
+        ScalarAnchor(), AnchorObjective(), y0=np.zeros((1, 1)), plan=plan
+    )
+    wrong = NodalControl(n_steps=2, control_dim=1, c=plan.methods[0].c)
+    assert wrong.stage_shape == (2, 1, 1)  # the shape check cannot see it
+
+    with pytest.raises(ValueError, match="abscissae"):
+        optimizer.scipy_interface(parametrization=wrong)
+    with pytest.raises(ValueError, match="abscissae"):
+        optimizer.scipy_hessp(parametrization=wrong)
+
+
+def test_a_piecewise_constant_map_needs_no_abscissae():
+    """It declares ``None`` rather than reporting abscissae it does not use.
+
+    ``u[n, i] = θ[n]`` whatever ``c`` is, so there is nothing for a plan to
+    disagree with, and the map is usable on a plan that changes method at
+    every step.
+    """
+    plan = mixed_plan((0.3, 1.1), MIXED_PLANS[0].values[0], ratio=4.0)
+    problem = CoupledNonlinear()
+    param = PiecewiseConstantControl(
+        plan.N, [m.s for m in plan.methods], problem.control_dim
+    )
+    assert param.stage_abscissae is None
+    assert param.packed_shape == (plan.total_stages, problem.control_dim)
+
+    optimizer = GLMOptimizer(
+        problem, FullCostObjective(nx=3, nu=2),
+        y0=np.array([0.4, -0.25, 0.15]), plan=plan,
+    )
+    theta = np.linspace(-0.4, 0.6, plan.N * problem.control_dim)
+    fun, jac = optimizer.scipy_interface(parametrization=param)
+
+    # The pullback is the transpose of the expansion, in the flat Euclidean
+    # product C-10.4 specifies -- checked here against a directional
+    # difference of the objective, which shares no code with pullback.
+    g = jac(theta)
+    rng = np.random.default_rng(5)
+    v = rng.standard_normal(theta.size)
+    eps = 1e-6
+    fd = (fun(theta + eps * v) - fun(theta - eps * v)) / (2.0 * eps)
+    # Central differences on a smooth J: O(eps^2) truncation plus O(u_r/eps)
+    # rounding, so ~1e-9 at eps = 1e-6. 1e-7 is a margin over that.
+    assert g @ v == pytest.approx(fd, rel=1e-7)
+
+
+def test_a_mixed_plan_optimizes_through_the_scipy_adapters():
+    """C-18.5: the packed C-10 layout is the deliverable, not a refusal.
+
+    A plan mixing stage counts reaches a scalar value, a gradient and a
+    descent step. Without the packed layout the parametrization was refused
+    outright, so nothing below could run.
+    """
+    plan = mixed_plan((0.3, 1.1), MIXED_PLANS[0].values[0], ratio=4.0)
+    problem = CoupledNonlinear()
+    assert len({m.s for m in plan.methods}) > 1
+
+    optimizer = GLMOptimizer(
+        problem, FullCostObjective(nx=3, nu=2),
+        y0=np.array([0.4, -0.25, 0.15]), plan=plan,
+    )
+    param = PiecewiseConstantControl(
+        plan.N, [m.s for m in plan.methods], problem.control_dim
+    )
+    fun, jac = optimizer.scipy_interface(parametrization=param)
+    hessp = optimizer.scipy_hessp(parametrization=param)
+
+    theta = np.full(plan.N * problem.control_dim, 0.3)
+    g = jac(theta)
+    assert np.linalg.norm(g) > 0.0
+    assert hessp(theta, g).shape == g.shape
+
+    result = scipy.optimize.minimize(
+        fun, theta, jac=jac, hessp=hessp, method="trust-ncg",
+        options={"gtol": 1e-10, "maxiter": 200},
+    )
+    assert result.fun < fun(theta)
+    assert np.linalg.norm(jac(result.x)) < 1e-8
+
+
+# ---------------------------------------------------------------------------
+# The plan owns its tableaux (C-18.2)
+# ---------------------------------------------------------------------------
+
+
+def test_writing_through_the_callers_tableau_does_not_reach_the_plan():
+    """C-18.2, and the C-15.7 aliasing class reached through the method.
+
+    ``GLMethod`` is a frozen dataclass, so ``m.B = ...`` is refused; its
+    fields are ordinary writable arrays, so ``m.B[0, 0] = 2.0`` is not. That
+    write would change the discretization a trajectory was already recorded
+    against. Measured before the plan took a snapshot, on ``y' = u``,
+    ``J = y(1)²/2`` with two Euler steps and stage controls ``(1, 3)``:
+    ``J = 2.0`` became ``6.125``.
+    """
+    method = explicit_euler()
+    plan = DiscretizationPlan(
+        nodes=np.array([0.0, 0.5, 1.0]), methods=(method, method)
+    )
+    u = np.array([[1.0], [3.0]])
+    optimizer = GLMOptimizer(
+        ScalarAnchor(), AnchorObjective(), y0=np.zeros((1, 1)), plan=plan
+    )
+    before = optimizer.objective_value(u)
+    assert before == pytest.approx(2.0, rel=1e-15)
+
+    method.B[0, 0] = 2.0
+    method.c[0] = 0.75
+    assert plan.methods[0].B[0, 0] == 1.0
+    assert plan.methods[0].c[0] == 0.0
+
+    after = GLMOptimizer(
+        ScalarAnchor(), AnchorObjective(), y0=np.zeros((1, 1)), plan=plan
+    ).objective_value(u)
+    assert after == before
+
+    for name in ("A", "U", "B", "V", "c"):
+        assert not getattr(plan.methods[0], name).flags.writeable
+
+
+def test_the_snapshot_keeps_one_method_object_shared_across_steps():
+    """The snapshot must not cost the C-15.1 factorization reuse.
+
+    ``GLMOptimizer`` keys its stage solvers, and therefore its factorization
+    stores, on ``id(method)``. Copying each step's tableau separately would
+    give every step its own solver and silently refactorize once per step --
+    the same 5-factorizations-over-12-steps failure the explicit
+    ``step_sizes`` were introduced to prevent, reached a different way.
+    """
+    method = implicit_midpoint()
+    N = 6
+    plan = DiscretizationPlan.uniform((0.3, 1.1), N, method)
+    assert len({id(m) for m in plan.methods}) == 1
+
+    problem = ConstantJacobianQuadraticControl()
+    optimizer = GLMOptimizer(
+        problem, FullCostObjective(nx=3, nu=2),
+        y0=np.array([0.4, -0.25, 0.15]), plan=plan,
+        problem_structure=CONSTANT_JACOBIAN,
+    )
+    optimizer.gradient(packed_controls(plan, problem.control_dim, seed=4))
+    assert optimizer.stage_solver.factorizations.factorizations == 1
+
+
+def test_a_map_whose_stages_are_distributed_differently_is_refused():
+    """C-7: equal totals are the dangerous case, not the safe one.
+
+    A plan with stage counts ``(1, 4)`` and a map producing ``(4, 1)`` agree
+    on ``N``, on ``ν`` and on the total number of stage controls, so every
+    size in sight matches and the packed array reshapes without complaint.
+    The blocks are then read against the wrong steps: step 0's method gets
+    four controls of which it uses one, and step 1's gets one where it needs
+    four.
+
+    ``PiecewiseConstantControl`` reports no abscissae, so the stage-count
+    comparison is the only thing that can refuse this.
+    """
+    plan = DiscretizationPlan(
+        nodes=np.array([0.3, 0.7, 1.1]), methods=(explicit_euler(), rk4())
+    )
+    problem = CoupledNonlinear()
+    optimizer = GLMOptimizer(
+        problem, FullCostObjective(nx=3, nu=2),
+        y0=np.array([0.4, -0.25, 0.15]), plan=plan,
+    )
+
+    wrong = PiecewiseConstantControl(plan.N, [4, 1], problem.control_dim)
+    assert wrong.stage_abscissae is None
+    assert wrong.n_stage_controls == plan.total_stages * problem.control_dim
+    assert wrong.n_steps == plan.N and wrong.control_dim == problem.control_dim
+
+    with pytest.raises(ValueError, match="stage counts"):
+        optimizer.scipy_interface(parametrization=wrong)
+    with pytest.raises(ValueError, match="stage counts"):
+        optimizer.scipy_hessp(parametrization=wrong)

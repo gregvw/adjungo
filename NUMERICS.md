@@ -2791,12 +2791,19 @@ largest step: observed rates at or above `p − 0.25` for `explicit_euler` (1),
 `heun` (2), `implicit_midpoint` (2) and `rk4` (4).
 
 **Item 4.** A uniform and a three-to-one graded plan over the same `t_span` and
-`N`, with identical control parameters: the second plan evaluated on a fresh
-optimizer agrees with itself to `1e-13` relative in objective, gradient and
+`N`, with identical control parameters, exercised on an optimizer that has
+**already solved the first**: `warm.with_plan(second)` agrees with a fresh
+evaluation of the second plan to `1e-13` relative in objective, gradient and
 HVP, while differing from the first plan's gradient by more than `1e-6` — so
-the agreement is not satisfied by ignoring the plan. A second case changes `N`
-under `jacobian_constant` reuse and checks the result against the tier-1
-reference, which is what a factorization cache outliving its plan would fail.
+the agreement is not satisfied by ignoring the plan. Comparing two *fresh*
+optimizers, which is what this test did first, establishes none of that: a
+stale cache needs a warm object to be stale on. A second case changes `N` under
+a declared `jacobian_constant` structure on `ConstantJacobianQuadraticControl`,
+asserts the coarse solve really did reuse one factorization before concluding
+anything from the invalidation, and checks the refined gradient against the
+tier-1 reference. That fixture was previously `CoupledNonlinear` with reuse not
+enabled, so there was no cache to invalidate and the test passed for the wrong
+reason.
 
 **Item 5.** Twelve single-token injections, run under the [R-11](#r-11)
 protocol with the exit status cross-checked against the parsed count. Every one
@@ -2818,6 +2825,18 @@ was detected, and every one was detected by `tests/test_discretization_plan.py`
 | both sensitivity sweeps use `method_at(0)` | 4 |
 | `_enforce_envelope` loops over `plan.methods[:1]` | 1 |
 
+A second campaign of sixteen injections covers the review cures above — the
+tableau snapshot and its identity memoization, the packed parametrization's
+expansion, pullback and block offsets, the abscissa and stage-count
+comparisons, the read-only plan, and the packed objective route. All sixteen
+were detected; fifteen by `tests/test_discretization_plan.py` alone, and the
+sixteenth — transposing the rectangular reshape to `(s, N, ν)` — by seven tests
+elsewhere in the suite. Two of the sixteen were undetected when first run and
+are the reason two of the tests above exist: a parametrization whose stage
+counts are *distributed* differently from the plan's at an equal total, and
+that same transposed reshape, which `FullCostObjective` cannot see because it
+weights every stage identically.
+
 The sixth of those is the one worth reading twice. `np.diff` of equally spaced
 nodes returns step sizes that differ in the last ulp — harmless for accuracy,
 and fatal for [C-15.1](#c-15) reuse, because `I − h a_ii F` built from a step
@@ -2831,15 +2850,63 @@ explicit: 5 factorizations over 12 steps of `implicit_midpoint` where
 discretization and on a uniform mesh cannot both be exact, and this is the same
 pair the scalar-`h` code carried.
 
-**Two scope limits, both refused loudly under [C-7](#c-7).** A plan whose stage
-count *varies across steps* has no rectangular `(N, s, ν)` layout, so it is
-refused a [C-10](#c-10) control parametrization, and `Objective.evaluate`,
-which is specified on that layout, is refused it too — such a plan has exact
-gradients and Hessian-vector products, whose objective callbacks are per-stage
-and carry no layout assumption, but no scalar objective value and therefore no
-line search. Non-uniform steps at a *fixed* stage count, which is what
-[C-8.4](#c-8) needs and what an adaptation policy would reach for first, are
-unaffected.
+**The plan is binding, and the optimizer owns it.** Three routes by which a
+recorded trajectory could come to be interpreted against a discretization other
+than the one that produced it are closed by construction, because C-18.2 is not
+enforceable if any of them stays open:
+
+- `GLMOptimizer.plan` is **read-only**. Rebinding it left the cached
+  trajectory, adjoint, stage solvers and factorization stores describing the
+  previous plan, and the cache is keyed on the controls alone. Measured on
+  `y' = u`, `J = y(1)²/2` with two Euler steps and stage controls `(1, 3)`:
+  moving the interior node from `½` to `¼` and re-evaluating at the *same*
+  controls returned the first plan's `J = 2.0` instead of `3.125`, with the
+  gradient and Hessian-vector product stale alongside it.
+  `optimizer.with_plan(new_plan)` returns a new optimizer and is the supported
+  way to re-discretize — which is what an adaptation policy producing `𝒟ₖ`
+  needs.
+- The plan takes an **immutable snapshot of each tableau**. `GLMethod` is a
+  frozen dataclass, so `m.B = …` is refused; its fields were ordinary writable
+  arrays, so `m.B[0,0] = 2.0` was not, and that write reached the plan through
+  the alias. Same measurement: `J = 2.0` became `6.125` in silence. This is
+  [C-15.7](#c-15)'s coefficient-aliasing class reached through the tableau
+  rather than through the problem. The snapshot is memoized on `id(method)`,
+  because `GLMOptimizer` keys its stage solvers on method identity and a
+  separate copy per step would give every step its own solver and refactorize
+  once per step — the failure the explicit `step_sizes` above exist to
+  prevent, reached a different way.
+- A control parametrization must sample at **each step's own abscissae**.
+  Before C-18 there was one tableau for the whole solve, so a map holding
+  "the" abscissae could not disagree with the method being integrated. A plan
+  may now change method at an unchanged stage count — `explicit_euler` and
+  `implicit_midpoint` both have `s = 1` — so a map built against one step's
+  `c` produces an array of exactly the right shape sampled at instants the
+  solver never visits. Measured on the same scalar problem, nodes `(0, ½, 1)`,
+  Euler then midpoint, `θ = (0, ½, 1)`: stage controls `(0, ½)` and
+  `J = 0.03125` against the plan's own `(0, ¾)` and `J = 9/128 = 0.0703125`.
+  `GLMOptimizer` now compares the map's declared abscissae against the plan's
+  element for element, as in [C-15.1](#c-15)'s factorization comparison — a
+  tolerance would accept a different discrete problem as a rounding
+  difference. `NodalControl.from_plan` takes them from the plan.
+  A map that samples at no abscissae at all, as `PiecewiseConstantControl`
+  does not, declares `None` and is compared on stage counts alone. Equal
+  totals are the dangerous case there: counts `(1, 4)` against `(4, 1)` agree
+  on `N`, on `ν` and on the total, and reshape without complaint.
+
+**One scope limit, refused loudly under [C-7](#c-7).** The C-10 stage-control
+layout is packed, so a plan whose stage count varies across steps carries an
+ordinary control parametrization and optimizes through the SciPy adapters.
+`Objective.evaluate`, however, is specified on the rectangular `(N, s, ν)`
+layout, which such a plan does not have. Substituting the packed array would
+not fail: the objective would index stage `(n, k)` out of whatever step happens
+to lie at packed row `n` and return a number. Support is therefore **opt-in**
+through `PackedObjective.evaluate_packed`, which receives the packed array and
+reads each step's block through `trajectory.plan.stages`. An objective offering
+neither is refused. It is a separate method rather than a flag because the
+arithmetic differs: an objective carrying per-stage quadrature weights has no
+single weight vector once a plan mixes stage counts, and writing the per-step
+version *is* the declaration. Derivatives never needed any of this — `dJ_du`
+and `d2J_du2` are called one stage at a time with `(step, stage)` alongside.
 
 Certification of a *new method family* is unchanged by this: [C-6.1](#c-6)
 still governs, and nothing was added to it.

@@ -74,19 +74,26 @@ sweep executed. Adjungo returns exact derivatives of the discrete objective
 *that plan* defines. Choosing a plan from an evolving trajectory is a policy
 the caller writes; Adjungo does not yet supply one.
 
+`optimizer.plan` is read-only, and the plan copies and freezes each tableau it
+is given. Re-discretising is `optimizer.with_plan(new_plan)`, which returns a
+new optimizer: the trajectory, adjoint, stage solvers and factorization stores
+are all keyed to a plan, and none of them would survive rebinding the
+attribute.
+
 Stage-indexed arrays are stored packed, as `(Σₙ sₙ, ·)`. When every step has
 the same stage count this is the familiar `(N, s, ν)` array reshaped, and
-controls may be supplied in either layout. When the stage count **varies**,
-two things are refused rather than guessed:
+controls may be supplied in either layout. The control parametrisations below
+work in either case — build one with `NodalControl.from_plan(plan, ν)` so that
+it interpolates to each step's *own* abscissae, which is the thing a plan that
+changes method makes possible to get wrong at exactly the right shape.
 
-- the control parametrisations below, which are built against a single
-  `method.s`; and
-- the scalar objective value, because `Objective.evaluate` is specified on the
-  rectangular layout. Gradients and Hessian-vector products are still exact —
-  their objective callbacks receive one stage and its `(step, stage)` index —
-  but without an objective value there is no line search.
-
-Non-uniform steps at a *fixed* stage count have neither limitation.
+One thing is refused rather than guessed when the stage count **varies**: the
+scalar objective value, because `Objective.evaluate` is specified on the
+rectangular layout, and handing it the packed array would have it read stage
+`(n, k)` out of whatever step lies at packed row `n`. An objective that
+implements `evaluate_packed` is used instead and has no such limit. Gradients
+and Hessian-vector products never needed either — their objective callbacks
+receive one stage and its `(step, stage)` index.
 
 ### Problem types
 
