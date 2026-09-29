@@ -1136,7 +1136,7 @@ def test_each_example_documents_an_invocation_that_resolves():
             assert (directory.parent / target).is_file(), command
             assert target == f"examples/{path.name}"
         checked += 1
-    assert checked == 7, f"expected seven runnable examples, found {checked}"
+    assert checked == 8, f"expected eight runnable examples, found {checked}"
 
 
 @requires_sympy
@@ -2578,3 +2578,217 @@ def test_zermelo_main_runs(capsys):
     assert "D(1) defect" in out
     assert "steering optimally" in out
     assert "order" in out
+
+
+# ---------------------------------------------------------------------------
+# examples/atom_transport.py -- the shuttling example. The only example that is
+# not a GLM: Verlet applies a different coefficient array to each half of the
+# state, which C-8.4 records is not expressible as a single `A`.
+# ---------------------------------------------------------------------------
+
+
+@requires_sympy
+def test_transport_example_gradient_matches_independent_reference():
+    """C-2 through the shipped example, on the partitioned route.
+
+    ``reference_gradient`` re-derives the whole discrete problem from the
+    monolithic residual, solves the stage system by Newton, and never consults
+    ``dependency_order``. Its agreement is therefore evidence about the
+    substitution order the partitioned solver uses, not only about the
+    coefficients (C-14.1 item 1).
+    """
+    from adjungo.core.partitioned import verlet
+    from adjungo.core.plan import DiscretizationPlan
+    from examples.atom_transport import (
+        T_FINAL,
+        TransportCost,
+        stage_ramp,
+        transport_dynamics,
+    )
+
+    n_steps = 6
+    method = verlet()
+    plan = DiscretizationPlan.uniform((0.0, T_FINAL), n_steps, method)
+    ramp = stage_ramp(method, n_steps)
+    problem = transport_dynamics()
+    objective = TransportCost(method.B[0, :], T_FINAL / n_steps, ramp)
+    optimizer = GLMOptimizer(problem, objective, y0=np.zeros(2), plan=plan)
+
+    rng = np.random.default_rng(11)
+    u = ramp + 0.3 * rng.standard_normal(ramp.shape)
+
+    grad_ref = reference_gradient(
+        y0=np.zeros(2), u=u, problem=problem, plan=plan, objective=objective
+    )
+    assert np.max(np.abs(grad_ref)) > 1e-3, "degenerate case"
+    err = np.max(np.abs(optimizer.gradient(u) - grad_ref)) / float(
+        np.max(np.abs(grad_ref))
+    )
+    # C-3 budget with several orders of headroom over the observed agreement,
+    # matching the other examples' comparisons against the same reference.
+    assert err < 1e-11, f"transport gradient off by {err:.3e}"
+
+
+@requires_sympy
+def test_transport_example_hessp_matches_independent_reference():
+    """The exact Hessian on a problem whose ``F_yy`` does not vanish.
+
+    ``T(p) = J(1 - cos p)`` puts ``-J sin p`` into ``∂²f^q/∂p²``. With a
+    quadratic kinetic energy that block would be zero and this comparison
+    could not detect a dropped curvature term in the ``q`` half.
+    """
+    from adjungo.core.partitioned import verlet
+    from adjungo.core.plan import DiscretizationPlan
+    from examples.atom_transport import (
+        T_FINAL,
+        TransportCost,
+        stage_ramp,
+        transport_dynamics,
+    )
+
+    n_steps = 5
+    method = verlet()
+    plan = DiscretizationPlan.uniform((0.0, T_FINAL), n_steps, method)
+    ramp = stage_ramp(method, n_steps)
+    problem = transport_dynamics()
+    objective = TransportCost(method.B[0, :], T_FINAL / n_steps, ramp)
+    optimizer = GLMOptimizer(problem, objective, y0=np.zeros(2), plan=plan)
+
+    rng = np.random.default_rng(29)
+    u = ramp + 0.3 * rng.standard_normal(ramp.shape)
+    H_ref = reference_hessian(
+        y0=np.zeros(2), u=u, problem=problem, plan=plan, objective=objective
+    )
+
+    assert np.max(np.abs(problem.F_yy_action(
+        np.array([0.4, 0.7]), np.zeros(1), 0.0, np.array([1.0, 1.0])
+    ))) > 1e-3, "F_yy vanishes here, so this test could not see a dropped term"
+
+    for seed in (0, 1):
+        v = np.random.default_rng(seed).standard_normal(ramp.shape)
+        ref = (H_ref @ v.ravel()).reshape(v.shape)
+        err = np.max(np.abs(optimizer.hessian_vector_product(u, v) - ref)) / float(
+            np.max(np.abs(ref))
+        )
+        assert err < 1e-10, f"transport HVP off by {err:.3e}"
+
+
+@requires_sympy
+def test_transport_example_reaches_its_target_at_rest():
+    """Arriving is not enough: the momentum must be gone too.
+
+    A shuttling solve that lands on ``q = d`` while still moving has excited
+    the motional state, which is the failure the terminal weight's momentum
+    entry exists to price.
+    """
+    from examples.atom_transport import DISTANCE, excitation, solve
+
+    optimizer, result, control = solve(n_steps=40)
+    final = optimizer.trajectory(control).Y[-1][0]
+    assert abs(final[0] - DISTANCE) < 1e-4, f"q(T) = {final[0]:.9f}"
+    assert abs(final[1]) < 1e-4, f"p(T) = {final[1]:.9f}"
+    assert excitation(optimizer, control) < 1e-8
+    assert result.success or result.nit > 0
+
+
+@requires_sympy
+def test_transport_example_refuses_a_problem_outside_the_separable_domain():
+    """C-8.4's domain is checked, and the message says which half broke.
+
+    Linear drag is an ordinary model that every GLM family here integrates.
+    The partitioned sweeps would discard it rather than integrate it, so per
+    C-7 the solve refuses instead of answering.
+    """
+    from examples.atom_transport import refusal_demonstration
+
+    message = refusal_demonstration()
+    assert "f^p" in message
+    assert "separable" in message
+
+
+@requires_sympy
+def test_the_transport_drag_term_is_integrated_fine_by_a_certified_glm():
+    """The refusal above is about the *method*, not about the problem.
+
+    Without this, a mistake that made the damped dynamics unusable would make
+    the refusal test pass for the wrong reason.
+    """
+    from adjungo.core.plan import DiscretizationPlan
+    from adjungo.methods.runge_kutta import rk4
+    from examples.atom_transport import (
+        T_FINAL,
+        TransportCost,
+        stage_ramp,
+        transport_dynamics,
+    )
+
+    n_steps = 6
+    method = rk4()
+    plan = DiscretizationPlan.uniform((0.0, T_FINAL), n_steps, method)
+    ramp = stage_ramp(method, n_steps)
+    optimizer = GLMOptimizer(
+        transport_dynamics(drag=0.3),
+        TransportCost(method.B[0, :], T_FINAL / n_steps, ramp),
+        y0=np.zeros(2),
+        plan=plan,
+    )
+    assert np.isfinite(optimizer.objective_value(ramp))
+
+
+@requires_sympy
+def test_the_transport_ramp_is_sampled_at_each_step_s_stage_times():
+    """``stage_ramp``'s defining property, established without the solver.
+
+    C-8.4 records that a partitioned abscissa is not a row sum of ``A^q`` or
+    of ``A^p``; they are supplied. So the ramp is sampled through ``c``, and
+    an implementation that sampled the step nodes instead would supply the
+    wrong control to every non-endpoint stage.
+    """
+    from adjungo.core.partitioned import verlet
+    from examples.atom_transport import DISTANCE, T_FINAL, stage_ramp
+
+    method = verlet()
+    n_steps = 4
+    ramp = stage_ramp(method, n_steps)
+    h = T_FINAL / n_steps
+    for n in range(n_steps):
+        for k in range(method.s):
+            t = n * h + h * float(method.c[k])
+            assert ramp[n, k, 0] == pytest.approx(DISTANCE * t / T_FINAL, abs=1e-14)
+
+
+@requires_sympy
+def test_transport_energy_error_grows_far_more_slowly_under_verlet():
+    """The measurement the example's headline rests on, asserted.
+
+    Setup: undriven trap held at the origin, ``y0 = (0.5, 0)``, 20 steps per
+    small-oscillation period, statistic ``max|E(t) - E(0)|`` over the whole
+    integration, compared between horizons of 1 and 32 periods.
+
+    The assertion is on the *growth factor*, not on the error's size. ``rk4``
+    is fourth order against Verlet's second and is more accurate per step on
+    any short arc; what separates them here is how the error behaves as the
+    horizon lengthens. Per C-18.6 this is an observation at constant ``h`` on
+    this problem, not a guarantee: symplecticity does not imply energy
+    conservation, and a variable-step plan does not inherit it.
+    """
+    from adjungo.core.partitioned import verlet
+    from adjungo.methods.runge_kutta import rk4
+    from examples.atom_transport import energy_growth
+
+    symplectic = energy_growth(verlet)
+    explicit = energy_growth(rk4)
+    assert symplectic < 1.5, f"verlet energy error grew {symplectic:.2f}x"
+    assert explicit > 10.0, f"rk4 energy error grew only {explicit:.2f}x"
+
+
+@requires_sympy
+def test_transport_main_runs(capsys):
+    """The documented command produces the numbers the docstring describes."""
+    from examples.atom_transport import main
+
+    main()
+    out = capsys.readouterr().out
+    assert "residual excitation" in out
+    assert "refuses rather than answering" in out
+    assert "C-18.6" in out
