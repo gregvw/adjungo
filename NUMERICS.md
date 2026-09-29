@@ -1360,6 +1360,40 @@ injection campaign under [C-14.2](#c-14) has been run for this family**, and
 none is expected until the milestone delivers code to inject into. Certification
 remains pending in full.
 
+**The certification problem itself is built and validated.**
+`tests/prk_problems.py::ShakenLatticeTrap` is a separable Hamiltonian inside
+[C-8.4](#c-8)'s domain — `T(p) = Σ_d J_d(1 − cos p_d)` a tight-binding band,
+`V(q,u,t) = ½(κ + u₂²)‖q − d(t)‖² + ¼α‖q‖⁴ − u₁q₁` — at `n = 4`, `ν = 2`, with
+`t` appearing explicitly. It depends on no partitioned code and on nothing
+added for [C-18](#c-18), so a future disagreement can be attributed to the new
+method rather than to the fixture.
+
+`T` is deliberately **not** quadratic. With `T = ‖p‖²/2` the block `∂f^q/∂p` is
+the identity, so a wrong index in the `A^q` stage recursion would act on a
+constant Jacobian and cancel — finding B0 again, in the partition C-8.4 adds. A
+partitioned certification problem with a quadratic kinetic energy tests half of
+what it appears to. For the same reason the stiffness is `u₂²` rather than
+`u₂`: a control entering linearly leaves `F_uu = 0`, and a trap whose centre
+alone is controlled leaves `F_yu = 0` as well.
+
+Its six callbacks are written by hand and checked by two independent routes in
+`tests/test_prk_problem.py`: `f` against a symbolic `J ∇H` assembled from `T`
+and `V` that never reads `f`, and the five derivatives against
+`examples.symbolic.SymbolicDynamics` differentiating `f`. The block
+anti-diagonal structure the domain requires is asserted on exact zeros rather
+than inferred from the model. Gradients and HVPs agree with the
+[C-14.1](#c-14) tier-1 reference on `rk4`, `implicit_midpoint`, `sdirk3` and
+`gauss2`. Eleven single-token injections into the fixture — sign of the
+restoring force, swapped axes, an unsymmetrised quartic Hessian block, a
+contraction over the wrong half of `v`, a transposed Jacobian block — were all
+detected. A spectral-radius screen at `N = 60` over `[0.2, 1.4]` records that
+the problem is not obviously stiff at a mesh of that order; it is a necessary
+screen on one trajectory at one control, not a conditioning certificate and not
+the refinement study below.
+
+That establishes the fixture, not the family. **C-6.1 is unchanged and still
+lists partitioned methods as not supported.**
+
 **1. Symplecticity — structural, no mesh.** The paired condition and the
 conjugate exchange of [C-8.4](#c-8) are identities in the tableau; no mesh is
 involved and none may be introduced. Check them **symbolically** on the ideal
