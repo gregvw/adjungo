@@ -1666,9 +1666,10 @@ cured by the quadratic-drag problem of [C-8.4](#c-8) and by coupling strengths
 comparison. The third is cured by the same drag problem at `k = 2⁻³⁰`, where
 the consumed `f^p` is exactly `−0.5` and the completed one
 `−0.49999999994179234` — a relative difference of `1.2e-10`, which every
-ordinary tolerance accepts. The sweep drops the `k p²` term whatever its size,
-so the answer would belong to the undamped problem; a small coefficient makes a
-violation hard to see, not small in consequence.
+ordinary tolerance accepts. Accepting it would build the stage from a value
+that is not `f` at that stage, whatever the coefficient's size; the result
+solves no discretization of the problem, and is not the undamped one either.
+A small coefficient makes a violation hard to see, not small in consequence.
 
 Two were not defects at all, and saying so is part of the evidence. Adding the
 control term to the `q` half of the tangent sweep changes nothing, because

@@ -641,9 +641,12 @@ class _QuadraticDrag:
     What refuses the problem is the value comparison. The momentum
     substituted for the unwritten half is the incoming ``y^p``, which
     ``_drag_q0`` pins *away* from the completed ``Z^p = 0``, so the
-    consumed and completed evaluations of ``f^p`` differ. Accepting it
-    would integrate a drag term the sweep had dropped and return a gradient
-    for the undamped problem.
+    consumed and completed evaluations of ``f^p`` differ. What accepting it
+    would cost is the *stage equation*: the value the stage was built from
+    is not ``f`` at that stage. See
+    ``test_accepting_the_drag_violation_breaks_the_stage_equation`` -- the
+    result is not the undamped trajectory either, so there is no problem it
+    is the right answer to.
     """
 
     state_dim = 2
@@ -713,6 +716,65 @@ def test_a_violation_hidden_by_a_vanishing_jacobian_is_still_refused():
         )
 
 
+def test_accepting_the_drag_violation_breaks_the_stage_equation(monkeypatch):
+    """What the refusal above is protecting, measured rather than asserted.
+
+    An earlier version of this explanation said that accepting the
+    violation would return the *undamped* trajectory. That is wrong, and
+    the correction matters: the substitution still evaluates ``-k p**2``,
+    at the incoming momentum instead of the stage one, so the drag is
+    misplaced rather than dropped.
+
+    What is actually broken is the stage equation. The value the stage was
+    built from is ``f^p`` at the incoming momentum, not ``f^p`` at the
+    stage, so the computed step satisfies neither this problem's
+    discretization nor the undamped one. There is no problem it is the
+    right answer to, which is why C-8.4 refuses instead of warning.
+    """
+    monkeypatch.setattr(
+        PartitionedStageSolver, "_check_substitution_was_exact",
+        staticmethod(lambda *a, **k: None),
+    )
+    monkeypatch.setattr(
+        PartitionedStageSolver, "_check_block_structure",
+        staticmethod(lambda *a, **k: None),
+    )
+    y0 = _drag_y0(_DRAG)
+    method = symplectic_euler()
+    problem = _QuadraticDrag()
+    Z, _ = PartitionedStageSolver(n_q=1).solve_stages(
+        y0[None, :], np.zeros((1, 1)), 0.0, _DRAG_H, problem, method,
+    )
+
+    # The stage equation Z^p = y^p + h A^p f^p(Z) does not hold: the value
+    # the stage was built from is f^p at the incoming momentum.
+    built_from = problem.f(y0, np.zeros(1), 0.0)[1]
+    at_stage = problem.f(Z[0], np.zeros(1), 0.0)[1]
+    assert built_from != at_stage
+    assert y0[1] + _DRAG_H * built_from == Z[0, 1]
+    assert y0[1] + _DRAG_H * at_stage != Z[0, 1]
+
+    f_stage = np.array(
+        [problem.f(Z[i], np.zeros(1), 0.0) for i in range(method.s)]
+    )
+    accepted = y0 + _DRAG_H * (np.asarray(method.b) @ f_stage)
+
+    # The undamped recurrence from the same initial state, k = 0, built
+    # here rather than taken from the solver.
+    undamped_problem = _QuadraticDrag(k=0.0)
+    stage_p = y0[1] + _DRAG_H * undamped_problem.f(
+        np.array([y0[0], y0[1]]), np.zeros(1), 0.0
+    )[1]
+    undamped = y0 + _DRAG_H * undamped_problem.f(
+        np.array([y0[0], stage_p]), np.zeros(1), 0.0
+    )
+
+    assert not np.array_equal(accepted, undamped)
+    # The positions differ; the momenta coincide only because this
+    # fixture pins the stage momentum to zero.
+    assert accepted[0] != undamped[0]
+
+
 def test_a_small_violation_is_refused_because_the_comparison_is_exact():
     """C-8.4's reason for exact equality rather than a tolerance.
 
@@ -722,12 +784,13 @@ def test_a_small_violation_is_refused_because_the_comparison_is_exact():
     tolerance accepts that as agreement -- ``np.allclose`` with its default
     ``rtol=1e-5`` does, and so does a tightened ``rtol=1e-6, atol=1e-8``.
 
-    Accepting it would not be a rounding concession. The sweep drops the
-    ``k p**2`` term entirely, so the trajectory and every derivative below
-    it would belong to the undamped problem, not to a nearby one. A small
-    coefficient makes a violation hard to see, not small in consequence,
-    which is why the comparison is exact equality. The structural check
-    cannot cover this row: ``F^pp`` vanishes at the pinned stage momentum.
+    Accepting it would not be a rounding concession. The stage would be
+    built from a value that is not ``f`` at that stage, so the result
+    solves no discretization of this problem -- and, as the sibling test
+    below records, not the undamped one either. A small coefficient makes a
+    violation hard to see, not small in consequence, which is why the
+    comparison is exact equality. The structural check cannot cover this
+    row: ``F^pp`` vanishes at the pinned stage momentum.
     """
     k = _DRAG_SMALL
     y0 = _drag_y0(k)
