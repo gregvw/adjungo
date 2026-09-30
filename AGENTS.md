@@ -67,7 +67,22 @@ already produced a false result in this repository; see NUMERICS.md R-11 for the
 mechanism and for why the quiet failure direction is the dangerous one.
 
 Restore the source **in a `finally`**, and confirm it with `git status` before
-you trust any later measurement. Many of the probe scripts left around from
+you trust any later measurement.
+
+A `finally` is not enough on its own: if you **kill** the campaign, the
+injection it was running stays in the working tree. Two interrupted runs once
+left three live injections at once, and everything measured afterwards was
+worthless — it presented as a 30× slowdown rather than as a failure, so it was
+chased as an environment problem for an afternoon. Snapshot the files the
+campaign mutates before it starts, verify them against that snapshot before
+every injection, and read `git diff` **to its end** before calling a file clean;
+the injection that survived longest sat below the first screen of a diff.
+Discard whatever a killed run leaves in flight rather than reading it: one of
+those interrupted runs later returned a converged-looking optimization from the
+poisoned tree, 8 iterations where a clean tree takes 32, with nothing in the
+output to mark it as wrong. See NUMERICS.md R-11, third addendum.
+
+Many of the probe scripts left around from
 earlier sessions are one-way injectors: they mutate a source file and print a
 line describing the defect, with no restore step. The printed line is a label,
 not a report of what was done. One of them — `p_base.py`, which adds a

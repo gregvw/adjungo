@@ -298,7 +298,7 @@ forward solve, gradient, **and** Hessian-vector product for it, against the
 | Fully implicit (dense `A`) | **certified** — M3 (`gauss2`) |
 | Linear multistep, `r > 1` | **not supported** |
 | IMEX / additive splitting | **not supported** |
-| Partitioned (PRK, Nyström) | **not supported** — conventions [C-8.4](#c-8) and certification cases [C-14.5](#c-14) are `APPROVED`; neither is implemented, and approval of a convention is not certification of a family |
+| Partitioned (PRK, Nyström) | **certified** for `symplectic_euler` and `verlet`, on separable `H = T(p) + V(q, u, t)` only — conventions [C-8.4](#c-8), certification cases and evidence [C-14.5](#c-14). A problem may declare the split right-hand side `f_q(p, u, t)` / `f_p(q, u, t)`, which is preferred and fabricates no stage value; one declaring only `f` is solved by substitution, which additionally assumes `f` is evaluable at a state mixing the incoming half with the stage's own half, control and time. The solve checks necessary conditions for the block dependence structure it relies on and refuses a violation it sees, rather than integrating approximately; those checks are not a decision procedure, and [C-8.4](#c-8) records what escapes them. They do not establish that a Hamiltonian exists, so Hamiltonian structure remains a caller hypothesis and symplecticity is claimed for the tableau, not asserted of an arbitrary accepted problem | Compositions (Blanes–Moan) are **not** certified |
 
 `OBSERVED` — each certified method above is exercised, on the
 [C-14](#c-14-the-certification-test-population) population, by:
@@ -549,7 +549,7 @@ because the first version of the population checked it only through accuracy.
 The SDIRK solver's zero test was made exact for uniformity but is not injected,
 because it is unreachable: the SDIRK class requires a nonzero diagonal.
 
-### C-8.4 Partitioned methods — `APPROVED`, unimplemented
+### C-8.4 Partitioned methods — `APPROVED`, implemented
 
 C-8.1 applies one coefficient array `A` to the whole state, as `A ⊗ I`. A
 **partitioned** method applies a *different* array to each of two complementary
@@ -557,11 +557,11 @@ state blocks. This is not expressible under C-8.2 and is not a matter of adding
 history: carrying more external values generalises the state representation,
 never the component dependence of the coefficients.
 
-Nothing below is certified. C-6.1 lists this family as **not supported**. No
-representation exists — there is no partitioned method object to construct, so
-nothing can reach `GLMOptimizer` to be refused; C-6.2's last bullet would refuse
-one if there were. This clause fixes the conventions a milestone would have to
-implement, so that the mathematics is settled before any code claims it.
+`symplectic_euler` and `verlet` implement this clause and are certified on the
+separable domain below; [C-6.1](#c-6) records that, and [C-14.5](#c-14) holds
+the evidence. Compositions such as Blanes–Moan are not certified. This clause
+fixes the conventions, and the mathematics was settled before any code claimed
+it.
 
 **Domain.** The equations below are written for a general two-block
 partition, but the milestone they govern is deliberately narrower: two
@@ -585,7 +585,10 @@ y^p_{n+1} = y^p_n + h Σ_i b_i f^p(Z_i, u_i, t_n + c_i h)
 ```
 
 Each `f` argument is the **whole** stage vector `Z_j = (Z_j^q, Z_j^p)`; only the
-coefficients are partitioned, not the coupling.
+coefficients are partitioned, not the coupling. Inside the separable domain
+`f^q(Z_j, u_j, t_j) = f^q(Z_j^p)` and `f^p(Z_j, u_j, t_j) = f^p(Z_j^q, u_j, t_j)`,
+which is what lets a problem supply those halves directly; see **Two routes to
+a stage value** below.
 
 **Sampling: an abscissa is not a row sum.** Time and control are sampled at
 `t_n + c_i h` from the single declared `c`. The row sums
@@ -639,6 +642,159 @@ a fixed point. **It does not generalise without the exchange made explicit.**
 The displayed `D⁻¹` form assumes common, nonzero weights. It is a statement
 about tableau algebra and carries no claim about stage-time sampling; C-14.4 is
 a separate result under its own hypotheses and is not extended by this clause.
+
+**The domain is a hypothesis, so it is checked, and on the values used.** The
+partitioned sweeps do not integrate the coupling blocks inaccurately; they
+**drop** them by construction, so a violation must be caught rather than
+answered, per [C-7](#c-7). Two independent checks do it, and neither implies
+the other. Together they are **necessary conditions, not a decision
+procedure**: what escapes them is recorded below, and no claim is made that
+every problem outside the domain is refused.
+
+1. *What the stage was built from must equal `f` at that stage.* Compared by
+   exact equality, and what is compared depends on the route below. On the
+   **whole-vector** route: every value consumed while resolving the stages,
+   against `f` re-evaluated at the completed stage, which establishes that the
+   block did not read the half that was missing. On the **split** route: both
+   `f_q` and `f_p` at every completed stage, against `f` there, which
+   establishes that the split and `f` are the same function — necessary
+   because the step update, the Jacobians and the independent reference all go
+   through `f`. A tolerance would admit a problem that genuinely depends on
+   the missing half by a small amount, which is a different discrete problem
+   and not a rounding difference.
+2. *`F` block anti-diagonal and `G^q = 0`, on exact zeros.* Asserted on the
+   Jacobians the step computed with, following [C-8.3](#c-8)'s treatment of
+   structure everywhere else.
+
+Both are needed, and neither subsumes the other. Under symplectic Euler no
+`f^q` is consumed mid-substitution at all — its `A^q` row is empty — so an
+`f^q` that depends on `q` is caught only by (2); under Verlet the same
+violation is caught by (1). An `f^q` that depends on `u` changes no value,
+since `u` is known before any stage is, and is caught only by (2). Conversely
+quadratic drag `f^p = -V'(q) - k p²` has `F^pp = -2kp`, which vanishes where
+the momentum does, so (2) is blind there and only (1) refuses it.
+
+**Two routes to a stage value.** How the hypothesis is discharged depends on
+what the problem is willing to declare.
+
+*Split route (preferred).* A problem may declare
+
+```
+f_q(p, u, t)        f_p(q, u, t)
+```
+
+as a pair, and is then asked for each half from exactly the arguments that
+half reads. **Nothing is substituted and nothing is invented.** What this
+route settles is exactly one of the domain's requirements — that neither half
+needs the state half the method has not computed — by not offering it, rather
+than by evaluating and comparing. Every other requirement of the domain
+remains a caller hypothesis or a runtime check, as below.
+
+The pair is declared together or not at all — honouring one half would run one
+block on each route, which is neither route's contract. `f` remains required,
+because the step update, the Jacobians and the independent reference all go
+through it, and check (1) holds the two descriptions to each other: **both
+halves, at every stage.** Symplectic Euler's `A^q` row is empty, so it never
+evaluates `f_q` while resolving its stage; a check written over consumed
+values alone accepted an arbitrarily wrong `f_q` under symplectic Euler and
+refused it under Verlet. No wrong answer follows — an unconsumed value is by
+definition one no stage was built from — but it made the refusal a property of
+the tableau rather than of the problem, and deferred the author's error to
+whenever they next changed method. Evaluating at the completed stage instead
+of at the moment of consumption loses nothing, because each half of `Z` is
+written once and never revised.
+
+The signatures take `(u, t)` in both halves for uniformity with `f(y, u, t)`
+and for the C++ port of [C-1](#c-1). An `f_q` that used `u` is refused by
+check (2) as `G^q ≠ 0`; one that used `t` is **not** detected — see *what
+escapes* below.
+
+*Whole-vector route (fallback).* A problem declaring only `f` needs a whole
+state vector, so the half no stage has written yet is supplied from the step's
+incoming state `y`. This route carries an assumption the split route does not:
+that **`f` is evaluable** at a state mixing the incoming half with the stage's
+own half, control and time. Three valid Hamiltonians were refused by
+successive attempts to invent that half:
+
+* `NaN`, on the reasoning that it could never compare equal. An `f` assembled
+  as a matrix product computes `0 * NaN` across an exactly-zero coefficient
+  and returns `NaN` for the whole row, so Adjungo's own `AffineDynamics` —
+  `q' = p`, `p' = -q + u`, a separable linear Hamiltonian well inside this
+  domain — reported a dependence it does not have and was refused.
+* Two fixed finite values, supplied in turn so that a dependence on the
+  missing half would show up directly. For `H = p²/2 + q(log q − 1) − uq`,
+  which exists only for `q > 0`, Verlet's last node consumes `f^q` at a stage
+  whose position is still unwritten; the substituted `−0.618` reached a
+  callback that correctly refuses a negative position, and a valid Hamiltonian
+  raised `ValueError`.
+* The incoming state itself. For `H = p²/2 + (q−t)(log(q−t) − 1) − uq`, valid
+  for `q > t`, one Verlet step over `[0, 0.1]` from `(q, p) = (0.05, 1)` at
+  `u = 0.3` has actual stage gaps `q − t` of `0.05` and `0.06647866`, both
+  inside the domain, and the endpoint `(0.16647866, 1.31533033)` agrees with
+  the hand recurrence to `8e-16`. Substitution combines the incoming position
+  with the *stage's* time, giving `q − t = −0.05`, and the solve raised
+  `ValueError`.
+
+**Separability constrains what `f` reads, not where `f` is defined**, and
+validity is joint in `(y, u, t)`. The stage time is not the incoming time, so
+**no value the solver holds is guaranteed admissible at a stage the problem
+has not been asked about**; the assumption cannot be discharged from inside
+this route, which is why the split exists. It does hold by construction for a
+total `f` — affine, polynomial, trigonometric — which is what every shipped
+problem is, and those stay on this route unchanged.
+
+The fallback also pays a price in check (1): when the incoming half equals the
+completed stage half, the check compares a value with itself and cannot see a
+dependence on that half. The transport example's first step is exactly this
+case — it starts from rest with the ramp still at zero, so every quantity in
+step 0 is exactly zero — and its linear drag is refused there by (2) instead,
+`F^pp = -γ = -0.3` being nonzero everywhere. The blindness is local to that
+step: with (2) disabled the solve reaches step 1, where the consumed `f^p` is
+`0.06616667` against a completed `0.06567042`, and (1) refuses. The
+quadratic-drag witness is constructed the other way round — its stage momentum
+is pinned to exactly zero, so `F^pp = -2kp` vanishes and only (1) sees it. The
+split route has no such fixed point, because it consumes no fabricated value.
+
+`OBSERVED` — declaring the split changes no answer. `SplitShakenLatticeTrap`
+reaches the nonlinear certification fixture's dynamics by the split route over
+the same arithmetic its `f` concatenates; trajectory, gradient and
+Hessian-vector product agree with the whole-vector route by `np.array_equal`,
+exactly, under both methods.
+
+Check (1) costs one further evaluation of `f` per stage. That is accepted
+under [C-1](#c-1): this is a reference implementation, and a silent wrong
+answer on a problem the caller believed was separable costs more than the
+evaluations do. A port may drop the checks only by taking on the obligation to
+establish the domain another way.
+
+**What the checks do and do not establish.** They establish the *block
+dependence structure* the sweeps rely on: that `f^q` reads only the `p` half
+of the state, that `f^p` reads only the `q` half, and that the Jacobians are
+correspondingly structured.
+
+They do **not** see a dependence of `f^q` on `t`. Time is known before any
+stage is, so it changes no consumed value, and `F` and `G` carry no block for
+it. `f^q = p + t` with `f^p = -q + u` is accepted by both methods — `[1.013,
+0.13]` and `[1.0215, 0.128925]` from `(1, 0.2)` at `u = 0.3`, `h = 0.1`. This
+is a gap in the *wording* rather than in the sweeps: such a problem is
+`H = T(p, t) + V(q, u, t)`, still separable in `(q, p)`, and every block the
+partitioned sweeps drop is genuinely zero for it. The clause is written with
+`T(p)` because that is what the certification evidence covers, and no claim
+is made for the `t`-dependent case; admitting it would be an amendment with
+its own evidence, not a silent widening.
+
+They do **not** establish that a Hamiltonian exists. A potential
+`V(q, u, t)` with `f^p = -∂V/∂q` requires `∂f^p/∂q` to be symmetric; a
+non-symmetric one passes both checks and is not a gradient field. For
+`q' = p`, `p' = Cq` with `C = [[-1, 0.4], [0, -2]]` the one-step symplectic
+Euler map has `‖MᵀΩM − Ω‖∞ = 0.0400` at `h = 0.1`, against `1.99e-11` for the
+symmetrised `C`. The derivatives Adjungo returns are still the exact discrete
+derivatives of what it computed, under [C-2](#c-2); what is lost is
+symplecticity, which was a property of the *problem* being Hamiltonian and never
+of the tableau alone. Hamiltonian structure is therefore a **caller
+hypothesis**, stated here and not verified. Adding a symmetry test would need a
+tolerance with a [C-11.3](#c-11) basis, since a lambdified mixed partial is
+symmetric only to rounding; that is a new promise and is not made here.
 
 **Relation to the [C-18](#c-18) plan.** This clause partitions coefficients by
 state *component*, within a step. A plan selects a method by *step*. The axes
@@ -1005,9 +1161,9 @@ Recorded under C-1. A port that changes any of these produces different numbers:
     because the property is the sharpest available check *on* that indexing,
     and a port that reinvents the recursion should reproduce the anchor rather
     than trust a duality test.
-11. **The partitioned adjoint stays division-free** — [C-8.4](#c-8). Should a
-    partitioned family be built, its adjoint must be assembled by transposing
-    the stage residual, exactly as item 2 does, and never by forming the
+11. **The partitioned adjoint stays division-free** — [C-8.4](#c-8). The
+    partitioned adjoint is assembled by transposing the stage residual,
+    exactly as item 2 does, and never by forming the
     `D⁻¹ Aᵀ D` of C-8.4's conjugate exchange. The exchange is tableau algebra
     stated for common, nonzero weights; the recursion has no such restriction,
     and a port that implements the closed form instead of the transpose
@@ -1372,19 +1528,22 @@ in the suite for the explicit, SDIRK and DIRK routes. Transposing the driver's
 own weight `Σ_j a_jk μ_j`, which `Mᵀ` does not filter, fails 15 tests in that
 module.
 
-### C-14.5 Certification cases for a partitioned family — `APPROVED`, unimplemented
+### C-14.5 Certification cases for a partitioned family — `APPROVED`, delivered
 
-Should the [C-8.4](#c-8) family be built, it must be certified on **three
-separate properties**. They fail for different reasons and a single witness
-that conflates them will pass for the wrong one.
+The [C-8.4](#c-8) family is certified on **three separate properties**. They
+fail for different reasons and a single witness that conflates them will pass
+for the wrong one.
 
-**Status of the evidence below.** The measurements recorded here are
-preliminary mathematical evidence, obtained from standalone probes against the
-closed forms and the existing certified methods. They establish the conventions
-and fix the shape of the acceptance cases. **No implementation exists, so no
-injection campaign under [C-14.2](#c-14) has been run for this family**, and
-none is expected until the milestone delivers code to inject into. Certification
-remains pending in full.
+**Status of the evidence below.** `symplectic_euler` and `verlet` are
+implemented, as `adjungo/core/partitioned.py` and
+`adjungo/solvers/partitioned.py`, and [C-6.1](#c-6) records them as certified
+on the separable domain. The three claims below are carried by
+`tests/test_partitioned_methods.py` and `tests/test_partitioned_refinement.py`.
+The measurements quoted were first obtained from standalone probes against the
+closed forms and the existing certified methods; the delivered implementation
+reproduces them, and each is recorded below with the setup needed to recheck
+it. The [C-14.2](#c-14) injection campaign has been run and is recorded at the
+end of this clause. Compositions such as Blanes–Moan remain uncertified.
 
 **The certification problem itself is built and validated.**
 `tests/prk_problems.py::ShakenLatticeTrap` is a separable Hamiltonian inside
@@ -1417,8 +1576,7 @@ the problem is not obviously stiff at a mesh of that order; it is a necessary
 screen on one trajectory at one control, not a conditioning certificate and not
 the refinement study below.
 
-That establishes the fixture, not the family. **C-6.1 is unchanged and still
-lists partitioned methods as not supported.**
+That establishes the fixture, not the family; the three claims below do that.
 
 **1. Symplecticity — structural, no mesh.** The paired condition and the
 conjugate exchange of [C-8.4](#c-8) are identities in the tableau; no mesh is
@@ -1500,6 +1658,133 @@ narrow: at 60 steps second-order Verlet is `53.6×` closer in residual amplitude
 than fourth-order `rk4`, or `2.87e+03` in the quadratic objective. That is an
 observed accuracy comparison on one coarse-mesh fixture, and it is **not**
 grounds to weaken requirement 3.
+
+**Delivered evidence.** Claims 1 and 2 are carried by
+`tests/test_partitioned_methods.py`, claim 3 by
+`tests/test_partitioned_refinement.py`.
+
+*Claim 1* is checked symbolically on the ideal coefficients, as required above.
+The stored-coefficient route is not asserted for either shipped method, because
+neither needs it: both tableaux are exactly representable in binary floating
+point, so the paired residual vanishes structurally. Blanes–Moan is the case
+that would need a C-11.3 budget, and it is not shipped.
+
+This claim is about the **tableau**. `b_i A^p_ij + b_j A^q_ji − b_i b_j = 0` is
+the condition under which a partitioned method preserves the canonical
+symplectic form *when the problem it is applied to is Hamiltonian*. That
+hypothesis is not verified by the solve: [C-8.4](#c-8) records that the domain
+checks establish block dependence structure, which is necessary for separability
+but does not imply that a potential exists, and exhibits an accepted problem
+whose one-step map has symplectic defect `0.04`. Claim 1 is therefore not
+evidence that any given accepted problem is integrated symplectically, and the
+certification does not assert that.
+
+*Claim 2*, against the [C-14.1](#c-14) tier-1 reference extended to assemble
+the partitioned residual. Setup: `ShakenLatticeTrap` at
+`y₀ = (0.3, −0.2, 0.1, 0.05)`, `t ∈ [0.2, 1.1]`, `N = 5` uniform steps,
+`FullCostObjective(nx=4, nu=2, y_target=TRANSPORT_TARGET)`, controls from
+`make_controls(seed=5)`; errors relative, in the 2-norm:
+
+| method | stage values | gradient | HVP |
+|---|---|---|---|
+| `symplectic_euler` | `0.0` | `9.54e-17` | `2.67e-16` |
+| `verlet` | `4.16e-17` | `9.34e-17` | `1.34e-16` |
+
+The reference solves the whole stage system by Newton and never consults
+`dependency_order`, so its agreement is evidence about the substitution order
+and not only about the coefficients.
+
+*Claim 3* reproduces the detuned table above from the delivered implementation,
+to the digits shown. `rk4` is preasymptotic at 60 steps on this fixture — the
+`(60, 120)` pair reports an apparent order of `11.6` — so its order is measured
+on `(120, 240, 480)`. The resonant horizon is retained only as the labelled
+degeneracy check requirement 3 calls for; it asserts that Verlet sits at the
+rounding floor there (`7.47e-16`, `8.53e-16`, `6.14e-16`, orders `−0.19` and
+`0.47`) and so **no order can be measured**. It does not assert that every
+method scores near zero: `rk4` scores `6.64e-03` at 60 steps, because the
+degeneracy removes the ability to *discriminate*, not the ability to be wrong.
+
+**Injection campaign ([C-14.2](#c-14)).** Twenty-five single-token defects
+were injected into `adjungo/solvers/partitioned.py`,
+`adjungo/core/partitioned.py` and the partitioned extension of
+`adjungo/validation/reference.py`, one at a time, each run under the
+[R-11](#r-11) protocol against the whole suite. **All twenty-five were
+detected.** They covered both sweep directions, the transpose and the
+conjugate-half weighting in the adjoint, the `Γ` term, the tangent's control
+term and its `F` contraction, the `A^q`/`A^p` selector, the dependency graph's
+source array, the two tableaux, the symplectic residual and conjugate, the
+reference's coupling index, the routing of the split right-hand side, and the
+deletion of each domain check.
+
+Four of the twenty-five target the stage-value check specifically: relaxing
+its exact comparison to a tolerance, deleting the comparison, never
+substituting at all, and recording a half as written before it is. The last is
+the bypass that matters — it lets an unwritten half reach `f` unchecked — and
+it is detected.
+
+Six more target the split route: passing a half its own block rather than the
+conjugate, returning `f_q` and `f_p` swapped, ignoring a declared split and
+falling back to substitution, letting a half-declared pair fall back silently
+instead of being refused, deleting the split-versus-`f` comparison, and
+narrowing that comparison to the half the tableau happens to consume. All six
+are detected. The third is caught by the moving-domain witness — the only
+injection in this campaign whose detection depends on a problem the fallback
+route cannot serve — and the last was a **real defect**, not a hypothetical:
+the comparison was written over consumed values and accepted an arbitrarily
+wrong `f_q` under symplectic Euler. It is now `2s` comparisons per step,
+independent of the tableau.
+
+Five injections were **undetected** when first run, across the campaign's three
+revisions, and they divide into two kinds.
+
+Three were real gaps, and each was closed by adding a witness rather than by
+adjusting the injection: replacing the `NaN` fill with `0.0`, weakening the
+structural check from exact zero to a tolerance, and relaxing the substitution
+comparison from exact equality to `rtol=1e-6, atol=1e-8`. The first two were
+cured by the quadratic-drag problem of [C-8.4](#c-8) and by coupling strengths
+`1e-14` and `−1.0`, the second of which also escapes a one-sided `> tol`
+comparison. The third is cured by the same drag problem at `k = 2⁻³⁰`, where
+the consumed `f^p` is exactly `−0.5` and the completed one
+`−0.49999999994179234` — a relative difference of `1.2e-10`, which every
+ordinary tolerance accepts. Accepting it would build the stage from a value
+that is not `f` at that stage, whatever the coefficient's size; the result
+solves no discretization of the problem, and is not the undamped one either.
+A small coefficient makes a violation hard to see, not small in consequence.
+
+Two were not defects at all, and saying so is part of the evidence. Adding the
+control term to the `q` half of the tangent sweep changes nothing, because
+`G^q = 0` is enforced structurally and the added term is identically zero; it
+was replaced with dropping that term from the `p` half, which is detected.
+Substituting the conjugate half in place of the block's own is likewise
+inert: the conjugate half a consumed block needs is **always written
+already**, so the substitution branch never fires for it. That invariant is
+what `dependency_order` exists to establish, and it is now asserted directly
+on the tableaux and the ordering, with no solver involved; the fallback route
+relies on it to substitute only the block's own half, and the split route
+relies on it to have a real conjugate value to pass. An injection that cannot change a result is removed from the campaign
+rather than counted as a miss; counting it either way would misreport the
+suite.
+
+Two injections from earlier revisions no longer exist, because the code they
+targeted does not. The `NaN`-to-`0.0` injection went when the fill stopped
+being `NaN`, and collapsing two fill values to one went when the fills
+themselves did; [C-8.4](#c-8) records why neither could stay. The
+quadratic-drag witness survived both changes and still refuses, now from the
+incoming momentum differing from the completed stage momentum.
+
+**A procedural note, because it cost a full afternoon.** Two campaign runs were
+interrupted partway through. The harness restores each file in a `finally`, so
+an interrupted run leaves the *current* injection live in the working tree — and
+in one case three separate injections survived across two kills. Every
+measurement taken afterwards was meaningless, and the symptom was not an obvious
+failure but an apparent 30× slowdown, which invited an environmental
+explanation. `git diff` showed it immediately, but only when read in full: the
+surviving adjoint injection was below the first screen of a diff dominated by an
+unrelated change. The harness now verifies every injected file against a
+pristine snapshot before each injection and refuses to continue otherwise.
+**Do not diagnose a campaign result before confirming the tree is pristine**,
+and read the whole diff, not its head. This is [R-11](#r-11)'s failure mode in a
+new disguise: the quiet direction is the dangerous one.
 
 ---
 
@@ -3385,6 +3670,40 @@ Two requirements follow. Use the command in `AGENTS.md` **as written**, without
 adding `-q`. And have the harness cross-check the parsed count against the
 process exit status, refusing to report a number when a nonzero exit yields no
 parsed failures or a zero exit yields some; the discrepancy is what caught this.
+
+**Third addendum — an interrupted campaign poisons the tree it leaves behind.**
+A harness that injects into the working tree and restores in a `finally` has a
+hole exactly the size of a kill: the current injection stays live. Interrupting
+two runs during the [C-14.5](#c-14) campaign left **three** separate injections
+in `adjungo/solvers/partitioned.py`, including one in the adjoint sweep.
+
+Every measurement taken after that was meaningless, and — the part worth
+recording — it did not look like a defect. It looked like a 30× slowdown, with
+`trust-ncg` spinning on a broken HVP, which invited an environmental
+explanation; a plugin install, a BLAS threading difference and a cleared
+bytecode cache were all investigated first, and a "baseline" measured on the
+poisoned tree made the corruption look like a property of the cure. `git diff`
+would have shown it at any point, but only read **in full**: the surviving
+adjoint injection sat below the first screen of a diff dominated by an unrelated
+change, and a `head -80` of that diff looked entirely clean.
+
+The quieter half surfaced later, when one of the interrupted runs of
+`examples/atom_transport.py` finally returned. It did not fail. It reported a
+converged optimization — `residual excitation 2.007e-13`, `peak |u − ramp|
+0.026741`, 8 iterations — against the `2.041e-13`, `0.026722` and 32 iterations
+the same example gives on a clean tree at that commit. Nothing in that output
+announces itself as wrong; a broken adjoint simply walked a different path to a
+nearby point. Had it been read as a result rather than as an artefact, it would
+have been a measurement of nothing, recorded as evidence.
+
+Three requirements follow. Snapshot the files a campaign will mutate **before**
+it starts, and verify each against that snapshot before every injection, so a
+corrupted tree fails loudly instead of producing numbers. A snapshot carried
+over from a previous run is worth nothing — it may hold that run's injected
+text — so take a fresh one each time and refuse to start if one is already
+there. Confirm the tree is pristine before diagnosing any campaign result, and
+discard anything a killed run left behind rather than reading it. And read a
+diff to its end before concluding a file is clean.
 
 ### R-12 An unrun check is not a check — `APPROVED`
 

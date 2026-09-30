@@ -37,6 +37,7 @@ Hessian-vector product against an independently assembled reference.
 | DIRK (`implicit_trapezoid` / Crank–Nicolson) | **certified** |
 | SDIRK (`implicit_midpoint`, `sdirk2`, `sdirk3`) | **certified** |
 | Fully implicit, dense `A` (`gauss2`) | **certified** — one coupled `(s·n)` Newton solve per step |
+| Partitioned (`symplectic_euler`, `verlet`) | **certified** — separable `H = T(p) + V(q, u, t)` only; the block dependence structure the step relies on is checked on the values it used. That structure does not establish that a Hamiltonian exists, so symplecticity is a property of the tableau given a Hamiltonian problem, not something asserted of every accepted one (`NUMERICS.md` C-8.4) |
 | BDF (`bdf2`, `bdf3`) | **refused** — `r > 1` has no starting procedure |
 | Adams (`adams_bashforth2`, `adams_moulton2`) | **refused** — tableau not representable |
 | IMEX / additive splitting | **refused** |
@@ -105,6 +106,29 @@ objective's `d2J_dy2` and `d2J_dy2_terminal`) are **required** for the exact
 Hessian-vector product. If they are missing, adjungo raises. It does not
 silently fall back to a Gauss–Newton operator, because that is a different
 operator and the method promises the exact Hessian.
+
+A problem solved by a **partitioned** method may optionally declare the split
+right-hand side
+
+```python
+def f_q(self, p, u, t): ...   # ∂H/∂p, from the momentum half alone
+def f_p(self, q, u, t): ...   # -∂H/∂q, from the position half, control, time
+```
+
+alongside `f`, which stays required. A partitioned step resolves the two
+blocks in turn, so without the split it must evaluate `f` at a stage vector
+one half of which is not yet known, and substitute something for that half.
+Separability says what `f` *reads*, not where it is *defined*: a model with a
+restricted domain — a logarithmic or Coulomb potential, a positive-definite
+constraint — can refuse the substituted state even though its trajectory is
+perfectly well defined, and the more so when the domain moves with `t`. With
+the split declared, nothing is substituted. Both halves are checked against
+`f` at every completed stage, exactly, so a split that disagrees with `f` is
+refused rather than quietly integrated (`NUMERICS.md` C-8.4). On a problem
+whose `f` is total the split is therefore an equivalent route and not a
+different method: the nonlinear certification fixture's trajectory, gradient
+and Hessian-vector product are bit-identical between the two. Declare both or
+neither.
 
 ### Control parametrisation
 
@@ -195,13 +219,16 @@ the optimizer's cache and checks nothing. See `NUMERICS.md` C-17.6.
   Jacobian). Reuse under a declared-constant Jacobian is implemented and is
   described above; what is missing is reuse where the matrix genuinely
   changes and a stale one would be used deliberately.
-- **Partitioned methods** (partitioned Runge–Kutta, Nyström), which apply a
-  different coefficient array to each of two state blocks. A GLM applies one
-  array to the whole state as `A ⊗ I`, so symplectic Euler and Störmer–Verlet
-  are not expressible — there is no partitioned method object to construct.
-  Conventions, the domain and the certification cases are `APPROVED`
-  in `NUMERICS.md` C-8.4 and C-14.5. Nothing is implemented; those clauses rule
-  how a partitioned family must be expressed and certified, not that one exists.
+- **Higher-order partitioned methods.** Symplectic Euler and Störmer–Verlet
+  are certified and described above. Compositions such as Blanes–Moan are not
+  built: their paired symplectic condition cancels arithmetically rather than
+  vanishing structurally, so it needs a stated rounding budget under
+  `NUMERICS.md` C-11.3 before it can be asserted.
+- **Non-separable Hamiltonians** under a partitioned method. `NUMERICS.md`
+  C-8.4 scopes the family to `H = T(p) + V(q, u, t)`; a violation the checks
+  see is refused during the solve rather than integrated, because the
+  partitioned sweeps drop the coupling blocks by construction. The checks are
+  necessary conditions, not a decision procedure.
 - Nonlinear control parametrisation, sparse operators, and checkpointing.
 - **Mesh adaptation.** Prescribed non-uniform steps and per-step methods are
   implemented and described above; what is missing is a policy that builds a
@@ -400,6 +427,7 @@ independently assembled reference rather than merely run.
 | [`double_integrator.py`](examples/double_integrator.py) | The only example that knows its own answer. A linear-quadratic tracking problem checked against two references: a backward Riccati recursion on an independently assembled step map, and the closed-form solution of the continuous optimality conditions. For the undamped problem these coincide *exactly* — `u*` is linear in `t` and rk4's weights are Simpson's rule — so adding linear drag makes the costate exponential and recovers a fourth-order mesh study of the **optimum**, not of a solve. |
 | [`pendulum_swing_up.py`](examples/pendulum_swing_up.py) | The only example whose *nonlinear* dynamics have a closed-form solution. A torque-driven pendulum, swung from hanging to inverted under `gauss2`. Undriven and undamped it librates exactly as a Jacobi elliptic function, with a period a third longer than the small-angle `2π/ω₀`, so the fourth-order mesh study could not pass on a linearised `sin θ`. It also conserves `E = ½ω² + ω₀²(1 − cos θ)`, a first integral that constrains every point rather than one endpoint — and separates the methods: over 32× the integration time `rk4` lets the energy error grow 27-fold where symplectic `gauss2` holds it to 1.003. The swing-up optimum itself has no closed form, and none is claimed. Needs the `examples` extra. |
 | [`zermelo_navigation.py`](examples/zermelo_navigation.py) | The only example whose field is **nonlinear in the control**, and the only one that drives `F_uu`. A boat of fixed speed steers through a linear shear current to reach as far downstream as it can in a fixed time. Because `f` is linear in the state and the cost is terminal and linear, `F_yy`, `F_yu` and every `d2J` block vanish identically: removing `F_uu_action` does not perturb the Hessian, it zeroes it. Pontryagin gives `tan θ*(t) = (V/h)(T − t)`, Zermelo's navigation formula `θ̇ = −(V/h)cos²θ`, and the trajectory in elementary functions. The costate never consults the state, so that closed-form heading is stationary for the **discrete** problem too, on any mesh, to rounding — but only for tableaux satisfying Butcher's `D(1)`, `Σⱼbⱼaⱼᵢ = bᵢ(1−cᵢ)`. Four shipped tableaux satisfy it and four do not, and the example predicts which from the tableau alone. That binds the discrete adjoint's stage weights, which a duality test cannot separate from the tangent's. Needs the `examples` extra. |
+| [`atom_transport.py`](examples/atom_transport.py) | The only example that is **not a GLM**. Shuttling a trapped atom from rest to rest under Störmer–Verlet, which applies `A^q` to the position block and `A^p` to the momentum block — not expressible as a single `A ⊗ I` (`NUMERICS.md` C-8.4). The Hamiltonian is separable with a tight-binding kinetic energy `T(p) = J(1 − cos p)`, so `∂f^q/∂p` depends on the state; with a quadratic `T` that block would be the identity and a wrong index in the `A^q` recursion would cancel. What is priced is the residual **motional excitation**, a small difference of larger quantities, so any energy the integrator invents is added straight to the objective. Undriven at 20 steps per period, `max|E − E(0)|` grows 1.00× between horizons of 1 and 32 periods under Verlet, where fourth-order `rk4`'s grows 29.9× — a growth factor at constant `h`, not a guarantee and not a claim about the error's size; C-18.6 records that symplecticity implies neither energy conservation nor that a variable-step plan inherits this. It also shows the domain check: adding ordinary linear drag leaves C-8.4's separable domain and the solve refuses rather than silently discarding the term. Needs the `examples` extra. |
 
 ## Development
 

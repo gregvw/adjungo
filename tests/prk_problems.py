@@ -3,10 +3,11 @@
 A [C-8.4](NUMERICS.md) partitioned method needs a problem inside its domain to
 be certified on, and that problem has to exist before the method does, or the
 first evidence for the method will be produced by whatever the method happens
-to compute. This module supplies it. **It depends on no partitioned code**, and
-on nothing added for the discretization plan: every method certified under
-C-6.1 today can already integrate it, so the problem itself can be validated
-before the family it exists to certify is written.
+to compute. This module supplies it, and was written and validated before
+`symplectic_euler` and `verlet` were. **It depends on no partitioned code**,
+and on nothing added for the discretization plan: every other certified family
+can already integrate it, so a future disagreement can be attributed to the
+partitioned route rather than to the fixture.
 
 The model
 ---------
@@ -94,7 +95,15 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-__all__ = ["TRANSPORT_TARGET", "ShakenLatticeTrap"]
+__all__ = [
+    "EXCITATION_MODES",
+    "TRANSPORT_TARGET",
+    "DrivenOscillator",
+    "ShakenLatticeTrap",
+    "TerminalExcitation",
+    "excitation",
+    "oracle_terminal_map",
+]
 
 
 class ShakenLatticeTrap:
@@ -114,9 +123,10 @@ class ShakenLatticeTrap:
     control_dim = 2
 
     #: Index of the first momentum component. The state splits as
-    #: ``y[:n_q]`` and ``y[n_q:]``; no partitioned method object exists yet
-    #: (C-6.1 lists the family as not supported), so the split is recorded
-    #: here as plain data rather than promised as an API.
+    #: ``y[:n_q]`` and ``y[n_q:]``. The partition is the *problem's* to
+    #: declare, never the tableau's to guess: ``state_dim // 2`` is right for
+    #: every canonical Hamiltonian and wrong in silence for anything else,
+    #: which is the shape of answer C-7 forbids.
     n_q = 2
 
     def __init__(
@@ -164,14 +174,31 @@ class ShakenLatticeTrap:
 
     # -- Problem protocol ----------------------------------------------
 
-    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
-        """``f = (dH/dp, -dH/dq)``."""
-        q, p = y[:2], y[2:]
+    def velocity(self, p: NDArray, u: NDArray, t: float) -> NDArray:
+        """``dH/dp = dT/dp``, the group velocity. Reads ``p`` alone."""
+        return self.J * np.sin(p)
+
+    def force(self, q: NDArray, u: NDArray, t: float) -> NDArray:
+        """``-dH/dq = -dV/dq``. Reads ``(q, u, t)`` alone."""
         r = q - self.centre(t)
-        f_q = self.J * np.sin(p)
-        f_p = -(self.kappa + u[1] ** 2) * r - self.alpha * (q @ q) * q
-        f_p[0] += u[0]
-        return np.concatenate([f_q, f_p])
+        out = -(self.kappa + u[1] ** 2) * r - self.alpha * (q @ q) * q
+        out[0] += u[0]
+        return out
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        """``f = (dH/dp, -dH/dq)``, assembled from the two halves.
+
+        Written this way so that :class:`SplitShakenLatticeTrap` can declare
+        C-8.4's split route over exactly the same arithmetic, which is what
+        lets the two routes be compared bit for bit rather than to a
+        tolerance.
+        """
+        return np.concatenate(
+            [
+                self.velocity(y[self.n_q :], u, t),
+                self.force(y[: self.n_q], u, t),
+            ]
+        )
 
     def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
         """``df/dy``, block anti-diagonal because ``H`` is separable."""
@@ -244,6 +271,177 @@ class ShakenLatticeTrap:
         return out
 
 
+class SplitShakenLatticeTrap(ShakenLatticeTrap):
+    """:class:`ShakenLatticeTrap` declaring C-8.4's split right-hand side.
+
+    The same dynamics reached by the other route. Because ``f_q`` and ``f_p``
+    are the very functions the inherited ``f`` concatenates, the two routes
+    perform identical arithmetic on identical inputs, so their trajectories,
+    gradients and Hessian-vector products must agree *exactly* -- a
+    tolerance would hide a route that quietly computed something else.
+
+    Nothing here needs the split: ``sin`` and a polynomial are entire, so the
+    whole-vector route's totality hypothesis holds by construction. The
+    fixture exists to certify that declaring the split changes no answer. For
+    a problem the whole-vector route genuinely cannot serve, see
+    ``tests/test_partitioned_methods.py::_MovingLogTrap``.
+    """
+
+    def f_q(self, p: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.velocity(p, u, t)
+
+    def f_p(self, q: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.force(q, u, t)
+
+
 #: Terminal target for the transport problem: the atom displaced and brought
 #: to rest. Paired with ``FullCostObjective(nx=4, nu=2, y_target=...)``.
 TRANSPORT_TARGET = np.array([1.0, -0.5, 0.0, 0.0])
+
+
+class DrivenOscillator:
+    """``q' = v``, ``v' = -(q - x0(t))``: the C-14.5 refinement fixture.
+
+    A second, deliberately *simple* separable Hamiltonian, for the continuous
+    accuracy claim alone. ``H = p²/2 + (q - x₀)²/2`` at ``ω = 1``, driven by
+    the control through the potential minimum.
+
+    Why a second fixture, and why this one
+    --------------------------------------
+
+    :class:`ShakenLatticeTrap` is built to make derivative defects visible,
+    which is why its kinetic energy is not quadratic. Requirement 3 of C-14.5
+    asks a different question -- whether the discrete terminal state converges
+    to the continuous one at the method's order -- and answering it needs a
+    problem with a *closed-form* continuous solution. This one has one::
+
+        z = q + i v  ⟹  z' = -i z + i x₀,  z(0) = 0
+        z(T) = i e^{-iT} ∫₀ᵀ e^{it} x₀(t) dt
+
+    so the oracle is an integral, not another discretization. The two fixtures
+    are therefore not redundant: neither can answer the other's question. The
+    quadratic kinetic energy that would hide an ``A^q`` index defect here is
+    harmless, because the claim measured here is not a derivative.
+
+    ``f^q = v`` reads only ``p``, ``f^p`` only ``(q, u)``, and ``∂f^q/∂u = 0``,
+    so the problem is inside C-8.4's domain.
+    """
+
+    state_dim = 2
+    control_dim = 1
+    n_q = 1
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.array([y[1], -(y[0] - u[0])])
+
+    def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.array([[0.0, 1.0], [-1.0, 0.0]])
+
+    def G(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        return np.array([[0.0], [1.0]])
+
+    def F_yy_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return np.zeros((2, 2))
+
+    def F_yu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return np.zeros((2, 1))
+
+    def F_uu_action(
+        self, y: NDArray, u: NDArray, t: float, v: NDArray
+    ) -> NDArray:
+        return np.zeros((1, 1))
+
+
+class TerminalExcitation:
+    """``J = ‖(q(T) - 1, v(T))‖² / 2``: displace the oscillator and stop it."""
+
+    target = np.array([1.0, 0.0])
+
+    def evaluate(self, trajectory, u: NDArray) -> float:
+        d = trajectory.Y[-1, 0] - self.target
+        return 0.5 * float(d @ d)
+
+    def dJ_dy_terminal(self, y: NDArray) -> NDArray:
+        g = np.zeros_like(y)
+        g[0] = y[0] - self.target
+        return g
+
+    def dJ_dy(self, y: NDArray, step: int) -> NDArray:
+        return np.zeros_like(y)
+
+    def dJ_du(self, u: NDArray, step: int, stage: int) -> NDArray:
+        return np.zeros_like(u)
+
+    def d2J_dy2(self, y: NDArray, step: int) -> NDArray:
+        return np.zeros((y.shape[-1], y.shape[-1]))
+
+    def d2J_du2(self, u: NDArray, step: int, stage: int) -> NDArray:
+        return np.zeros((len(u), len(u)))
+
+
+#: Number of sine modes in the excitation basis of C-14.5 requirement 3.
+EXCITATION_MODES = 8
+
+
+def excitation(theta: NDArray, T: float):
+    """``x₀(t) = t/T + Σ_k θ_k sin(kπt/T)``, the drive of C-14.5.
+
+    A bare ramp plus a fixed sine basis. The ramp alone carries the target
+    displacement; the modes are what a fit has to work with.
+    """
+    theta = np.asarray(theta, dtype=float)
+
+    def x0(t: float) -> float:
+        modes = np.sin(np.arange(1, theta.size + 1) * np.pi * t / T)
+        return float(t / T + theta @ modes)
+
+    return x0
+
+
+def oracle_terminal_map(T: float) -> tuple[NDArray, NDArray]:
+    """Exact ``(R, d)`` with continuous terminal residual ``r = R θ + d``.
+
+    From ``z(T) = i e^{-iT} ∫₀ᵀ e^{it} x₀(t) dt`` with ``r = z(T) - 1``, whose
+    real and imaginary parts are the position and velocity residuals. The two
+    integrals are elementary::
+
+        ∫₀ᵀ e^{it} (t/T) dt      = [e^{iT}(1 - iT) - 1] / T
+        ∫₀ᵀ e^{it} sin(ω t) dt   = [E(1+ω) - E(1-ω)] / 2i,
+                                   E(a) = (e^{iaT} - 1) / ia
+
+    and are written out rather than quadratured, so the oracle carries no
+    discretization of its own. ``ω = kπ/T`` never equals ``1`` for the
+    horizons in use, so ``E(1-ω)`` has no removable singularity here; a
+    horizon that made ``kπ/T = 1`` would need the limit form and is refused.
+
+    The oracle's standing rests on the integral satisfying the stated ODE and
+    initial condition, which is a derivation, not a measurement. The
+    independent checks in the test module -- adaptive quadrature, and
+    refinement of ``gauss2`` toward it -- corroborate the arithmetic; per
+    C-14.5 neither proves it nor bounds the residual error.
+    """
+    k = np.arange(1, EXCITATION_MODES + 1)
+    omega = k * np.pi / T
+    if np.any(np.isclose(omega, 1.0, rtol=0.0, atol=1e-12)):
+        raise ValueError(
+            f"horizon T = {T!r} puts an excitation mode exactly on "
+            f"resonance with the oscillator; the closed form below divides "
+            f"by 1 - kπ/T."
+        )
+
+    def z(integral):
+        return 1j * np.exp(-1j * T) * integral
+
+    def E(a):
+        return (np.exp(1j * a * T) - 1.0) / (1j * a)
+
+    d_c = z((np.exp(1j * T) * (1.0 - 1j * T) - 1.0) / T) - 1.0
+    cols = z((E(1.0 + omega) - E(1.0 - omega)) / 2j)
+    return (
+        np.array([cols.real, cols.imag]),
+        np.array([d_c.real, d_c.imag]),
+    )

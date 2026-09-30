@@ -9,12 +9,12 @@ from numpy.typing import NDArray
 
 from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
-from adjungo.solvers.base import StageSolver, StepCache
+from adjungo.solvers.base import GLMStageSolver, StepCache
 from adjungo.solvers.factorization import FactorizationStore
 from adjungo.solvers.newton import StageDispatchMixin, stage_context
 
 
-class SDIRKStageSolver(StageDispatchMixin, StageSolver):
+class SDIRKStageSolver(StageDispatchMixin, GLMStageSolver):
     """
     SDIRK stage solver: a constant diagonal coefficient ``γ`` means every
     implicit stage has a matrix of the same *form*, ``I - h γ F``.

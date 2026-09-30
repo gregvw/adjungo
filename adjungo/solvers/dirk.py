@@ -9,12 +9,12 @@ from numpy.typing import NDArray
 
 from adjungo.core.method import GLMethod
 from adjungo.core.problem import Problem
-from adjungo.solvers.base import StageSolver, StepCache
+from adjungo.solvers.base import GLMStageSolver, StepCache
 from adjungo.solvers.factorization import FactorizationStore
 from adjungo.solvers.newton import StageDispatchMixin, stage_context
 
 
-class DIRKStageSolver(StageDispatchMixin, StageSolver):
+class DIRKStageSolver(StageDispatchMixin, GLMStageSolver):
     """DIRK stage solver (each stage has a different diagonal element).
 
     Stages are solved one at a time in order, because ``A`` is lower

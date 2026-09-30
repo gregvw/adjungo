@@ -3,17 +3,26 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property
+from typing import ClassVar
 
 import numpy as np
 from numpy.typing import NDArray
 
 
 class StageType(Enum):
-    """Classification of stage matrix structure."""
+    """Classification of the stage coupling, which selects the stage solver.
+
+    The first four classify the exact structure of a single ``A`` (C-8.3).
+    ``PARTITIONED`` does not: it says that no single ``A`` exists, because the
+    method applies a different array to each half of the state (C-8.4). It is
+    therefore not a structure a ``GLMethod`` can have, and declaring it on one
+    is refused at construction.
+    """
     EXPLICIT = auto()   # A strictly lower triangular
     DIRK = auto()       # A lower triangular, varying diagonal
     SDIRK = auto()      # A lower triangular, constant diagonal γ
     IMPLICIT = auto()   # A dense
+    PARTITIONED = auto()  # no single A: an (A^q, A^p) pair, C-8.4
 
 
 class TableauDeclarationError(ValueError):
@@ -53,6 +62,11 @@ class GLMethod:
     #: recommended practice: it is the only way a coefficient typo that moves
     #: the tableau into another class is caught rather than integrated.
     declared_stage_type: StageType | None = None
+
+    #: Arrays a discretization plan must copy and freeze. Named on the class
+    #: so that :func:`adjungo.core.plan._frozen_tableau` need not know which
+    #: method type it is holding; a partitioned tableau names a different set.
+    coefficient_names: ClassVar[tuple[str, ...]] = ("A", "U", "B", "V", "c")
 
     def __post_init__(self) -> None:
         """Enforce the NUMERICS.md C-8.2 shape invariants, then check any
@@ -102,6 +116,18 @@ class GLMethod:
                 raise TypeError(
                     f"GLMethod.declared_stage_type must be a StageType or "
                     f"None, got {type(declared).__name__}."
+                )
+            if declared is StageType.PARTITIONED:
+                # PARTITIONED is not a structure of A, so
+                # stage_structure_violations cannot answer for it; without
+                # this guard the declaration would fall through to the SDIRK
+                # branch and be checked against the wrong property.
+                raise TableauDeclarationError(
+                    "GLMethod cannot declare PARTITIONED: that stage type "
+                    "says the method has no single stage matrix, and this "
+                    "tableau has one. Use "
+                    "adjungo.core.partitioned.PartitionedMethod "
+                    "(NUMERICS.md C-8.4)."
                 )
             violations = stage_structure_violations(self.A, declared)
             if violations:

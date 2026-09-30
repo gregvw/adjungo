@@ -218,7 +218,7 @@ def test_certified_families_agree_with_the_code():
         "Fully implicit (dense `A`)": StageType.IMPLICIT,
         "Linear multistep, `r > 1`": None,
         "IMEX / additive splitting": None,
-        "Partitioned (PRK, Nyström)": None,
+        "Partitioned (PRK, Nyström)": StageType.PARTITIONED,
     }
 
     rows = [
@@ -323,6 +323,7 @@ def test_the_readme_status_table_agrees_with_the_code():
         "BDF (`bdf2`, `bdf3`)": None,
         "Adams (`adams_bashforth2`, `adams_moulton2`)": None,
         "IMEX / additive splitting": None,
+        "Partitioned (`symplectic_euler`, `verlet`)": StageType.PARTITIONED,
     }
 
     rows = _first_table_block(section)
