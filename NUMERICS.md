@@ -3605,13 +3605,23 @@ would have shown it at any point, but only read **in full**: the surviving
 adjoint injection sat below the first screen of a diff dominated by an unrelated
 change, and a `head -80` of that diff looked entirely clean.
 
+The quieter half surfaced later, when one of the interrupted runs of
+`examples/atom_transport.py` finally returned. It did not fail. It reported a
+converged optimization — `residual excitation 2.007e-13`, `peak |u − ramp|
+0.026741`, 8 iterations — against the `2.041e-13`, `0.026722` and 32 iterations
+the same example gives on a clean tree at that commit. Nothing in that output
+announces itself as wrong; a broken adjoint simply walked a different path to a
+nearby point. Had it been read as a result rather than as an artefact, it would
+have been a measurement of nothing, recorded as evidence.
+
 Three requirements follow. Snapshot the files a campaign will mutate **before**
 it starts, and verify each against that snapshot before every injection, so a
 corrupted tree fails loudly instead of producing numbers. A snapshot carried
 over from a previous run is worth nothing — it may hold that run's injected
 text — so take a fresh one each time and refuse to start if one is already
-there. Confirm the tree is pristine before diagnosing any campaign result. And
-read a diff to its end before concluding a file is clean.
+there. Confirm the tree is pristine before diagnosing any campaign result, and
+discard anything a killed run left behind rather than reading it. And read a
+diff to its end before concluding a file is clean.
 
 ### R-12 An unrun check is not a check — `APPROVED`
 

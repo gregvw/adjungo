@@ -76,8 +76,11 @@ worthless — it presented as a 30× slowdown rather than as a failure, so it wa
 chased as an environment problem for an afternoon. Snapshot the files the
 campaign mutates before it starts, verify them against that snapshot before
 every injection, and read `git diff` **to its end** before calling a file clean;
-the injection that survived longest sat below the first screen of a diff. See
-NUMERICS.md R-11, third addendum.
+the injection that survived longest sat below the first screen of a diff.
+Discard whatever a killed run leaves in flight rather than reading it: one of
+those interrupted runs later returned a converged-looking optimization from the
+poisoned tree, 8 iterations where a clean tree takes 32, with nothing in the
+output to mark it as wrong. See NUMERICS.md R-11, third addendum.
 
 Many of the probe scripts left around from
 earlier sessions are one-way injectors: they mutate a source file and print a
