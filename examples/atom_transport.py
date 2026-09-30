@@ -311,11 +311,25 @@ def _energy_trace(method_factory, horizon: float, n_steps: int) -> NDArray:
 
 
 def refusal_demonstration(drag: float = 0.3) -> str:
-    """Solve the same problem with a drag term, and return the refusal's first line.
+    """Solve the same problem with a drag term, and return the refusal message.
 
     ``-γp`` in ``f^p`` is an ordinary damping model and every GLM family here
     integrates it. It is outside C-8.4's separable domain, and the partitioned
     route declines rather than dropping the term it cannot carry.
+
+    The *structural* check is what refuses it, and the reason is specific to
+    the first step. The trajectory starts from rest with the ramp still at
+    zero, so every quantity in step 0 is exactly zero: the momentum
+    substituted for the unwritten half is the incoming ``y^p = 0``, the
+    completed stage momentum is zero too, and the value comparison sees
+    ``0.0`` against ``0.0``. ``F^pp = -γ = -0.3`` is nonzero everywhere, so
+    the Jacobian structure refuses at that same step.
+
+    The value check is not blind to this problem in general. With the
+    structural check disabled the solve reaches step 1, where the consumed
+    ``f^p`` is ``0.06616667`` and the completed one ``0.06567042``, and the
+    comparison refuses there. The two checks are complementary in exactly
+    this way; see C-8.4.
     """
     optimizer, ramp = build_optimizer()
     damped = GLMOptimizer(
@@ -327,7 +341,7 @@ def refusal_demonstration(drag: float = 0.3) -> str:
     try:
         damped.objective_value(ramp)
     except SeparabilityViolation as exc:
-        return str(exc).splitlines()[0]
+        return str(exc)
     raise AssertionError(
         f"a drag of {drag} put p into f^p and was accepted; C-8.4's domain "
         "check did not fire, and the sweeps would have discarded the term"
@@ -361,7 +375,8 @@ def main() -> None:
     print(f"  iterations         {result.nit}")
 
     print("\nOutside C-8.4's domain, the solve refuses rather than answering:")
-    print(f"  {refusal_demonstration()}")
+    for line in refusal_demonstration().splitlines():
+        print(f"  {line}")
 
 
 def _rk4():

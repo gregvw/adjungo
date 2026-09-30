@@ -298,7 +298,7 @@ forward solve, gradient, **and** Hessian-vector product for it, against the
 | Fully implicit (dense `A`) | **certified** — M3 (`gauss2`) |
 | Linear multistep, `r > 1` | **not supported** |
 | IMEX / additive splitting | **not supported** |
-| Partitioned (PRK, Nyström) | **certified** for `symplectic_euler` and `verlet`, on separable `H = T(p) + V(q, u, t)` only — conventions [C-8.4](#c-8), certification cases and evidence [C-14.5](#c-14). The solve checks the block dependence structure it relies on and refuses a problem that violates it, rather than integrating approximately; that structure is necessary for separability but does not establish that a Hamiltonian exists, so Hamiltonian structure remains a caller hypothesis and symplecticity is claimed for the tableau, not asserted of an arbitrary accepted problem ([C-8.4](#c-8)). Compositions (Blanes–Moan) are **not** certified |
+| Partitioned (PRK, Nyström) | **certified** for `symplectic_euler` and `verlet`, on separable `H = T(p) + V(q, u, t)` only — conventions [C-8.4](#c-8), certification cases and evidence [C-14.5](#c-14). The solve checks necessary conditions for the block dependence structure it relies on and refuses a violation it sees, rather than integrating approximately; those checks are not a decision procedure, and [C-8.4](#c-8) records what escapes them. They do not establish that a Hamiltonian exists, so Hamiltonian structure remains a caller hypothesis and symplecticity is claimed for the tableau, not asserted of an arbitrary accepted problem | Compositions (Blanes–Moan) are **not** certified |
 
 `OBSERVED` — each certified method above is exercised, on the
 [C-14](#c-14-the-certification-test-population) population, by:
@@ -642,69 +642,86 @@ a separate result under its own hypotheses and is not extended by this clause.
 
 **The domain is a hypothesis, so it is checked, and on the values used.** The
 partitioned sweeps do not integrate the coupling blocks inaccurately; they
-**drop** them by construction. A problem outside the separable domain is
-therefore refused during the solve, per [C-7](#c-7), rather than answered.
-Three independent checks do it, and none implies the others:
+**drop** them by construction, so a violation must be caught rather than
+answered, per [C-7](#c-7). Two independent checks do it, and neither implies
+the other. Together they are **necessary conditions, not a decision
+procedure**: what escapes them is recorded below, and no claim is made that
+every problem outside the domain is refused.
 
-1. *A consumed `f` must not move when the unwritten half does.* `f` takes the
-   whole stage vector, so something must be supplied for the half no stage has
-   written yet. Two different finite values are supplied in turn and the
-   consumed block must come back **exactly** equal.
-2. *Every `f` consumed mid-substitution must survive completion unchanged.*
-   Each value used before the whole stage vector was known is compared, by
-   exact equality, with the same `f` re-evaluated at the completed stage. A
-   tolerance would admit a problem that genuinely depends on the missing half
-   by a small amount, which is a different discrete problem and not a rounding
-   difference.
-3. *`F` block anti-diagonal and `G^q = 0`, on exact zeros.* Asserted on the
+1. *Every `f` consumed mid-substitution must survive completion unchanged.*
+   `f` takes the whole stage vector, so something must be supplied for the
+   half no stage has written yet. Each value used before the whole stage
+   vector was known is compared, by exact equality, with the same `f`
+   re-evaluated at the completed stage. A tolerance would admit a problem that
+   genuinely depends on the missing half by a small amount, which is a
+   different discrete problem and not a rounding difference.
+2. *`F` block anti-diagonal and `G^q = 0`, on exact zeros.* Asserted on the
    Jacobians the step computed with, following [C-8.3](#c-8)'s treatment of
    structure everywhere else.
 
-All three are needed. Under symplectic Euler no `f^q` is consumed
-mid-substitution at all — its `A^q` row is empty — so an `f^q` that depends on
-`q` is caught only by (3); under Verlet the same violation is caught by (1). An
-`f^q` that depends on `u` changes no value, since `u` is known before any stage
-is, and is caught only by (3). A dependence constructed to agree at both of
-(1)'s values — `f^q += K (q - a)(q - b)` for the two fills `a, b` — is
-invisible to (1) by construction and is caught by (2).
+Both are needed, and neither subsumes the other. Under symplectic Euler no
+`f^q` is consumed mid-substitution at all — its `A^q` row is empty — so an
+`f^q` that depends on `q` is caught only by (2); under Verlet the same
+violation is caught by (1). An `f^q` that depends on `u` changes no value,
+since `u` is known before any stage is, and is caught only by (2). Conversely
+quadratic drag `f^p = -V'(q) - k p²` has `F^pp = -2kp`, which vanishes where
+the momentum does, so (2) is blind there and only (1) refuses it.
 
-**The substituted values are finite, and that is a correction.** They were
-originally `NaN`, on the reasoning that `NaN` never compares equal so (1) could
-not be fooled by arithmetic. That confuses a property of the *callback's
-arithmetic* with a property of the mathematics. An `f` assembled as a matrix
-product computes `0 * NaN` across a coefficient that is exactly zero and
-returns `NaN` for the whole row, so it reports a dependence it does not have.
-Adjungo's own `AffineDynamics` does exactly that: `q' = p`, `p' = -q + u` — a
-separable linear Hamiltonian well inside this domain — was refused. Mathematical
-separability does not imply NaN-safe evaluation, and a check that demands it
-rejects ordinary implementations rather than wrong ones.
+**What is substituted comes from the trajectory, never from a constant.** The
+half no stage has written yet is supplied from the step's incoming state `y` —
+a value the caller provided as `y₀` or a previous step produced, and which `f`
+is evaluated at in the ordinary course of the solve. Invented values were
+tried twice and refused valid problems both times:
 
-Two finite values test the same independence without that hypothesis. They are
-fixed, not random, so a certified path stays deterministic; they differ in sign
-and in magnitude, so a dependence through `x`, `x²`, `|x|` or `sign(x)` separates
-under at least one of them. No fixed pair is a proof, which is why (2) is a
-separate check rather than a convenience — the constructed witness above is
-exactly the case (1) cannot see. This also preserves what the `NaN` fill was
-for: quadratic drag `f^p = -V'(q) - k p²` is non-separable, but `F^pp = -2kp`
-vanishes where the momentum does, so (3) is blind there, and (1) still refuses
-it because `-kp²` differs at the two values. Both witnesses are in
-`tests/test_partitioned_methods.py`.
+* `NaN`, on the reasoning that it could never compare equal. An `f` assembled
+  as a matrix product computes `0 * NaN` across an exactly-zero coefficient
+  and returns `NaN` for the whole row, so Adjungo's own `AffineDynamics` —
+  `q' = p`, `p' = -q + u`, a separable linear Hamiltonian well inside this
+  domain — reported a dependence it does not have and was refused.
+* Two fixed finite values, supplied in turn so that a dependence on the
+  missing half would show up directly. For `H = p²/2 + q(log q − 1) − uq`,
+  which exists only for `q > 0`, Verlet's last node consumes `f^q` at a stage
+  whose position is still unwritten; the substituted `−0.618` reached a
+  callback that correctly refuses a negative position, and a valid Hamiltonian
+  raised `ValueError`.
 
-Check (1) costs two evaluations of `f` per consumed stage term where an
-unchecked implementation needs one, and check (2) one further evaluation per
-stage. That is accepted under [C-1](#c-1): this is a reference implementation,
-and a silent wrong answer on a problem the caller believed was separable costs
-more than the evaluations do. A port may drop the checks only by taking on the
-obligation to establish the domain another way.
+Both are the same mistake. **Separability constrains what `f` reads, not where
+`f` is defined.** A model with a restricted domain — a logarithmic or Coulomb
+potential, a positive-definite constraint — is ordinary physics, and a check
+that requires the callback to be total on fabricated states rejects careful
+implementations rather than wrong ones. Only a state the problem has already
+accepted is safe to supply.
+
+The price is stated rather than hidden: when the incoming half equals the
+completed stage half, check (1) compares a value with itself and cannot see a
+dependence on that half. The transport example's first step is exactly this
+case — it starts from rest with the ramp still at zero, so every quantity in
+step 0 is exactly zero — and its linear drag is refused there by (2) instead,
+`F^pp = -γ = -0.3` being nonzero everywhere. The blindness is local to that
+step: with (2) disabled the solve reaches step 1, where the consumed `f^p` is
+`0.06616667` against a completed `0.06567042`, and (1) refuses. The
+quadratic-drag witness is constructed the other way round — its stage momentum
+is pinned to exactly zero, so `F^pp = -2kp` vanishes and only (1) sees it.
+Recovering the coverage (1) loses at a fixed point would need a second value
+the problem is known to accept, and at this point in the recursion there is not
+one; a caller-supplied split of `f` into its blocks would remove the need to
+substitute anything at all, and is the extension to make if this bound becomes
+binding.
+
+Check (1) costs one further evaluation of `f` per stage. That is accepted
+under [C-1](#c-1): this is a reference implementation, and a silent wrong
+answer on a problem the caller believed was separable costs more than the
+evaluations do. A port may drop the checks only by taking on the obligation to
+establish the domain another way.
 
 **What the checks do and do not establish.** They establish the *block
 dependence structure* the sweeps rely on: that `f^q` reads only `p`, that `f^p`
 reads only `q`, `u` and `t`, and that the Jacobians are correspondingly
 structured. They do **not** establish that a Hamiltonian exists. A potential
 `V(q, u, t)` with `f^p = -∂V/∂q` requires `∂f^p/∂q` to be symmetric; a
-non-symmetric one passes all three checks and is not a gradient field. For
+non-symmetric one passes both checks and is not a gradient field. For
 `q' = p`, `p' = Cq` with `C = [[-1, 0.4], [0, -2]]` the one-step symplectic
-Euler map has `‖MᵀΩM − Ω‖∞ = 0.04` at `h = 0.1`, against `2.2e-19` for the
+Euler map has `‖MᵀΩM − Ω‖∞ = 0.0400` at `h = 0.1`, against `1.99e-11` for the
 symmetrised `C`. The derivatives Adjungo returns are still the exact discrete
 derivatives of what it computed, under [C-2](#c-2); what is lost is
 symplecticity, which was a property of the *problem* being Hamiltonian and never
@@ -1621,38 +1638,57 @@ rounding floor there (`7.47e-16`, `8.53e-16`, `6.14e-16`, orders `−0.19` and
 method scores near zero: `rk4` scores `6.64e-03` at 60 steps, because the
 degeneracy removes the ability to *discriminate*, not the ability to be wrong.
 
-**Injection campaign ([C-14.2](#c-14)).** Twenty single-token defects were
+**Injection campaign ([C-14.2](#c-14)).** Nineteen single-token defects were
 injected into `adjungo/solvers/partitioned.py`, `adjungo/core/partitioned.py`
 and the partitioned extension of `adjungo/validation/reference.py`, one at a
 time, each run under the [R-11](#r-11) protocol against the whole suite.
-**All twenty were detected.** They covered both sweep directions, the
+**All nineteen were detected.** They covered both sweep directions, the
 transpose and the conjugate-half weighting in the adjoint, the `Γ` term, the
 tangent's control term and its `F` contraction, the `A^q`/`A^p` selector, the
 dependency graph's source array, the two tableaux, the symplectic residual and
 conjugate, the reference's coupling index, and the deletion of each domain
 check.
 
-Four of the twenty target the substitution check specifically: collapsing its
-two fill values to one, deleting its comparison, never substituting at all, and
-recording a half as written before it is. The last is the bypass that matters —
-it lets an unwritten half reach `f` unchecked — and it is detected.
+Four of the nineteen target the substitution check specifically: relaxing its
+exact comparison to a tolerance, deleting the comparison, never substituting at
+all, and recording a half as written before it is. The last is the bypass that
+matters — it lets an unwritten half reach `f` unchecked — and it is detected.
 
-Three of the original seventeen were initially **undetected**, and two of those
-were real gaps that this clause's evidence now closes: replacing the `NaN` fill
-with `0.0`, and weakening the structural check from exact zero to a tolerance.
-Both were cured by adding witnesses — the quadratic-drag problem described in
-[C-8.4](#c-8), and coupling strengths `1e-14` and `−1.0`, the second of which
-also escapes a one-sided `> tol` comparison. The third was not a defect: adding
-the control term to the `q` half of the tangent sweep changes nothing, because
-`G^q = 0` is enforced structurally, so the added term is identically zero. It
+Five injections were **undetected** when first run, across the campaign's three
+revisions, and they divide into two kinds.
+
+Three were real gaps, and each was closed by adding a witness rather than by
+adjusting the injection: replacing the `NaN` fill with `0.0`, weakening the
+structural check from exact zero to a tolerance, and relaxing the substitution
+comparison from exact equality to `rtol=1e-6, atol=1e-8`. The first two were
+cured by the quadratic-drag problem of [C-8.4](#c-8) and by coupling strengths
+`1e-14` and `−1.0`, the second of which also escapes a one-sided `> tol`
+comparison. The third is cured by the same drag problem at `k = 2⁻³⁰`, where
+the consumed `f^p` is exactly `−0.5` and the completed one
+`−0.49999999994179234` — a relative difference of `1.2e-10`, which every
+ordinary tolerance accepts. The sweep drops the `k p²` term whatever its size,
+so the answer would belong to the undamped problem; a small coefficient makes a
+violation hard to see, not small in consequence.
+
+Two were not defects at all, and saying so is part of the evidence. Adding the
+control term to the `q` half of the tangent sweep changes nothing, because
+`G^q = 0` is enforced structurally and the added term is identically zero; it
 was replaced with dropping that term from the `p` half, which is detected.
+Substituting the block's own half in place of the conjugate one is likewise
+inert: the conjugate half a consumed block needs is always written already, so
+on the only iteration where the branch fires the two expressions name the same
+slice. That invariant is what `dependency_order` exists to establish, and it is
+now asserted directly on the tableaux and the ordering, with no solver
+involved. An injection that cannot change a result is removed from the campaign
+rather than counted as a miss; counting it either way would misreport the
+suite.
 
-The `NaN`-to-`0.0` injection no longer exists, because the fill is no longer
-`NaN`; see [C-8.4](#c-8) for why it could not stay. Collapsing the two fills to
-a single value is its replacement and plays the same role — it is the injection
-that asks whether the suite can tell the substitution check is doing anything.
-The quadratic-drag witness survives the change and still refuses, now from the
-values differing at the two fills rather than from `NaN` inequality.
+Two injections from earlier revisions no longer exist, because the code they
+targeted does not. The `NaN`-to-`0.0` injection went when the fill stopped
+being `NaN`, and collapsing two fill values to one went when the fills
+themselves did; [C-8.4](#c-8) records why neither could stay. The
+quadratic-drag witness survived both changes and still refuses, now from the
+incoming momentum differing from the completed stage momentum.
 
 **A procedural note, because it cost a full afternoon.** Two campaign runs were
 interrupted partway through. The harness restores each file in a `finally`, so
@@ -3571,9 +3607,11 @@ change, and a `head -80` of that diff looked entirely clean.
 
 Three requirements follow. Snapshot the files a campaign will mutate **before**
 it starts, and verify each against that snapshot before every injection, so a
-corrupted tree fails loudly instead of producing numbers. Confirm the tree is
-pristine before diagnosing any campaign result. And read a diff to its end
-before concluding a file is clean.
+corrupted tree fails loudly instead of producing numbers. A snapshot carried
+over from a previous run is worth nothing — it may hold that run's injected
+text — so take a fresh one each time and refuse to start if one is already
+there. Confirm the tree is pristine before diagnosing any campaign result. And
+read a diff to its end before concluding a file is clean.
 
 ### R-12 An unrun check is not a check — `APPROVED`
 

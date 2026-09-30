@@ -70,24 +70,6 @@ class SeparabilityViolation(ValueError):
     """
 
 
-#: The two values handed to ``f`` for a half of the state that no stage has
-#: written yet. The consumed block must come back identical for both; see
-#: :meth:`PartitionedStageSolver._consume`.
-#:
-#: Both are finite, because an ``f`` assembled as a matrix product propagates
-#: ``0 * NaN`` across an exactly-zero coefficient and would fail for every
-#: caller rather than only the offending ones. They differ in **sign and in
-#: magnitude**, so a dependence through any of ``x``, ``x**2``, ``abs(x)`` or
-#: ``sign(x)`` separates under at least one of them, and their ratio is
-#: irrational so that a dependence through a ratio does not cancel.
-#:
-#: No fixed pair is a proof. A dependence can agree at two points -- ``f``
-#: proportional to ``(x - a)(x - b)`` agrees at both, and at zero -- which is
-#: why the comparison of consumed against completed values below is a separate
-#: check and not a convenience.
-PROBE_FILLS = (-0.6180339887498949, 1.7724538509055159)
-
-
 def partition_of(problem: Problem) -> int:
     """``n_q``, the size of the position block, declared by the problem.
 
@@ -153,10 +135,10 @@ class PartitionedStageSolver(StageSolver["PartitionedMethod"]):
         y = y_history[0]
         t_stage = t_n + method.c * h
 
-        # NaN marks an entry no node has written yet. It is never handed to
-        # `f`, which sees a probe vector built below; it is here so that an
-        # unwritten entry escaping into the returned array is visible rather
-        # than plausible (C-7).
+        # NaN marks an entry no node has written yet. What `f` sees is the
+        # substituted vector built in `_consume`, never this one; the NaN is
+        # here so that an unwritten entry escaping into the returned array is
+        # visible rather than plausible (C-7).
         Z = np.full((s, n), np.nan)
         written: set[tuple[int, int]] = set()
         consumed: list[tuple[int, int, NDArray]] = []
@@ -168,8 +150,8 @@ class PartitionedStageSolver(StageSolver["PartitionedMethod"]):
                 if A[i, j] == 0.0:  # exact, as everywhere structure routes
                     continue
                 f_j = self._consume(
-                    Z, written, problem, u_stages[j], t_stage[j],
-                    sl, block, j, step,
+                    Z, written, y, problem, u_stages[j], t_stage[j],
+                    sl, block, j,
                 )
                 consumed.append((block, j, f_j.copy()))
                 acc = acc + h * A[i, j] * f_j
@@ -200,61 +182,52 @@ class PartitionedStageSolver(StageSolver["PartitionedMethod"]):
         self,
         Z: NDArray,
         written: set[tuple[int, int]],
+        y: NDArray,
         problem: Problem,
         u_stage: NDArray,
         t: float,
         sl: tuple[slice, slice],
         block: int,
         j: int,
-        step: int | None,
     ) -> NDArray:
-        """``f^block`` at stage ``j``, established independent of what is unwritten.
+        """``f^block`` at stage ``j``, before every half of that stage is known.
 
-        ``f`` takes the whole state vector, so it has to be handed something
-        for the halves no node has written yet. Under C-8.4 the block being
-        consumed does not depend on them, and the point of this method is to
-        establish that rather than assume it: ``f`` is evaluated at two
-        different fill values and the consumed block must come back exactly
-        the same.
+        ``f`` takes the whole state vector, so something must be supplied for
+        the half no node has written yet. The half the consumed block actually
+        needs is always written already -- that is what ``dependency_order``
+        establishes -- so under C-8.4 the supplied value cannot affect the
+        result, and :meth:`_check_substitution_was_exact` is what establishes
+        that rather than assuming it.
 
-        An earlier version filled with ``NaN`` and relied on it propagating.
-        That is a property of the *callback's arithmetic*, not of the
-        mathematics: an ``f`` assembled as a matrix product computes
-        ``0 * NaN`` across a coefficient that is exactly zero and returns
-        ``NaN`` anyway. Adjungo's own :class:`~adjungo.core.affine.AffineDynamics`
-        does exactly that, so ``q' = p``, ``p' = -q + u`` -- a separable linear
-        Hamiltonian squarely inside the domain -- was refused. Mathematical
-        separability does not imply NaN-safe evaluation, and a check that
-        demands it rejects ordinary implementations.
+        **The value supplied comes from the trajectory, never from a
+        constant.** It is the step's incoming state `y`, which the caller
+        either provided as `y0` or the previous step produced, and which `f`
+        is evaluated at in the ordinary course of the solve. Invented values
+        were tried twice and refused valid problems both times, because a
+        callback is only defined where its model is:
 
-        Two finite fills test the same independence without that hypothesis,
-        and they keep what the ``NaN`` fill was there for: a violation whose
-        Jacobian block happens to vanish at the stage values is still seen,
-        because it is seen from the *values* rather than from the derivative.
+        * ``NaN``, on the reasoning that it could not compare equal. An ``f``
+          assembled as a matrix product computes ``0 * NaN`` across an
+          exactly-zero coefficient and returns ``NaN`` for the whole row, so
+          Adjungo's own ``AffineDynamics`` reported a dependence it did not
+          have.
+        * Two fixed finite values, to test independence directly. For
+          ``H = p²/2 + q(log q − 1) − uq``, which exists only for ``q > 0``,
+          Verlet substitutes a negative position into a callback that
+          correctly refuses one, and a valid Hamiltonian raises ``ValueError``.
+
+        Both are the same mistake: separability constrains what ``f`` *reads*,
+        not where it is *defined*. Only a state the problem has already
+        accepted is safe to supply, and the incoming state is the one such
+        value available at this point in the recursion.
         """
-        values = []
-        for fill in PROBE_FILLS:
-            probe = np.array(Z[j], dtype=float)
-            for other in (Q, P):
-                if (other, j) not in written:
-                    probe[sl[other]] = fill
-            values.append(
-                np.asarray(problem.f(probe, u_stage, t), dtype=float)[sl[block]]
-            )
-
-        if not np.array_equal(values[0], values[1]):
-            name = "q" if block == Q else "p"
-            where = "" if step is None else f" at step {step}"
-            raise SeparabilityViolation(
-                f"f^{name} at stage {j}{where} depends on a half of the state "
-                f"that no stage has computed yet: it returned {values[0]} and "
-                f"{values[1]} for two different values of that half. A "
-                f"partitioned method advances the blocks in turn, which is "
-                f"valid only inside C-8.4's separable domain, where f^q "
-                f"depends on p alone and f^p on (q, u, t) alone. This problem "
-                f"is outside it; use an unpartitioned method, or amend C-8.4."
-            )
-        return values[0]
+        substituted = np.array(Z[j], dtype=float)
+        for other in (Q, P):
+            if (other, j) not in written:
+                substituted[sl[other]] = y[sl[other]]
+        return np.asarray(
+            problem.f(substituted, u_stage, t), dtype=float
+        )[sl[block]]
 
     @staticmethod
     def _check_substitution_was_exact(

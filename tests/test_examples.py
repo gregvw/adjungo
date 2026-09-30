@@ -2704,6 +2704,52 @@ def test_transport_example_refuses_a_problem_outside_the_separable_domain():
     message = refusal_demonstration()
     assert "f^p" in message
     assert "separable" in message
+    # Which check refuses is part of the claim. The structural one does,
+    # because step 0 starts from rest with the ramp at zero and the value
+    # comparison has nothing to compare; see the docstring there.
+    assert "F^pp" in message
+    assert "before the whole" not in message
+
+
+def test_the_transport_drag_is_also_refused_by_the_value_check_one_step_later(
+    monkeypatch,
+):
+    """The structural check is first, not sole. C-8.4's complementarity.
+
+    ``refusal_demonstration`` is refused at step 0 by the block-structure
+    check, because every quantity there is exactly zero and the value
+    comparison sees ``0.0`` against ``0.0``. That could equally describe a
+    value check that never works on this problem, which is a different and
+    much weaker situation, so it is measured rather than asserted.
+
+    With the structural check disabled the solve reaches step 1, where the
+    consumed ``f^p`` and the completed one differ in the sixth significant
+    figure and the value comparison refuses. The blindness is local to the
+    fixed point the trajectory starts at.
+    """
+    import re
+
+    from adjungo.solvers.partitioned import PartitionedStageSolver
+    from examples.atom_transport import refusal_demonstration
+
+    monkeypatch.setattr(
+        PartitionedStageSolver,
+        "_check_block_structure",
+        staticmethod(lambda *args, **kwargs: None),
+    )
+    message = refusal_demonstration()
+    assert "before the whole" in message
+    assert "at step 1" in message
+    used, final = (
+        float(v) for v in re.findall(r"\[([0-9.eE+-]+)\]", message)[:2]
+    )
+    # Recorded with their setup: the transport problem of
+    # examples/atom_transport.py with drag 0.3, its shipped plan and ramp.
+    # Six significant figures, well inside any plausible tolerance, which
+    # is why C-8.4 compares exactly.
+    assert used != final
+    assert abs(used - final) / abs(used) < 1e-2
+    assert abs(used - final) / abs(used) > 1e-4
 
 
 @requires_sympy
