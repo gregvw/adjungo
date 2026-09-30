@@ -107,6 +107,29 @@ Hessian-vector product. If they are missing, adjungo raises. It does not
 silently fall back to a Gauss–Newton operator, because that is a different
 operator and the method promises the exact Hessian.
 
+A problem solved by a **partitioned** method may optionally declare the split
+right-hand side
+
+```python
+def f_q(self, p, u, t): ...   # ∂H/∂p, from the momentum half alone
+def f_p(self, q, u, t): ...   # -∂H/∂q, from the position half, control, time
+```
+
+alongside `f`, which stays required. A partitioned step resolves the two
+blocks in turn, so without the split it must evaluate `f` at a stage vector
+one half of which is not yet known, and substitute something for that half.
+Separability says what `f` *reads*, not where it is *defined*: a model with a
+restricted domain — a logarithmic or Coulomb potential, a positive-definite
+constraint — can refuse the substituted state even though its trajectory is
+perfectly well defined, and the more so when the domain moves with `t`. With
+the split declared, nothing is substituted. Both halves are checked against
+`f` at every completed stage, exactly, so a split that disagrees with `f` is
+refused rather than quietly integrated (`NUMERICS.md` C-8.4). On a problem
+whose `f` is total the split is therefore an equivalent route and not a
+different method: the nonlinear certification fixture's trajectory, gradient
+and Hessian-vector product are bit-identical between the two. Declare both or
+neither.
+
 ### Control parametrisation
 
 Derivatives are computed with respect to the *stage* controls
@@ -202,9 +225,10 @@ the optimizer's cache and checks nothing. See `NUMERICS.md` C-17.6.
   vanishing structurally, so it needs a stated rounding budget under
   `NUMERICS.md` C-11.3 before it can be asserted.
 - **Non-separable Hamiltonians** under a partitioned method. `NUMERICS.md`
-  C-8.4 scopes the family to `H = T(p) + V(q, u, t)`; anything else is refused
-  during the solve rather than integrated, because the partitioned sweeps drop
-  the coupling blocks by construction.
+  C-8.4 scopes the family to `H = T(p) + V(q, u, t)`; a violation the checks
+  see is refused during the solve rather than integrated, because the
+  partitioned sweeps drop the coupling blocks by construction. The checks are
+  necessary conditions, not a decision procedure.
 - Nonlinear control parametrisation, sparse operators, and checkpointing.
 - **Mesh adaptation.** Prescribed non-uniform steps and per-step methods are
   implemented and described above; what is missing is a policy that builds a

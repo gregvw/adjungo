@@ -6,6 +6,46 @@ from typing import Protocol
 from numpy.typing import NDArray
 
 
+class SeparableProblem(Protocol):
+    """Optional split right-hand side for the partitioned route (C-8.4).
+
+    A partitioned method never needs the whole of ``f`` at once. It needs
+    ``f^q`` from the momentum and ``f^p`` from the position, control and
+    time, and inside C-8.4's separable domain those arguments are exactly
+    what each half reads. Declaring them separately lets the solver evaluate each block
+    from its own arguments instead of assembling a whole state vector that
+    the method has not finished computing.
+
+    Declaring both is optional and strictly additive: a problem that
+    declares neither is solved through ``f`` alone, under the totality
+    assumption C-8.4 states for that path. Declaring exactly one is an
+    authoring error and is refused. ``f`` stays required either way, and
+    both halves are checked against it, exactly, at every completed stage.
+
+    What this settles is one requirement of C-8.4's domain -- that neither
+    half needs the state half the method has not computed. The rest of the
+    domain is unaffected: the Jacobian block structure is still checked at
+    runtime, and Hamiltonian structure is still a caller hypothesis.
+
+    Why it exists: three separate valid Hamiltonians were refused by
+    schemes that invented a value for the half no stage had written --
+    ``NaN`` (an ``f`` built as a matrix product returns ``NaN`` for the
+    whole row), a fixed finite constant (``log q`` needs ``q > 0``), and
+    the step's incoming state (a domain that moves with ``t`` invalidates
+    it at the stage time). Separability constrains what ``f`` *reads*, not
+    where it is *defined*, and validity is joint in ``(y, u, t)``, so no
+    value the solver holds is safe to invent with in general. See C-8.4.
+    """
+
+    def f_q(self, p: NDArray, u: NDArray, t: float) -> NDArray:
+        """``f^q = ∂H/∂p``, from the momentum half alone."""
+        ...
+
+    def f_p(self, q: NDArray, u: NDArray, t: float) -> NDArray:
+        """``f^p = -∂H/∂q``, from the position half, control and time."""
+        ...
+
+
 class Problem(Protocol):
     """User provides callbacks; solver never forms full Jacobians unless needed."""
 

@@ -43,7 +43,11 @@ from adjungo.validation import (
     reference_hessian,
     reference_solve,
 )
-from tests.prk_problems import TRANSPORT_TARGET, ShakenLatticeTrap
+from tests.prk_problems import (
+    TRANSPORT_TARGET,
+    ShakenLatticeTrap,
+    SplitShakenLatticeTrap,
+)
 from tests.problems import FullCostObjective, make_controls
 
 METHODS = [
@@ -732,7 +736,7 @@ def test_accepting_the_drag_violation_breaks_the_stage_equation(monkeypatch):
     right answer to, which is why C-8.4 refuses instead of warning.
     """
     monkeypatch.setattr(
-        PartitionedStageSolver, "_check_substitution_was_exact",
+        PartitionedStageSolver, "_check_consumed_values_match_the_whole",
         staticmethod(lambda *a, **k: None),
     )
     monkeypatch.setattr(
@@ -1040,6 +1044,338 @@ def test_a_separable_problem_with_a_restricted_domain_is_accepted(
         y0=y0, u=u, problem=problem, plan=plan
     ).Y[-1][0]
     assert np.allclose(y1, reference, rtol=0.0, atol=8e-16)
+
+
+# =====================================================================
+# C-8.4's split route -- the half computed from its own dependencies
+# =====================================================================
+
+
+class _MovingLogTrap:
+    """``H = p²/2 + (q−t)(log(q−t) − 1) − u q``, valid only for ``q > t``.
+
+    The witness that closes the whole-vector route. Its domain moves with
+    the stage time, so no state the solver holds is guaranteed valid at the
+    stage it is about to evaluate: the incoming position is valid on
+    arrival and invalid one stage time later. Substituting *any* held value
+    fabricates a point the problem never agreed to, which is why C-8.4 now
+    offers a route that fabricates nothing.
+
+    Both halves are supplied twice over -- separately as ``f_q``/``f_p``,
+    and concatenated as ``f`` -- because the rest of the library integrates
+    ``f``: the step update, the Jacobians and the independent reference all
+    go through it.
+    """
+
+    state_dim, control_dim, n_q = 2, 1, 1
+
+    def _gap(self, q: float, t: float) -> float:
+        gap = float(q) - t
+        if gap <= 0.0:
+            raise ValueError(f"q - t must be positive, got {gap}")
+        return gap
+
+    def f_q(self, p, u, t):
+        return np.array([float(p[0])])
+
+    def f_p(self, q, u, t):
+        return np.array([-math.log(self._gap(q[0], t)) + float(u[0])])
+
+    def f(self, y, u, t):
+        return np.concatenate([self.f_q(y[1:], u, t), self.f_p(y[:1], u, t)])
+
+    def F(self, y, u, t):
+        return np.array([[0.0, 1.0], [-1.0 / self._gap(y[0], t), 0.0]])
+
+    def G(self, y, u, t):
+        self._gap(y[0], t)
+        return np.array([[0.0], [1.0]])
+
+
+class _WholeOnlyMovingLogTrap(_MovingLogTrap):
+    """The same Hamiltonian withholding the split, hence on the fallback."""
+
+    f_q = None  # type: ignore[assignment]
+    f_p = None  # type: ignore[assignment]
+
+    def f(self, y, u, t):
+        return np.array(
+            [
+                float(y[1]),
+                -math.log(self._gap(y[0], t)) + float(u[0]),
+            ]
+        )
+
+
+#: Hand recurrences for one step of length ``h`` from ``(0.05, 1.0)`` at
+#: ``u = 0.3``, ``t₀ = 0``, evaluated from the definitions above and from no
+#: Adjungo route. Symplectic Euler kicks first at ``t = 0``: ``p₁ = 1 +
+#: h(−log(0.05) + 0.3)``, then ``q₁ = 0.05 + h p₁``. Verlet half-kicks at
+#: ``t = 0``, drifts, then half-kicks at ``t = h`` where the gap is
+#: ``q₁ − h``.
+_MOVING_H = 0.1
+_MOVING_Y0 = np.array([0.05, 1.0])
+_MOVING_U = 0.3
+
+
+def _moving_expected(name: str) -> np.ndarray:
+    gap0 = _MOVING_Y0[0]
+    if name == "symplectic_euler":
+        p1 = _MOVING_Y0[1] + _MOVING_H * (-math.log(gap0) + _MOVING_U)
+        return np.array([_MOVING_Y0[0] + _MOVING_H * p1, p1])
+    half = _MOVING_Y0[1] + 0.5 * _MOVING_H * (-math.log(gap0) + _MOVING_U)
+    q1 = _MOVING_Y0[0] + _MOVING_H * half
+    gap1 = q1 - _MOVING_H
+    return np.array(
+        [q1, half + 0.5 * _MOVING_H * (-math.log(gap1) + _MOVING_U)]
+    )
+
+
+def _moving_case(method):
+    plan = DiscretizationPlan((0.0, _MOVING_H), [method])
+    return plan, np.full((1, method.s, 1), _MOVING_U)
+
+
+@pytest.mark.parametrize("method_factory", [symplectic_euler, verlet])
+def test_a_problem_whose_domain_moves_with_time_is_accepted_via_the_split(
+    method_factory,
+):
+    """The split route evaluates only at points the problem admits.
+
+    Verlet's actual stage positions here are ``0.05`` and ``0.16647866``,
+    whose gaps ``q − t`` are ``0.05`` and ``0.06647866`` -- both inside the
+    domain. The trajectory is therefore well defined, and the failure the
+    fallback produces is an artefact of substitution, not a property of the
+    problem.
+    """
+    method = method_factory()
+    plan, u = _moving_case(method)
+    y1 = GLMOptimizer(
+        _MovingLogTrap(), None, y0=_MOVING_Y0, plan=plan
+    ).trajectory(u).Y[-1][0]
+
+    # Tier-2 closed form (C-14.1). Budget: a few ULPs of an accumulation of
+    # order one, not a discretization bound.
+    assert np.allclose(
+        y1, _moving_expected(method.name), rtol=0.0, atol=8e-16
+    )
+
+
+@pytest.mark.parametrize("method_factory", [symplectic_euler, verlet])
+def test_the_stages_the_split_route_produced_satisfy_the_stage_equations(
+    method_factory,
+):
+    """Independent of the solver: substitute the answer into the equations.
+
+    ``reference_solve`` cannot serve as the oracle here. Its Newton
+    iteration starts from the incoming state broadcast to every stage,
+    which for this problem is outside the domain at the later stage times,
+    so the tier-1 reference fails at its initial guess -- a limitation of
+    that reference on moving domains, not of the route under test. The
+    residual below is the same equation the reference would drive to zero,
+    evaluated at the stages actually produced.
+    """
+    method = method_factory()
+    plan, u = _moving_case(method)
+    problem = _MovingLogTrap()
+    traj = GLMOptimizer(problem, None, y0=_MOVING_Y0, plan=plan).trajectory(u)
+    Z = np.asarray(traj.Z).reshape(method.s, 2)
+
+    t_stage = plan.nodes[0] + method.c * _MOVING_H
+    fs = [problem.f(Z[j], u[0, j], t_stage[j]) for j in range(method.s)]
+    scale = max(1.0, float(np.max(np.abs(Z))))
+    residual = 0.0
+    for i in range(method.s):
+        for block, A in ((0, method.A_q), (1, method.A_p)):
+            want = _MOVING_Y0[block] + _MOVING_H * sum(
+                A[i, j] * fs[j][block] for j in range(method.s)
+            )
+            residual = max(residual, abs(Z[i, block] - want))
+
+    # Not exact zero: the solver accumulates `acc + h A_ij f_j` term by
+    # term while this regroups the sum, so the two differ by rounding
+    # (C-11.3 -- the residual is not a quantity to pin bit-exactly).
+    # Basis: a sum of at most `s` terms of size `|h A f|` against a scale
+    # of order `|Z|`, so a few ULP of that scale. Measured over 2000
+    # randomized (h, y0, u) draws inside the domain, the worst relative
+    # residual is 0.99 eps under Verlet and exactly 0 under symplectic
+    # Euler, whose stage sum has one term; 8 eps is that with margin.
+    assert residual <= 8.0 * np.finfo(float).eps * scale
+
+
+@pytest.mark.parametrize("method_factory", [symplectic_euler, verlet])
+def test_withholding_the_split_puts_the_same_problem_out_of_reach(
+    method_factory,
+):
+    """The fallback's totality hypothesis is doing real work.
+
+    Symplectic Euler never consumes ``f^q`` before the position is known,
+    so it survives substitution and must still agree with the closed form;
+    Verlet does, and is refused. Recording both keeps the boundary between
+    the routes measured rather than asserted.
+    """
+    method = method_factory()
+    plan, u = _moving_case(method)
+    opt = GLMOptimizer(
+        _WholeOnlyMovingLogTrap(), None, y0=_MOVING_Y0, plan=plan
+    )
+    if method.name == "symplectic_euler":
+        y1 = opt.trajectory(u).Y[-1][0]
+        assert np.allclose(
+            y1, _moving_expected(method.name), rtol=0.0, atol=8e-16
+        )
+        return
+    with pytest.raises(ValueError, match="q - t must be positive"):
+        opt.trajectory(u)
+
+
+@pytest.mark.parametrize("method_factory", [symplectic_euler, verlet])
+def test_the_two_routes_agree_exactly_on_the_nonlinear_fixture(
+    method_factory,
+):
+    """Declaring the split must change no answer, to the last bit.
+
+    ``SplitShakenLatticeTrap`` reaches the same dynamics by the other
+    route, over the very functions the inherited ``f`` concatenates. A
+    tolerance here would admit a split route that computed something
+    slightly different; exact equality is the claim, so exact equality is
+    the test. Gradient and Hessian-vector product are included because the
+    derivative assembly reads the stage cache the route fills.
+    """
+    whole, objective, plan, y0, u = _case(method_factory)
+    split = SplitShakenLatticeTrap()
+
+    opt_w = GLMOptimizer(whole, objective, y0=y0, plan=plan)
+    opt_s = GLMOptimizer(split, objective, y0=y0, plan=plan)
+
+    assert np.array_equal(
+        np.asarray(opt_w.trajectory(u).Y), np.asarray(opt_s.trajectory(u).Y)
+    )
+    assert np.array_equal(opt_w.gradient(u), opt_s.gradient(u))
+
+    rng = np.random.default_rng(11)
+    v = rng.standard_normal(u.shape)
+    assert np.array_equal(
+        opt_w.hessian_vector_product(u, v),
+        opt_s.hessian_vector_product(u, v),
+    )
+
+
+@pytest.mark.parametrize("missing", ["f_q", "f_p"])
+def test_declaring_half_of_the_split_is_refused(missing):
+    """No correct reading exists, so neither half-honouring is offered.
+
+    Ignoring the declared half discards what the author wrote; using it
+    would run one block on the split route and the other on the fallback,
+    which is neither route's contract.
+    """
+    problem = _MovingLogTrap()
+    setattr(problem, missing, None)
+    method = verlet()
+    plan, u = _moving_case(method)
+    with pytest.raises(SeparabilityViolation, match=f"not {missing}"):
+        GLMOptimizer(problem, None, y0=_MOVING_Y0, plan=plan).trajectory(u)
+
+
+def _disagreeing(half: str, amount: float = 1e-9):
+    """``f`` stays honest; one declared half drifts from it by ``amount``.
+
+    The base fixture builds ``f`` *from* its halves, which makes
+    disagreement structurally impossible -- the authoring style this check
+    exists to encourage. The realistic failure is an author who writes the
+    three callbacks independently, so the fixture writes them independently
+    too.
+    """
+
+    class _Disagreeing(_MovingLogTrap):
+        def f(self, y, u, t):
+            return np.concatenate(
+                [
+                    _MovingLogTrap.f_q(self, y[1:], u, t),
+                    _MovingLogTrap.f_p(self, y[:1], u, t),
+                ]
+            )
+
+    def drifted(self, half_of_y, u, t):
+        return getattr(_MovingLogTrap, half)(self, half_of_y, u, t) + amount
+
+    setattr(_Disagreeing, half, drifted)
+    return _Disagreeing()
+
+
+@pytest.mark.parametrize("half", ["f_q", "f_p"])
+@pytest.mark.parametrize("method_factory", [symplectic_euler, verlet])
+def test_a_split_that_disagrees_with_f_is_refused(method_factory, half):
+    """The split and ``f`` must be the same function -- both halves of it.
+
+    The stage is built from the split, while the step update, the Jacobians
+    and the reference all use ``f``. A split that drifted from ``f`` would
+    make the forward step and its derivatives describe different problems,
+    with nothing else in the library positioned to notice.
+
+    ``half`` is parametrized because the tableau decides which halves get
+    consumed, and the check must not. Symplectic Euler's ``A^q`` row is
+    empty, so it never evaluates ``f_q`` while resolving its stage; a check
+    written over consumed values alone accepted an arbitrarily wrong
+    ``f_q`` under symplectic Euler while refusing it under Verlet. That
+    produced no wrong answer -- an unconsumed value is one the stage was
+    not built from -- but it made the refusal a property of the tableau
+    rather than of the problem, and deferred the author's error to whenever
+    they next changed method.
+    """
+    method = method_factory()
+    plan, u = _moving_case(method)
+    with pytest.raises(SeparabilityViolation, match=f"{half} disagrees"):
+        GLMOptimizer(
+            _disagreeing(half), None, y0=_MOVING_Y0, plan=plan
+        ).trajectory(u)
+
+
+@pytest.mark.parametrize("method_factory", [symplectic_euler, verlet])
+def test_a_wrong_split_half_is_refused_even_where_it_is_never_consumed(
+    method_factory,
+):
+    """The coarse version of the case above, kept as its own statement.
+
+    A gross error, not a `1e-9` drift, so that the refusal cannot be read
+    as an artefact of the exact comparison. Under symplectic Euler this
+    ``f_q`` is never evaluated by the stage solve at all, and the
+    trajectory it would have produced is correct; the refusal is of the
+    inconsistent *declaration*.
+    """
+    method = method_factory()
+    plan, u = _moving_case(method)
+    with pytest.raises(SeparabilityViolation, match="f_q disagrees"):
+        GLMOptimizer(
+            _disagreeing("f_q", amount=7.0), None, y0=_MOVING_Y0, plan=plan
+        ).trajectory(u)
+
+
+@pytest.mark.parametrize("method_factory", [symplectic_euler, verlet])
+def test_the_split_route_still_enforces_the_structural_checks(
+    method_factory,
+):
+    """Separability of the interface does not imply the Jacobian agrees.
+
+    A split declares which arguments each half is *given*; ``F`` and ``G``
+    state which it *depends on*. Here ``f_q`` is honestly a function of
+    ``p`` alone while ``F`` claims an ``F^qq`` block, so the two
+    descriptions contradict each other and the solve must not proceed on
+    either one.
+    """
+
+    class _LyingJacobian(_MovingLogTrap):
+        def F(self, y, u, t):
+            out = super().F(y, u, t)
+            out[0, 0] = 0.5
+            return out
+
+    method = method_factory()
+    plan, u = _moving_case(method)
+    with pytest.raises(SeparabilityViolation, match=r"F\^qq"):
+        GLMOptimizer(
+            _LyingJacobian(), None, y0=_MOVING_Y0, plan=plan
+        ).trajectory(u)
 
 
 def test_the_broken_fixtures_are_integrated_fine_by_a_certified_family():

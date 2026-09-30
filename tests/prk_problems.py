@@ -174,14 +174,31 @@ class ShakenLatticeTrap:
 
     # -- Problem protocol ----------------------------------------------
 
-    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
-        """``f = (dH/dp, -dH/dq)``."""
-        q, p = y[:2], y[2:]
+    def velocity(self, p: NDArray, u: NDArray, t: float) -> NDArray:
+        """``dH/dp = dT/dp``, the group velocity. Reads ``p`` alone."""
+        return self.J * np.sin(p)
+
+    def force(self, q: NDArray, u: NDArray, t: float) -> NDArray:
+        """``-dH/dq = -dV/dq``. Reads ``(q, u, t)`` alone."""
         r = q - self.centre(t)
-        f_q = self.J * np.sin(p)
-        f_p = -(self.kappa + u[1] ** 2) * r - self.alpha * (q @ q) * q
-        f_p[0] += u[0]
-        return np.concatenate([f_q, f_p])
+        out = -(self.kappa + u[1] ** 2) * r - self.alpha * (q @ q) * q
+        out[0] += u[0]
+        return out
+
+    def f(self, y: NDArray, u: NDArray, t: float) -> NDArray:
+        """``f = (dH/dp, -dH/dq)``, assembled from the two halves.
+
+        Written this way so that :class:`SplitShakenLatticeTrap` can declare
+        C-8.4's split route over exactly the same arithmetic, which is what
+        lets the two routes be compared bit for bit rather than to a
+        tolerance.
+        """
+        return np.concatenate(
+            [
+                self.velocity(y[self.n_q :], u, t),
+                self.force(y[: self.n_q], u, t),
+            ]
+        )
 
     def F(self, y: NDArray, u: NDArray, t: float) -> NDArray:
         """``df/dy``, block anti-diagonal because ``H`` is separable."""
@@ -252,6 +269,29 @@ class ShakenLatticeTrap:
         out = np.zeros((2, 2))
         out[1, 1] = float(-2.0 * (v[2:] @ r))
         return out
+
+
+class SplitShakenLatticeTrap(ShakenLatticeTrap):
+    """:class:`ShakenLatticeTrap` declaring C-8.4's split right-hand side.
+
+    The same dynamics reached by the other route. Because ``f_q`` and ``f_p``
+    are the very functions the inherited ``f`` concatenates, the two routes
+    perform identical arithmetic on identical inputs, so their trajectories,
+    gradients and Hessian-vector products must agree *exactly* -- a
+    tolerance would hide a route that quietly computed something else.
+
+    Nothing here needs the split: ``sin`` and a polynomial are entire, so the
+    whole-vector route's totality hypothesis holds by construction. The
+    fixture exists to certify that declaring the split changes no answer. For
+    a problem the whole-vector route genuinely cannot serve, see
+    ``tests/test_partitioned_methods.py::_MovingLogTrap``.
+    """
+
+    def f_q(self, p: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.velocity(p, u, t)
+
+    def f_p(self, q: NDArray, u: NDArray, t: float) -> NDArray:
+        return self.force(q, u, t)
 
 
 #: Terminal target for the transport problem: the atom displaced and brought
