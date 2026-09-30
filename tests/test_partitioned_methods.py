@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 import sympy as sp
 
+from adjungo.core.affine import AffineDynamics
 from adjungo.core.method import GLMethod, StageType, TableauDeclarationError
 from adjungo.core.partitioned import (
     P,
@@ -32,6 +33,7 @@ from adjungo.core.plan import DiscretizationPlan
 from adjungo.methods.runge_kutta import explicit_euler, rk4
 from adjungo.optimization.interface import GLMOptimizer
 from adjungo.solvers.partitioned import (
+    PROBE_FILLS,
     PartitionedStageSolver,
     SeparabilityViolation,
     partition_of,
@@ -457,8 +459,56 @@ class _MomentumDependentForce(ShakenLatticeTrap):
         return out
 
 
+#: Strength of the probe-blind term. Any nonzero value works; this one is
+#: large enough that the discrepancy is far above rounding and small enough
+#: not to destabilise the step.
+_BLIND_K = 0.35
+
+
+class _ProbeBlind(ShakenLatticeTrap):
+    """``f^q`` depends on ``q``, and no two-point probe can see it.
+
+    The added term is ``K (q - a)(q - b)`` with ``a, b`` the two values in
+    :data:`~adjungo.solvers.partitioned.PROBE_FILLS`, so it is *exactly*
+    zero at both of them -- not small, zero, since each factor vanishes
+    identically. Substituting an unwritten ``q`` therefore returns the same
+    ``f^q`` for both fills and the probe check sees a separable problem.
+
+    This is the witness for the limitation stated beside ``PROBE_FILLS``:
+    two points do not establish independence. It is caught instead by
+    comparing what the substitution consumed against ``f`` at the completed
+    stage, which is a statement about the values the answer was built from
+    rather than about a probe.
+    """
+
+    def f(self, y, u, t):
+        out = super().f(y, u, t)
+        out[0] += _BLIND_K * (y[0] - PROBE_FILLS[0]) * (y[0] - PROBE_FILLS[1])
+        return out
+
+    def F(self, y, u, t):
+        out = super().F(y, u, t)
+        out[0, 0] += _BLIND_K * (2.0 * y[0] - PROBE_FILLS[0] - PROBE_FILLS[1])
+        return out
+
+
+def test_the_probe_blind_term_vanishes_at_both_fills():
+    """The fixture's defining property, established without the solver.
+
+    If this drifted -- a changed fill constant, a changed term -- the
+    refusal row above would still pass, but by the ordinary probe check,
+    and the one mechanism it is there to exercise would go untested.
+    """
+    for fill in PROBE_FILLS:
+        y = np.array([fill, 0.1, 0.2, 0.05])
+        extra = _BLIND_K * (y[0] - PROBE_FILLS[0]) * (y[0] - PROBE_FILLS[1])
+        assert extra == 0.0
+    off = 0.3  # any point that is neither fill
+    assert _BLIND_K * (off - PROBE_FILLS[0]) * (off - PROBE_FILLS[1]) != 0.0
+
+
 #: Which check refuses which violation, per method. Recorded explicitly so
-#: that deleting one check cannot be masked by the other: the two mechanisms
+#: that deleting one check cannot be masked by another: the three mechanisms
 #: are independent, and each of them is the only one that sees some row here.
 #:
 #: The empty ``A^q`` row of both methods' first stage means no ``f^q`` is
@@ -466,16 +516,20 @@ class _MomentumDependentForce(ShakenLatticeTrap):
 #: ``f_q(q)`` row is caught structurally while Verlet's is caught by value.
 REFUSALS = [
     pytest.param(symplectic_euler, _CoupledHamiltonian, "F^qq", id="se_fq_q"),
-    pytest.param(verlet, _CoupledHamiltonian, "before the whole", id="v_fq_q"),
+    pytest.param(
+        verlet, _CoupledHamiltonian, "depends on a half", id="v_fq_q"
+    ),
     pytest.param(symplectic_euler, _ControlledKinetic, "G^q", id="se_fq_u"),
     pytest.param(verlet, _ControlledKinetic, "G^q", id="v_fq_u"),
     pytest.param(
-        symplectic_euler, _MomentumDependentForce, "before the whole",
+        symplectic_euler, _MomentumDependentForce, "depends on a half",
         id="se_fp_p",
     ),
     pytest.param(
-        verlet, _MomentumDependentForce, "before the whole", id="v_fp_p"
+        verlet, _MomentumDependentForce, "depends on a half", id="v_fp_p"
     ),
+    pytest.param(symplectic_euler, _ProbeBlind, "F^qq", id="se_blind"),
+    pytest.param(verlet, _ProbeBlind, "before the whole", id="v_blind"),
 ]
 
 
@@ -505,10 +559,20 @@ def test_a_non_separable_problem_is_refused_during_the_solve(
         opt.objective_value(u)
 
 
-def test_both_refusal_mechanisms_are_exercised():
-    """Neither check is dead code in the table above."""
+def test_every_refusal_mechanism_is_exercised():
+    """No check is dead code in the table above.
+
+    Three independent mechanisms refuse a non-separable problem: the probe
+    comparison during substitution, the comparison of what was consumed
+    against ``f`` at the completed stage, and the block structure of the
+    Jacobians. Each is the only one that sees some row of :data:`REFUSALS`,
+    so deleting any of them fails here rather than hiding behind the
+    others.
+    """
     mechanisms = {row.values[2] for row in REFUSALS}
-    assert mechanisms == {"F^qq", "G^q", "before the whole"}
+    assert mechanisms == {
+        "depends on a half", "before the whole", "F^qq", "G^q",
+    }
 
 
 #: Coupling strengths that a tolerance would swallow. ``1e-14`` is below any
@@ -609,14 +673,20 @@ def test_the_stage_momentum_of_the_drag_witness_is_exactly_zero():
 
 
 def test_a_violation_hidden_by_a_vanishing_jacobian_is_still_refused():
-    """The NaN fill is load-bearing, not decorative.
+    """A violation the structural check cannot see, refused from the values.
 
-    Its only job is this case: a violation that both value comparison and
-    structural check would miss under any finite fill. Replace ``np.nan``
-    with ``0.0`` and this problem is accepted with ``Z = [0.6, 0.0]``.
+    ``f^p = -V'(q) - k p**2`` has ``dF^p/dp = -2 k p``, which is exactly
+    zero at the stage momentum the fixture above pins to zero. The
+    structural check is therefore blind here, and the refusal has to come
+    from the substituted values differing.
+
+    Both probe fills give a different ``-k p**2``, so the probe check sees
+    it. What this row establishes is that a *vanishing Jacobian* does not
+    hide a violation -- the property that made the momentum pinning worth
+    constructing -- independent of which value mechanism catches it.
     """
     solver = PartitionedStageSolver(n_q=1)
-    with pytest.raises(SeparabilityViolation, match="before the whole"):
+    with pytest.raises(SeparabilityViolation, match="depends on a half"):
         solver.solve_stages(
             np.array([[_DRAG_Q0, _DRAG_H * _OMEGA_SQ * _DRAG_Q0]]),
             np.zeros((1, 1)),
@@ -625,6 +695,154 @@ def test_a_violation_hidden_by_a_vanishing_jacobian_is_still_refused():
             _QuadraticDrag(),
             symplectic_euler(),
         )
+
+
+#: The harmonic oscillator ``q' = p``, ``p' = -q + u`` as Adjungo's own
+#: :class:`~adjungo.core.affine.AffineDynamics`. Separable, linear, and
+#: squarely inside C-8.4.
+_AFFINE_M = np.array([[0.0, 1.0], [-1.0, 0.0]])
+_AFFINE_Y0 = np.array([1.0, 0.2])
+_AFFINE_U = 0.3
+_AFFINE_H = 0.1
+
+#: Hand-evaluated one-step results, derived from the recurrences rather than
+#: from any Adjungo route. Symplectic Euler: ``Z^q = q0 = 1``, so
+#: ``Z^p = 0.2 + 0.1(-1 + 0.3) = 0.13`` and ``q1 = 1 + 0.1(0.13) = 1.013``.
+#: Verlet: the half-kick ``0.2 + 0.05(-1 + 0.3) = 0.165`` drifts
+#: ``q1 = 1 + 0.1(0.165) = 1.0165``, then the second half-kick gives
+#: ``0.165 + 0.05(-1.0165 + 0.3) = 0.129175``.
+_AFFINE_EXPECTED = {
+    "symplectic_euler": np.array([1.013, 0.13]),
+    "verlet": np.array([1.0165, 0.129175]),
+}
+
+
+@pytest.mark.parametrize("method_factory", [symplectic_euler, verlet])
+def test_an_affine_separable_problem_is_accepted(method_factory):
+    """A separable problem whose ``f`` is a matrix product is not refused.
+
+    The domain checks substitute values for the half of the state no stage
+    has written yet. An earlier implementation substituted ``NaN`` and
+    relied on it propagating through any genuine dependence. That is a
+    property of the callback's arithmetic rather than of the mathematics:
+    ``AffineDynamics`` computes ``M @ y``, and ``0 * NaN`` is ``NaN`` even
+    where the coefficient is exactly zero, so every row came back ``NaN``
+    and this problem -- a separable linear Hamiltonian, through Adjungo's
+    own shipped ``Problem`` -- was refused.
+
+    Mathematical separability does not imply NaN-safe evaluation. This is
+    an ordinary use-case witness, not an adversarial one, which is why the
+    check now establishes independence from two finite fills instead.
+    """
+    problem = AffineDynamics(
+        M=_AFFINE_M, C=np.array([[0.0], [1.0]]), b=np.zeros(2)
+    )
+    problem.n_q = 1
+    method = method_factory()
+    plan = DiscretizationPlan((0.0, _AFFINE_H), [method])
+    u = np.full((1, method.s, 1), _AFFINE_U)
+
+    optimizer = GLMOptimizer(problem, None, y0=_AFFINE_Y0, plan=plan)
+    y1 = optimizer.trajectory(u).Y[-1][0]
+
+    expected = _AFFINE_EXPECTED[method.name]
+    # Tier-2 closed form (C-14.1): the recurrences above are exact in
+    # binary, so the budget is a few ULPs of the accumulation, not a
+    # discretization bound.
+    assert np.allclose(y1, expected, rtol=0.0, atol=8e-16)
+
+    reference = reference_solve(
+        y0=_AFFINE_Y0, u=u, problem=problem, plan=plan
+    ).Y[-1][0]
+    assert np.allclose(y1, reference, rtol=0.0, atol=8e-16)
+
+
+#: A non-symmetric force Jacobian. ``f^p = C q`` is a gradient field only when
+#: ``C`` is symmetric, so no potential ``V`` exists here and the problem is not
+#: Hamiltonian -- yet it has exactly the block dependence C-8.4's checks look
+#: for.
+_NONSYMMETRIC_C = np.array([[-1.0, 0.4], [0.0, -2.0]])
+
+
+class _NonHamiltonianBlockSeparable:
+    """Block-separable, and not a Hamiltonian system."""
+
+    state_dim = 4
+    control_dim = 1
+    n_q = 2
+
+    def f(self, y, u, t):
+        q, p = y[:2], y[2:]
+        return np.concatenate([p, _NONSYMMETRIC_C @ q])
+
+    def F(self, y, u, t):
+        out = np.zeros((4, 4))
+        out[:2, 2:] = np.eye(2)
+        out[2:, :2] = _NONSYMMETRIC_C
+        return out
+
+    def G(self, y, u, t):
+        return np.zeros((4, 1))
+
+
+def _symplectic_defect(method, problem, y0, h):
+    """``||M^T Omega M - Omega||_inf`` for the one-step map, by columns."""
+    solver = PartitionedStageSolver(n_q=2)
+    n = 4
+
+    def step(y):
+        Z, _ = solver.solve_stages(
+            y.reshape(1, n), np.zeros((method.s, 1)), 0.0, h, problem, method
+        )
+        return y + h * sum(
+            method.b[i] * problem.f(Z[i], np.zeros(1), 0.0)
+            for i in range(method.s)
+        )
+
+    eps = 1e-6
+    M = np.column_stack([
+        (step(y0 + eps * e) - step(y0 - eps * e)) / (2.0 * eps)
+        for e in np.eye(n)
+    ])
+    omega = np.block([
+        [np.zeros((2, 2)), np.eye(2)], [-np.eye(2), np.zeros((2, 2))]
+    ])
+    return np.abs(M.T @ omega @ M - omega).max()
+
+
+def test_the_domain_checks_do_not_establish_hamiltonian_structure():
+    """A documented limitation of C-8.4, not a defect. Kept executable.
+
+    The three checks establish the *block dependence structure* the sweeps
+    rely on: ``f^q`` reads only ``p``, ``f^p`` only ``q, u, t``. That is
+    necessary for separability and does not imply a Hamiltonian exists. A
+    potential ``V`` with ``f^p = -dV/dq`` requires ``df^p/dq`` symmetric;
+    the fixture above is not, so it is not a gradient field, and every
+    check passes anyway.
+
+    What is lost is symplecticity, which was always a property of the
+    *problem* being Hamiltonian together with the tableau's paired
+    condition -- never of the tableau alone. The derivatives Adjungo
+    returns remain the exact discrete derivatives of what it computed
+    (C-2). This test exists so that C-8.4's paragraph recording the
+    limitation cannot drift away from the behaviour.
+    """
+    problem = _NonHamiltonianBlockSeparable()
+    y0 = np.array([0.3, -0.1, 0.2, 0.07])
+    h = 0.1
+    method = symplectic_euler()
+
+    accepted = _symplectic_defect(method, problem, y0, h)
+    # Far above the differencing noise below, so this is the map failing to
+    # be symplectic rather than the probe being imprecise.
+    assert accepted > 1e-3
+
+    symmetrised = _NonHamiltonianBlockSeparable()
+    sym_c = 0.5 * (_NONSYMMETRIC_C + _NONSYMMETRIC_C.T)
+    symmetrised.f = lambda y, u, t: np.concatenate([y[2:], sym_c @ y[:2]])
+    # Central differences at eps = 1e-6 carry roughly 1e-10 error, which the
+    # quadratic form doubles; 1e-8 is that budget with margin.
+    assert _symplectic_defect(method, symmetrised, y0, h) < 1e-8
 
 
 def test_the_broken_fixtures_are_integrated_fine_by_a_certified_family():

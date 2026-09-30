@@ -37,7 +37,7 @@ Hessian-vector product against an independently assembled reference.
 | DIRK (`implicit_trapezoid` / Crank–Nicolson) | **certified** |
 | SDIRK (`implicit_midpoint`, `sdirk2`, `sdirk3`) | **certified** |
 | Fully implicit, dense `A` (`gauss2`) | **certified** — one coupled `(s·n)` Newton solve per step |
-| Partitioned (`symplectic_euler`, `verlet`) | **certified** — separable `H = T(p) + V(q, u, t)` only; the domain is checked on the values the step used |
+| Partitioned (`symplectic_euler`, `verlet`) | **certified** — separable `H = T(p) + V(q, u, t)` only; the block dependence structure the step relies on is checked on the values it used. That structure does not establish that a Hamiltonian exists, so symplecticity is a property of the tableau given a Hamiltonian problem, not something asserted of every accepted one (`NUMERICS.md` C-8.4) |
 | BDF (`bdf2`, `bdf3`) | **refused** — `r > 1` has no starting procedure |
 | Adams (`adams_bashforth2`, `adams_moulton2`) | **refused** — tableau not representable |
 | IMEX / additive splitting | **refused** |
